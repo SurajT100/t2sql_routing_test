@@ -1,0 +1,32 @@
+# Core Framework
+streamlit>=1.30.0
+
+# Database
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
+pgvector>=0.2.4
+
+# Data Processing
+pandas>=2.1.0
+numpy>=1.24.0
+
+# LLM APIs
+anthropic>=0.39.0
+requests>=2.31.0
+
+# Google Cloud (for Qwen Vertex)
+google-auth>=2.23.0
+google-cloud-aiplatform>=1.38.0
+
+# Embeddings (REAL, not dummy!)
+sentence-transformers>=2.2.2
+torch>=2.0.0  # Required by sentence-transformers
+
+# Environment & Config
+python-dotenv>=1.0.0
+
+# Excel Export
+openpyxl>=3.1.0
+
+# Utilities
+tqdm>=4.66.0  # Progress bars for migration
