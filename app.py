@@ -2776,6 +2776,12 @@ with st.sidebar:
             # Reasoning LLM
             "Reasoning Input Tokens",
             "Reasoning Output Tokens",
+            "Reasoning Pass1 Input Tokens",
+            "Reasoning Pass1 Output Tokens",
+            "Reasoning Pass2 Input Tokens",
+            "Reasoning Pass2 Output Tokens",
+            "Opus Complex Input Tokens",
+            "Opus Complex Output Tokens",
             
             # SQL Coder
             "SQL Coder Input Tokens",
@@ -2786,9 +2792,15 @@ with st.sidebar:
             "Opus Output Tokens",
             "Opus Verdict",
             
-            # Refinement
+            # Refinement / Recovery / Charts
             "Refinement Input Tokens",
             "Refinement Output Tokens",
+            "Error Fix Reasoning Input Tokens",
+            "Error Fix Reasoning Output Tokens",
+            "Error Fix Opus Input Tokens",
+            "Error Fix Opus Output Tokens",
+            "Chart Builder Input Tokens",
+            "Chart Builder Output Tokens",
             
             # Totals
             "Total Input Tokens",
@@ -2856,9 +2868,15 @@ with st.sidebar:
                     "",
                     "Total Classifier Tokens",
                     "Total Reasoning Tokens",
+                    "Total Pass1 Tokens",
+                    "Total Pass2 Tokens",
+                    "Total Opus Complex Tokens",
                     "Total SQL Coder Tokens",
                     "Total Opus Tokens",
                     "Total Refinement Tokens",
+                    "Total Error Fix (Reasoning) Tokens",
+                    "Total Error Fix (Opus) Tokens",
+                    "Total Chart Builder Tokens",
                     "Grand Total Tokens",
                     "",
                     "Queries with Rule RAG",
@@ -2877,9 +2895,15 @@ with st.sidebar:
                     "",
                     df_export["Classifier Input Tokens"].sum() + df_export["Classifier Output Tokens"].sum() if "Classifier Input Tokens" in df_export.columns else 0,
                     df_export["Reasoning Input Tokens"].sum() + df_export["Reasoning Output Tokens"].sum() if "Reasoning Input Tokens" in df_export.columns else 0,
+                    df_export["Reasoning Pass1 Input Tokens"].sum() + df_export["Reasoning Pass1 Output Tokens"].sum() if "Reasoning Pass1 Input Tokens" in df_export.columns else 0,
+                    df_export["Reasoning Pass2 Input Tokens"].sum() + df_export["Reasoning Pass2 Output Tokens"].sum() if "Reasoning Pass2 Input Tokens" in df_export.columns else 0,
+                    df_export["Opus Complex Input Tokens"].sum() + df_export["Opus Complex Output Tokens"].sum() if "Opus Complex Input Tokens" in df_export.columns else 0,
                     df_export["SQL Coder Input Tokens"].sum() + df_export["SQL Coder Output Tokens"].sum() if "SQL Coder Input Tokens" in df_export.columns else 0,
                     df_export["Opus Input Tokens"].sum() + df_export["Opus Output Tokens"].sum() if "Opus Input Tokens" in df_export.columns else 0,
                     df_export["Refinement Input Tokens"].sum() + df_export["Refinement Output Tokens"].sum() if "Refinement Input Tokens" in df_export.columns else 0,
+                    df_export["Error Fix Reasoning Input Tokens"].sum() + df_export["Error Fix Reasoning Output Tokens"].sum() if "Error Fix Reasoning Input Tokens" in df_export.columns else 0,
+                    df_export["Error Fix Opus Input Tokens"].sum() + df_export["Error Fix Opus Output Tokens"].sum() if "Error Fix Opus Input Tokens" in df_export.columns else 0,
+                    df_export["Chart Builder Input Tokens"].sum() + df_export["Chart Builder Output Tokens"].sum() if "Chart Builder Input Tokens" in df_export.columns else 0,
                     df_export["Total Tokens"].sum() if "Total Tokens" in df_export.columns else 0,
                     "",
                     len(df_export[df_export["Rule RAG Used"] == "Yes"]) if "Rule RAG Used" in df_export.columns else 0,
