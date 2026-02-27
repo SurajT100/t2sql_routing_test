@@ -2215,17 +2215,28 @@ with tab3:
                 with st.expander("💰 Token Usage Breakdown", expanded=True):
                     tokens = result.tokens
                     token_data = []
-                    
-                    if tokens.classifier["input"] + tokens.classifier["output"] > 0:
-                        token_data.append({"Stage": "🏷️ Classifier", "Input": tokens.classifier["input"], "Output": tokens.classifier["output"]})
-                    if tokens.reasoning["input"] + tokens.reasoning["output"] > 0:
-                        token_data.append({"Stage": "🧠 Reasoning", "Input": tokens.reasoning["input"], "Output": tokens.reasoning["output"]})
-                    if tokens.sql_gen["input"] + tokens.sql_gen["output"] > 0:
-                        token_data.append({"Stage": "⚙️ SQL Gen", "Input": tokens.sql_gen["input"], "Output": tokens.sql_gen["output"]})
-                    if tokens.opus["input"] + tokens.opus["output"] > 0:
-                        token_data.append({"Stage": "🎯 Opus", "Input": tokens.opus["input"], "Output": tokens.opus["output"]})
-                    if tokens.chart["input"] + tokens.chart["output"] > 0:
-                        token_data.append({"Stage": "📊 Chart Builder", "Input": tokens.chart["input"], "Output": tokens.chart["output"]})
+
+                    stage_rows = [
+                        ("🏷️ Classifier", tokens.classifier),
+                        ("🧠 Reasoning", tokens.reasoning),
+                        ("🧠 Reasoning Pass 1", tokens.reasoning_pass1),
+                        ("🧠 Reasoning Pass 2", tokens.reasoning_pass2),
+                        ("🧠 Opus Complex", tokens.opus_complex),
+                        ("⚙️ SQL Gen", tokens.sql_gen),
+                        ("🎯 Opus", tokens.opus),
+                        ("🔧 Refinement", tokens.refinement),
+                        ("🩹 Error Fix (Reasoning)", tokens.error_fix_reasoning),
+                        ("🩹 Error Fix (Opus)", tokens.error_fix_opus),
+                        ("📊 Chart Builder", tokens.chart),
+                    ]
+
+                    for stage_label, stage_tokens in stage_rows:
+                        if stage_tokens["input"] + stage_tokens["output"] > 0:
+                            token_data.append({
+                                "Stage": stage_label,
+                                "Input": stage_tokens["input"],
+                                "Output": stage_tokens["output"]
+                            })
                     
                     # Show resolver stats (no LLM tokens — DB query time)
                     if hasattr(result, 'resolver_result') and result.resolver_result:
@@ -2234,15 +2245,25 @@ with tab3:
                             "Stage": f"🔍 Resolver ({resolver_r.queries_run} queries, {resolver_r.total_time_ms}ms)",
                             "Input": 0,
                             "Output": 0
-                        })                    
+                        })
+
                     if token_data:
                         for row in token_data:
                             row["Total"] = row["Input"] + row["Output"]
                         
                         df_tokens = pd.DataFrame(token_data)
-                        total_row = {"Stage": "**TOTAL**", "Input": df_tokens["Input"].sum(), "Output": df_tokens["Output"].sum(), "Total": df_tokens["Total"].sum()}
+                        grand_total = tokens.total()
+                        total_row = {
+                            "Stage": "**TOTAL**",
+                            "Input": grand_total["input"],
+                            "Output": grand_total["output"],
+                            "Total": grand_total["input"] + grand_total["output"]
+                        }
                         df_tokens = pd.concat([df_tokens, pd.DataFrame([total_row])], ignore_index=True)
                         st.dataframe(df_tokens, use_container_width=True, hide_index=True)
+
+                        if hasattr(result, 'resolver_result') and result.resolver_result:
+                            st.caption("ℹ️ Resolver runs DB lookups only, so it shows activity/time but 0 LLM tokens.")
                         
                         # Savings calculation
                         baseline = 15000
@@ -2377,6 +2398,12 @@ with tab3:
                                         question=question,
                                         llm_provider=st.session_state.get('reasoning_provider', 'claude_sonnet')
                                     )
+
+                                    if chart_tokens:
+                                        result.tokens.chart = {
+                                            "input": chart_tokens.get("input", 0),
+                                            "output": chart_tokens.get("output", 0)
+                                        }
 
                                     if not chart_rendered:
                                         st.info("📋 No suitable chart for this result — showing table")
@@ -2628,6 +2655,12 @@ with tab3:
                     # Reasoning LLM (Sonnet)
                     "Reasoning Input Tokens": result.tokens.reasoning["input"],
                     "Reasoning Output Tokens": result.tokens.reasoning["output"],
+                    "Reasoning Pass1 Input Tokens": result.tokens.reasoning_pass1["input"],
+                    "Reasoning Pass1 Output Tokens": result.tokens.reasoning_pass1["output"],
+                    "Reasoning Pass2 Input Tokens": result.tokens.reasoning_pass2["input"],
+                    "Reasoning Pass2 Output Tokens": result.tokens.reasoning_pass2["output"],
+                    "Opus Complex Input Tokens": result.tokens.opus_complex["input"],
+                    "Opus Complex Output Tokens": result.tokens.opus_complex["output"],
                     
                     # SQL Coder (Llama/Groq)
                     "SQL Coder Input Tokens": result.tokens.sql_gen["input"],
@@ -2641,10 +2674,16 @@ with tab3:
                     # Refinement (if Opus found error)
                     "Refinement Input Tokens": result.tokens.refinement["input"],
                     "Refinement Output Tokens": result.tokens.refinement["output"],
+                    "Error Fix Reasoning Input Tokens": result.tokens.error_fix_reasoning["input"],
+                    "Error Fix Reasoning Output Tokens": result.tokens.error_fix_reasoning["output"],
+                    "Error Fix Opus Input Tokens": result.tokens.error_fix_opus["input"],
+                    "Error Fix Opus Output Tokens": result.tokens.error_fix_opus["output"],
+                    "Chart Builder Input Tokens": result.tokens.chart["input"],
+                    "Chart Builder Output Tokens": result.tokens.chart["output"],
                     
                     # Total Tokens
-                    "Total Input Tokens": result.tokens.classifier["input"] + result.tokens.reasoning["input"] + result.tokens.sql_gen["input"] + result.tokens.opus["input"] + result.tokens.refinement["input"],
-                    "Total Output Tokens": result.tokens.classifier["output"] + result.tokens.reasoning["output"] + result.tokens.sql_gen["output"] + result.tokens.opus["output"] + result.tokens.refinement["output"],
+                    "Total Input Tokens": result.tokens.total()["input"],
+                    "Total Output Tokens": result.tokens.total()["output"],
                     "Total Tokens": result.tokens.total_tokens(),
                     
                     # RAG Details
