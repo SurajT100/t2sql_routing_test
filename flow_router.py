@@ -287,17 +287,35 @@ class TokenUsage:
     chart: Dict[str, int] = field(default_factory=lambda: {"input": 0, "output": 0})
 
     def total(self) -> Dict[str, int]:
+        """
+        Total token usage without double-counting legacy reasoning.
+
+        `reasoning` is a legacy single-pass bucket. New routed flows use
+        `reasoning_pass1`/`reasoning_pass2`/`opus_complex`. If both are present,
+        count only the pass/opus buckets.
+        """
+        has_new_reasoning = (
+            self.reasoning_pass1["input"] + self.reasoning_pass1["output"] +
+            self.reasoning_pass2["input"] + self.reasoning_pass2["output"] +
+            self.opus_complex["input"] + self.opus_complex["output"]
+        ) > 0
+
+        reasoning_input = 0 if has_new_reasoning else self.reasoning["input"]
+        reasoning_output = 0 if has_new_reasoning else self.reasoning["output"]
+
         return {
-            "input": (self.classifier["input"] + self.reasoning["input"] +
+            "input": (self.classifier["input"] + reasoning_input +
                      self.reasoning_pass1["input"] + self.reasoning_pass2["input"] +
                      self.opus_complex["input"] +
                      self.sql_gen["input"] + self.opus["input"] + self.refinement["input"] +
-                     self.error_fix_reasoning["input"] + self.error_fix_opus["input"]),
-            "output": (self.classifier["output"] + self.reasoning["output"] +
+                     self.error_fix_reasoning["input"] + self.error_fix_opus["input"] +
+                     self.chart["input"]),
+            "output": (self.classifier["output"] + reasoning_output +
                       self.reasoning_pass1["output"] + self.reasoning_pass2["output"] +
                       self.opus_complex["output"] +
                       self.sql_gen["output"] + self.opus["output"] + self.refinement["output"] +
-                      self.error_fix_reasoning["output"] + self.error_fix_opus["output"])
+                      self.error_fix_reasoning["output"] + self.error_fix_opus["output"] +
+                      self.chart["output"])
         }
 
     def total_tokens(self) -> int:
@@ -799,8 +817,6 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
             result.llm_trace.sql_gen_input = sql_prompt
             result.llm_trace.sql_gen_output = sql_response
 
-            # Keep legacy reasoning field populated for backward compat
-            result.tokens.reasoning = pass1_tokens
 
         elif complexity_norm == "complex":
             # ── COMPLEX: Pass 1 (bare + rules) → Context Agent → Opus single call ─
@@ -866,8 +882,6 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
             result.pass2_plan = opus_response
             print(f"[STAGE3] COMPLEX Opus call complete — {opus_complex_tokens.get('input',0)+opus_complex_tokens.get('output',0)} tokens")
 
-            # Legacy reasoning token compat
-            result.tokens.reasoning = pass1_tokens
 
         else:
             # Fallback — treat as analytical
