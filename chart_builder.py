@@ -117,9 +117,20 @@ def _plan_chart(df: pd.DataFrame, question: str, llm_provider: str) -> tuple[Opt
     )
 
     response, tokens = call_llm(prompt, llm_provider)
+
+    # Keep planner I/O visible for debugging in UI
+    st.session_state['chart_planner_debug'] = {
+        'question': question,
+        'prompt': prompt,
+        'raw_response': response,
+        'profile': profile
+    }
+
     plan = _safe_json_loads(response)
     if not plan:
         return None, tokens
+
+    st.session_state['chart_planner_debug']['plan'] = plan
     return plan, tokens
 
 
@@ -163,6 +174,11 @@ def _apply_plan(df: pd.DataFrame, plan: dict[str, Any]) -> pd.DataFrame:
     drop_cols = [c for c in [x, y] if c and c in out.columns]
     if drop_cols:
         out = out.dropna(subset=drop_cols)
+
+    # Drop textual null-like categories that often come from SQL output formatting
+    if x and x in out.columns:
+        out[x] = out[x].astype(str).str.strip()
+        out = out[~out[x].str.lower().isin({'null', 'none', 'nan', ''})]
 
     return out
 
@@ -210,6 +226,35 @@ def _render_altair_chart(df: pd.DataFrame, plan: dict[str, Any]) -> bool:
     st.altair_chart(chart.interactive(), use_container_width=True)
     return True
 
+
+
+
+def _render_plotly_xy(df: pd.DataFrame, plan: dict[str, Any]) -> bool:
+    import plotly.express as px
+
+    chart_type = (plan.get("chart_type") or "").lower()
+    x = plan.get("x")
+    y = plan.get("y")
+    color = plan.get("color") if plan.get("color") in df.columns else None
+    title = plan.get("title") or "Query Chart"
+
+    if not x or not y or x not in df.columns or y not in df.columns:
+        return False
+
+    if chart_type == "bar":
+        fig = px.bar(df, x=x, y=y, color=color, title=title, text_auto='.2s')
+    elif chart_type == "line":
+        fig = px.line(df, x=x, y=y, color=color, title=title, markers=True)
+    elif chart_type == "area":
+        fig = px.area(df, x=x, y=y, color=color, title=title)
+    elif chart_type == "scatter":
+        fig = px.scatter(df, x=x, y=y, color=color, title=title)
+    else:
+        return False
+
+    fig.update_layout(template="plotly_white", hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
+    return True
 
 def _render_plotly_pie(df: pd.DataFrame, plan: dict[str, Any]) -> bool:
     import plotly.express as px
@@ -282,11 +327,28 @@ def build_and_render_chart(
     if chart_type in {"pie", "donut"}:
         rendered = _render_plotly_pie(prepared, plan)
     else:
-        rendered = _render_altair_chart(prepared, plan)
+        # Prefer Plotly for xy charts to avoid blank mark rendering issues
+        rendered = _render_plotly_xy(prepared, plan)
+        if not rendered:
+            rendered = _render_altair_chart(prepared, plan)
 
     if rendered:
         reason = plan.get("reason")
         if reason:
             st.caption(f"🧠 Chart logic: {reason}")
+
+    with st.expander("🔍 View chart planner input/output", expanded=False):
+        dbg = st.session_state.get('chart_planner_debug', {})
+        if dbg.get('prompt'):
+            st.caption("Planner Prompt")
+            st.code(dbg['prompt'][:8000])
+        if dbg.get('raw_response'):
+            st.caption("Planner Raw Response")
+            st.code(str(dbg['raw_response'])[:4000])
+        if dbg.get('plan'):
+            st.caption("Parsed Plan")
+            st.json(dbg['plan'])
+        st.caption("Prepared table used for chart")
+        st.dataframe(prepared.head(30), use_container_width=True)
 
     return rendered, tokens
