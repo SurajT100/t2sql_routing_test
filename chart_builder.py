@@ -276,6 +276,72 @@ def _render_plotly_pie(df: pd.DataFrame, plan: dict[str, Any]) -> bool:
     return True
 
 
+
+
+def _render_manual_chart(df: pd.DataFrame) -> bool:
+    """Render user-selected chart using chosen x/y axes."""
+    import plotly.express as px
+
+    if df is None or df.empty:
+        return False
+
+    cols = list(df.columns)
+    if len(cols) < 2:
+        st.info("Manual chart mode requires at least 2 columns.")
+        return False
+
+    numeric_cols = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
+    default_y = numeric_cols[0] if numeric_cols else cols[1]
+    default_x = cols[0] if cols[0] != default_y else cols[1]
+
+    m1, m2, m3 = st.columns([1, 1, 1])
+    with m1:
+        chart_type = st.selectbox(
+            "Chart Type",
+            ["bar", "line", "area", "scatter", "pie", "donut"],
+            index=0,
+            key="manual_chart_type"
+        )
+    with m2:
+        x = st.selectbox("X Axis", cols, index=cols.index(default_x), key="manual_chart_x")
+    with m3:
+        y = st.selectbox("Y Axis", cols, index=cols.index(default_y), key="manual_chart_y")
+
+    if x == y:
+        st.warning("Please choose different columns for X and Y axes.")
+        return False
+
+    # Clean selected columns for plotting
+    df_plot = df.copy()
+    if y in df_plot.columns:
+        df_plot[y] = pd.to_numeric(df_plot[y], errors="coerce")
+    df_plot = df_plot.dropna(subset=[x, y])
+
+    if df_plot.empty:
+        st.info("No plottable rows for selected axes.")
+        return False
+
+    title = f"{y} by {x}"
+    if chart_type == "bar":
+        fig = px.bar(df_plot, x=x, y=y, title=title, text_auto='.2s')
+    elif chart_type == "line":
+        fig = px.line(df_plot, x=x, y=y, title=title, markers=True)
+    elif chart_type == "area":
+        fig = px.area(df_plot, x=x, y=y, title=title)
+    elif chart_type == "scatter":
+        fig = px.scatter(df_plot, x=x, y=y, title=title)
+    elif chart_type == "pie":
+        fig = px.pie(df_plot, names=x, values=y, title=title)
+    elif chart_type == "donut":
+        fig = px.pie(df_plot, names=x, values=y, hole=0.45, title=title)
+    else:
+        return False
+
+    fig.update_layout(template="plotly_white")
+    st.plotly_chart(fig, use_container_width=True)
+    return True
+
+
 def build_and_render_chart(
     df: pd.DataFrame,
     question: str,
@@ -297,6 +363,17 @@ def build_and_render_chart(
         for i, col in enumerate(df.columns[:4]):
             cols[i].metric(str(col), str(row[col]))
         return True, empty_tokens
+
+    view_mode = st.radio(
+        "Chart Mode",
+        ["Smart (Auto)", "Manual"],
+        horizontal=True,
+        key="chart_view_mode"
+    )
+
+    if view_mode == "Manual":
+        rendered = _render_manual_chart(df)
+        return rendered, empty_tokens
 
     with st.spinner("📊 Planning best visualization..."):
         plan, tokens = _plan_chart(df, question, llm_provider)
