@@ -37,115 +37,160 @@ def safe_json_dumps(obj, **kwargs) -> str:
 
 def compress_rules_for_llm(rules: List[Dict]) -> str:
     """
-    Convert verbose business rules to compact format.
-    
-    BEFORE (80 tokens per rule):
-    ─────────────────────────────
-    Rule: Revenue Calculation
-    Description: Revenue is calculated by summing the Amount column 
-    from the Orders table. Important: You must exclude all records where 
-    Status equals 'Cancelled' as these are not completed orders.
-    
-    AFTER (20 tokens per rule):
-    ────────────────────────────
-    {"type": "metric", "name": "Revenue", "formula": "SUM(Amount)", "filter": "Status <> 'Cancelled'"}
-    
-    Args:
-        rules: List of rule dictionaries from RAG
-    
-    Returns:
-        Compact JSON string of rules
+    Quality-first rule compression.
+
+    Goal: reduce token size while preserving business logic fidelity.
+    We keep critical semantics (formula/sql_pattern/conditions/filters/mappings)
+    and only trim verbose narrative text.
     """
     compressed = []
-    
+
     for rule in rules:
         rule_type = rule.get("rule_type", "other")
         rule_name = rule.get("rule_name", "Unknown")
+        rule_desc = rule.get("rule_description", "")
         rule_data = rule.get("rule_data", {})
-        
-        # Parse rule_data if it's a string
+
         if isinstance(rule_data, str):
             try:
                 rule_data = json.loads(rule_data)
-            except:
+            except Exception:
                 rule_data = {}
-        
-        # ALL rules get name and type for display
-        compact_rule = {"type": rule_type, "name": rule_name}
-        
+
+        compact_rule = {
+            "type": rule_type,
+            "name": rule_name,
+        }
+
+        # Preserve lightweight metadata that helps ranking/applicability
+        if rule.get("priority") is not None:
+            compact_rule["priority"] = rule.get("priority")
+        if rule.get("is_mandatory") is not None:
+            compact_rule["mandatory"] = bool(rule.get("is_mandatory"))
+        if rule.get("keywords"):
+            compact_rule["keywords"] = rule.get("keywords")[:12]
+        if rule.get("tables"):
+            compact_rule["tables"] = rule.get("tables")[:8]
+
         if rule_type == "metric":
-            compact_rule.update({
-                "formula": rule_data.get("formula", ""),
-            })
-            if rule_data.get("condition"):
-                compact_rule["filter"] = rule_data["condition"]
-            if rule_data.get("note"):
-                compact_rule["note"] = rule_data["note"][:80]
-        
-        elif rule_type == "join":
-            compact_rule.update({
-                "tables": rule_data.get("tables", []),
-                "on": rule_data.get("join_condition", ""),
-            })
-            if rule_data.get("join_type"):
-                compact_rule["join_type"] = rule_data["join_type"]
-        
-        elif rule_type == "filter":
-            compact_rule.update({
-                "apply": rule_data.get("sql_pattern", ""),
-            })
+            # Keep core metric semantics intact
+            for key, out_key in [
+                ("formula", "formula"),
+                ("aggregation", "aggregation"),
+                ("table", "table"),
+                ("column", "column"),
+                ("transform", "transform"),
+                ("display_unit", "unit"),
+                ("condition", "filter"),
+            ]:
+                val = rule_data.get(key)
+                if val not in (None, "", [], {}):
+                    compact_rule[out_key] = val
+
+            # Preserve mandatory filters/business-term aliases (high-value for accuracy)
+            if rule_data.get("mandatory_filters"):
+                compact_rule["mandatory_filters"] = rule_data["mandatory_filters"]
+            if rule_data.get("user_terms"):
+                compact_rule["user_terms"] = rule_data["user_terms"][:12]
             if rule_data.get("description"):
-                compact_rule["desc"] = rule_data["description"][:60]
-        
-        elif rule_type == "mapping" or rule_type == "value_mapping":
-            compact_rule.update({
-                "maps": rule_data.get("mappings", rule_data.get("values", {})),
-            })
-        
-        elif rule_type == "dialect" or rule_type == "default":
-            # For dialect rules: only keep essential syntax info, strip everything else
+                compact_rule["desc"] = str(rule_data["description"])[:220]
+            elif rule_desc:
+                compact_rule["desc"] = str(rule_desc)[:220]
+
+        elif rule_type == "join":
+            # Join condition must remain exact
+            compact_rule["on"] = rule_data.get("join_condition", "")
+            if rule_data.get("tables"):
+                compact_rule["tables"] = rule_data.get("tables", [])[:8]
+            if rule_data.get("join_type"):
+                compact_rule["join_type"] = rule_data.get("join_type")
+            if rule_data.get("description"):
+                compact_rule["desc"] = str(rule_data["description"])[:180]
+            elif rule_desc:
+                compact_rule["desc"] = str(rule_desc)[:180]
+
+        elif rule_type == "filter":
+            # Preserve full filter logic; this is accuracy-critical
+            if rule_data.get("sql_pattern"):
+                compact_rule["apply"] = rule_data.get("sql_pattern")
+            for key in ["table", "column", "operator", "values", "filter_name", "user_terms"]:
+                val = rule_data.get(key)
+                if val not in (None, "", [], {}):
+                    compact_rule[key] = val
+            if rule_data.get("description"):
+                compact_rule["desc"] = str(rule_data["description"])[:180]
+            elif rule_desc:
+                compact_rule["desc"] = str(rule_desc)[:180]
+
+        elif rule_type in ("mapping", "value_mapping", "term_alias"):
+            # Mapping structure is usually compact and highly informative
+            mappings = rule_data.get("mappings", rule_data.get("values", {}))
+            if mappings:
+                compact_rule["maps"] = mappings
+            for key in ["source", "target", "table", "column", "description_type", "description", "user_terms"]:
+                val = rule_data.get(key)
+                if val not in (None, "", [], {}):
+                    compact_rule[key] = val
+            if rule_desc and "description" not in compact_rule:
+                compact_rule["desc"] = str(rule_desc)[:200]
+
+        elif rule_type in ("dialect", "default"):
             if rule_type == "dialect":
+                # Keep dialect directives exact and complete
                 compact_rule = {
                     "type": "dialect",
+                    "name": rule_name,
                     "db": rule_data.get("dialect", ""),
                     "quote": rule_data.get("quote_char", '"'),
-                    "str_quote": rule_data.get("string_quote", "'")
+                    "str_quote": rule_data.get("string_quote", "'"),
+                    "schema_hint": rule_data.get("schema_qualification", ""),
+                    "date_functions": rule_data.get("date_functions", {}),
+                    "limit_syntax": rule_data.get("limit_syntax", ""),
                 }
             else:
-                # default rules: keep sql_pattern and description (business logic critical)
-                if rule_data.get("sql_pattern"):
-                    compact_rule["apply"] = rule_data["sql_pattern"]
+                # Default/critical business rules should retain full logic
+                for key, out_key in [
+                    ("sql_pattern", "apply"),
+                    ("condition", "condition"),
+                    ("auto_apply", "auto_apply"),
+                    ("rule_type", "subtype"),
+                    ("applies_to_queries", "applies_to_queries"),
+                ]:
+                    val = rule_data.get(key)
+                    if val not in (None, "", [], {}):
+                        compact_rule[out_key] = val
                 if rule_data.get("description"):
-                    compact_rule["desc"] = rule_data["description"][:100]
-                if rule_data.get("condition"):
-                    compact_rule["filter"] = rule_data["condition"]
-        
-        elif rule_type == "example" or rule_type == "query_example":
+                    compact_rule["desc"] = str(rule_data["description"])[:260]
+                elif rule_desc:
+                    compact_rule["desc"] = str(rule_desc)[:260]
+
+        elif rule_type in ("example", "query_example"):
+            # Keep concise examples (still useful but token-capped)
             compact_rule.update({
-                "q": rule_data.get("question", rule.get("rule_name", ""))[:100],
-                "sql": rule_data.get("sql", ""),
+                "q": rule_data.get("question", rule_name)[:160],
+                "sql": rule_data.get("sql", "")[:500],
             })
-        
-        elif rule_type == "column" or rule_type == "table_column":
+
+        elif rule_type in ("column", "table_column"):
             compact_rule.update({
-                "col": rule_data.get("column_name", rule.get("rule_name", "")),
-                "desc": rule_data.get("description", rule.get("rule_description", ""))[:100],
+                "col": rule_data.get("column_name", rule_name),
+                "table": rule_data.get("table_name", rule_data.get("table", "")),
+                "desc": rule_data.get("description", rule_desc)[:220],
             })
             if rule_data.get("business_terms"):
-                compact_rule["terms"] = rule_data["business_terms"][:5]
-        
+                compact_rule["terms"] = rule_data["business_terms"][:12]
+
         else:
-            # Generic compression for unknown types
-            compact_rule.update({
-                "desc": rule.get("rule_description", "")[:100],
-            })
-        
-        # Remove empty values
-        compact_rule = {k: v for k, v in compact_rule.items() if v}
-        
-        if len(compact_rule) > 1:  # Has more than just 'type'
+            # Generic safe fallback
+            if rule_data:
+                compact_rule["data"] = rule_data
+            if rule_desc:
+                compact_rule["desc"] = str(rule_desc)[:200]
+
+        compact_rule = {k: v for k, v in compact_rule.items() if v not in (None, "", [], {})}
+        if len(compact_rule) > 1:
             compressed.append(compact_rule)
-    
+
     return safe_json_dumps(compressed, separators=(',', ':'))
 
 
