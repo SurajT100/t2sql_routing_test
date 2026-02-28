@@ -78,6 +78,24 @@ def _profile_df(df: pd.DataFrame) -> dict[str, Any]:
     return profile
 
 
+def _is_likely_datetime(series: pd.Series) -> bool:
+    """Heuristic: treat as datetime only when most rows parse successfully."""
+    converted = pd.to_datetime(series, errors="coerce")
+    threshold = max(3, int(len(series) * 0.6))
+    return converted.notna().sum() >= threshold
+
+
+def _coerce_numeric_if_possible(series: pd.Series) -> pd.Series:
+    """Convert object-like numeric columns (e.g. '123.45') safely to numeric."""
+    if pd.api.types.is_numeric_dtype(series):
+        return series
+    converted = pd.to_numeric(series, errors="coerce")
+    threshold = max(3, int(len(series) * 0.6))
+    if converted.notna().sum() >= threshold:
+        return converted
+    return series
+
+
 def _safe_json_loads(text: str) -> Optional[dict[str, Any]]:
     content = text.strip()
     if content.startswith("```"):
@@ -111,8 +129,11 @@ def _apply_plan(df: pd.DataFrame, plan: dict[str, Any]) -> pd.DataFrame:
     y = plan.get("y")
     agg = (plan.get("aggregation") or "none").lower()
 
-    if x and x in out.columns and pd.api.types.is_datetime64_any_dtype(pd.to_datetime(out[x], errors="coerce")):
+    # Ensure chart axes use real usable values
+    if x and x in out.columns and _is_likely_datetime(out[x]):
         out[x] = pd.to_datetime(out[x], errors="coerce")
+    if y and y in out.columns:
+        out[y] = _coerce_numeric_if_possible(out[y])
 
     if x and y and x in out.columns and y in out.columns and agg in {"sum", "avg", "count"}:
         if agg == "sum":
@@ -138,6 +159,11 @@ def _apply_plan(df: pd.DataFrame, plan: dict[str, Any]) -> pd.DataFrame:
     if isinstance(limit, int) and limit > 0 and len(out) > limit:
         out = out.head(limit)
 
+    # Prevent blank charts from null axis/value rows
+    drop_cols = [c for c in [x, y] if c and c in out.columns]
+    if drop_cols:
+        out = out.dropna(subset=drop_cols)
+
     return out
 
 
@@ -159,13 +185,25 @@ def _render_altair_chart(df: pd.DataFrame, plan: dict[str, Any]) -> bool:
         return False
 
     if chart_type == "bar":
-        chart = base.mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(y=alt.Y(y), color=color if color in df.columns else alt.value("#4F86C6"))
+        if color in df.columns:
+            chart = base.mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(y=alt.Y(y), color=alt.Color(color))
+        else:
+            chart = base.mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4, color="#4F86C6").encode(y=alt.Y(y))
     elif chart_type == "line":
-        chart = base.mark_line(point=True, strokeWidth=3).encode(y=alt.Y(y), color=color if color in df.columns else alt.value("#4F86C6"))
+        if color in df.columns:
+            chart = base.mark_line(point=True, strokeWidth=3).encode(y=alt.Y(y), color=alt.Color(color))
+        else:
+            chart = base.mark_line(point=True, strokeWidth=3, color="#4F86C6").encode(y=alt.Y(y))
     elif chart_type == "area":
-        chart = base.mark_area(opacity=0.65).encode(y=alt.Y(y), color=color if color in df.columns else alt.value("#4F86C6"))
+        if color in df.columns:
+            chart = base.mark_area(opacity=0.65).encode(y=alt.Y(y), color=alt.Color(color))
+        else:
+            chart = base.mark_area(opacity=0.65, color="#4F86C6").encode(y=alt.Y(y))
     elif chart_type == "scatter":
-        chart = base.mark_circle(size=100, opacity=0.8).encode(y=alt.Y(y), color=color if color in df.columns else alt.value("#4F86C6"), tooltip=list(df.columns))
+        if color in df.columns:
+            chart = base.mark_circle(size=100, opacity=0.8).encode(y=alt.Y(y), color=alt.Color(color), tooltip=list(df.columns))
+        else:
+            chart = base.mark_circle(size=100, opacity=0.8, color="#4F86C6").encode(y=alt.Y(y), tooltip=list(df.columns))
     else:
         return False
 
@@ -235,6 +273,7 @@ def build_and_render_chart(
 
     prepared = _apply_plan(df, plan)
     if prepared.empty:
+        st.info("📋 Chart plan produced no plottable rows from the final table. Showing data instead.")
         return False, tokens
 
     chart_type = (plan.get("chart_type") or "").lower()
