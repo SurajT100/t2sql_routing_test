@@ -1,245 +1,197 @@
 """
 Chart Builder
 =============
-Uses Claude Sonnet to generate Plotly chart code on the fly.
-LLM sees actual data, question, and style guidelines — handles
-sorting, formatting, edge cases automatically.
+Adaptive chart planner + renderer for Streamlit query results.
 
-Usage:
-    from chart_builder import build_and_render_chart
-    build_and_render_chart(df, question, llm_provider="claude_sonnet")
+- Uses LLM to choose chart intent from question + dataframe profile
+- Uses Altair for modern visual styling (primary)
+- Falls back to Plotly/table when needed
 """
+
+from __future__ import annotations
+
+import json
+from typing import Any, Optional
 
 import pandas as pd
 import streamlit as st
-import traceback
-import json
-from typing import Optional
 
 
-# =============================================================================
-# STYLE GUIDELINES — injected into every Chart Builder prompt
-# =============================================================================
+MAX_PROFILE_ROWS = 50
+DEFAULT_TOP_N = 20
 
-CHART_STYLE_GUIDELINES = """
-PLOTLY STYLE REQUIREMENTS (follow exactly):
 
-TEMPLATE & FONTS:
-- template="plotly_white"
-- font=dict(family="DM Sans, Segoe UI, sans-serif", size=13, color="#1e293b")
-- title_font=dict(size=16, family="DM Sans, Segoe UI, sans-serif", color="#0f172a", bold=True)
+VIS_PLANNING_GUIDELINES = """
+You are a senior data-visualization planner.
+Return ONLY strict JSON (no markdown) with this schema:
+{
+  "render": "chart" | "table" | "metric",
+  "chart_type": "bar" | "line" | "area" | "scatter" | "pie" | "donut" | null,
+  "x": "column_name_or_null",
+  "y": "column_name_or_null",
+  "color": "column_name_or_null",
+  "aggregation": "none" | "sum" | "avg" | "count",
+  "sort": "x_asc" | "x_desc" | "y_asc" | "y_desc" | "time_asc",
+  "limit": integer,
+  "title": "short_title",
+  "reason": "one sentence"
+}
 
-COLORS (use this palette in order):
-COLORS = ["#4F86C6", "#F4845F", "#57B894", "#A78BFA", "#F59E0B",
-          "#EC4899", "#06B6D4", "#84CC16"]
-
-LAYOUT:
-- plot_bgcolor="white"
-- paper_bgcolor="white"  
-- margin=dict(l=50, r=30, t=70, b=60)
-- legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-- showlegend=True (only if multiple series)
-
-AXES:
-- showgrid=True on y-axis only, gridcolor="#f1f5f9", gridwidth=1
-- showgrid=False on x-axis
-- linecolor="#e2e8f0", linewidth=1
-- Remove top and right axis borders: mirror=False
-- Rotate x-axis labels if more than 6 categories: tickangle=-35
-
-NUMBERS & FORMATTING:
-- Format large numbers in axis ticks using tickformat
-- If values > 10,000,000 → use ticksuffix=" Cr", divide by 10000000
-- If values > 100,000 → use ticksuffix=" L", divide by 100000
-- Add comma separators for all numbers
-- Show data labels on bars only if <= 12 bars
-
-SORTING RULES (CRITICAL):
-- Time series data: ALWAYS sort chronologically by date/period column
-- Month names: sort Jan→Dec not alphabetically
-- Quarter names: sort Q1→Q4
-- Bar charts: sort by value descending UNLESS it's a ranking/ordered question
-- Never plot in random DataFrame order
-
-DATE/TIMESTAMP FORMATTING:
-- Convert full timestamps like "2025-06-01 00:00:00+00:00" to "Jun 2025"
-- Use pd.to_datetime() then .dt.strftime("%b %Y") for month columns
-- Use .dt.strftime("%b '%y") for compact month labels
-
-BARS:
-- marker_line_width=0 (no bar borders)
-- opacity=0.9
-- Bar gap: bargap=0.3
-
-LINES:
-- line_width=2.5
-- markers=True, marker_size=7, marker_line_width=0
-
-PIE/DONUT:
-- hole=0.38 (donut style)
-- Cap at 8 slices, group rest as "Other"
-- textinfo="percent+label", textposition="inside"
+Rules:
+1) Choose chart based on BOTH question intent and data shape.
+2) If only one value/row is meaningful, use render='metric'.
+3) If data cannot be visualized reliably, use render='table'.
+4) Prefer time-series charts when question asks trend/growth over time.
+5) For long category results, set reasonable limit (10-25).
+6) Pick existing columns exactly as named.
+7) If no safe chart mapping, do not guess.
 """
 
 
-# =============================================================================
-# CHART BUILDER — LLM generates Plotly code
-# =============================================================================
-
-def generate_chart_code(
-    df: pd.DataFrame,
-    question: str,
-    llm_provider: str = "claude_sonnet"
-) -> tuple[Optional[str], dict]:
-    """
-    Ask Claude Sonnet to write Plotly code for this specific DataFrame.
-
-    Args:
-        df: Query result DataFrame
-        question: Original user question
-        llm_provider: LLM provider key
-
-    Returns:
-        Tuple of (code string or None, token usage dict)
-    """
-    try:
-        from llm_v2 import call_llm
-
-        # Send first 20 rows so LLM sees real values
-        sample_rows = min(20, len(df))
-        data_sample = df.head(sample_rows).to_string(index=False)
-        dtypes_info = df.dtypes.to_string()
-
-        prompt = f"""You are an expert data visualization engineer.
-Write Python code using Plotly to create the best chart for this data.
-
-USER QUESTION: {question}
-
-DATAFRAME INFO:
-Columns and dtypes:
-{dtypes_info}
-
-Total rows: {len(df)}
-
-Sample data (first {sample_rows} rows):
-{data_sample}
-
-{CHART_STYLE_GUIDELINES}
-
-TASK:
-1. Analyze the question and data to choose the most appropriate chart type
-2. Sort the data correctly (time series chronologically, bars by value etc.)
-3. Format dates/timestamps to readable labels
-4. Apply all style guidelines above
-5. Write complete, runnable Python code
-
-AVAILABLE VARIABLES (already in scope, do NOT redefine):
-- df: the pandas DataFrame with query results
-- COLORS: list of hex color strings (from style guidelines)
-
-IMPORTS AVAILABLE:
-- import plotly.express as px
-- import plotly.graph_objects as go
-- import pandas as pd
-
-REQUIRED OUTPUT FORMAT:
-- Variable named `fig` must be the final Plotly figure
-- No st.plotly_chart() call — just create fig
-- No import statements needed
-- No print statements
-- Handle edge cases (empty data, single row, etc.)
-
-EXAMPLE STRUCTURE:
-# Sort data
-df_chart = df.copy()
-df_chart['Month'] = pd.to_datetime(df_chart['Month']).dt.strftime('%b %Y')
-df_chart = df_chart.sort_values(...)
-
-# Create figure
-fig = go.Figure()
-fig.add_trace(...)
-fig.update_layout(
-    title="...",
-    template="plotly_white",
-    ...
-)
-
-Return ONLY the Python code. No explanation, no markdown fences."""
-
-        response, tokens = call_llm(prompt, llm_provider)
-        print(f"[CHART BUILDER] Generated chart code ({tokens.get('output', 0)} output tokens)")
-
-        # Strip markdown fences if LLM added them
-        code = response.strip()
-        if code.startswith("```"):
-            lines = code.split("\n")
-            lines = lines[1:] if lines[0].startswith("```") else lines
-            lines = lines[:-1] if lines[-1].strip() == "```" else lines
-            code = "\n".join(lines)
-
-        return code.strip(), tokens
-
-    except Exception as e:
-        print(f"[CHART BUILDER] Code generation error: {e}")
-        return None, {"input": 0, "output": 0}
+def _normalize_col(col: str) -> str:
+    return str(col).strip()
 
 
-# =============================================================================
-# SAFE EXECUTOR — runs LLM-generated code in a sandboxed namespace
-# =============================================================================
+def _profile_df(df: pd.DataFrame) -> dict[str, Any]:
+    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    datetime_cols = []
+    categorical_cols = []
 
-def execute_chart_code(
-    code: str,
-    df: pd.DataFrame
-) -> Optional[object]:
-    """
-    Safely execute LLM-generated Plotly code.
+    for col in df.columns:
+        if col in numeric_cols:
+            continue
+        converted = pd.to_datetime(df[col], errors="coerce")
+        if converted.notna().sum() >= max(3, int(len(df) * 0.6)):
+            datetime_cols.append(col)
+        else:
+            categorical_cols.append(col)
 
-    Runs in an isolated namespace with only the libraries
-    the LLM is allowed to use. Returns the `fig` variable.
-
-    Args:
-        code: Python code string from LLM
-        df: DataFrame to pass into the code namespace
-
-    Returns:
-        Plotly figure object, or None if execution failed
-    """
-    import plotly.express as px
-    import plotly.graph_objects as go
-
-    # Isolated namespace — LLM code runs here
-    namespace = {
-        "df": df.copy(),
-        "pd": pd,
-        "px": px,
-        "go": go,
-        "COLORS": [
-            "#4F86C6", "#F4845F", "#57B894", "#A78BFA",
-            "#F59E0B", "#EC4899", "#06B6D4", "#84CC16"
-        ]
+    profile = {
+        "rows": len(df),
+        "cols": len(df.columns),
+        "columns": [str(c) for c in df.columns],
+        "numeric_columns": numeric_cols,
+        "datetime_columns": datetime_cols,
+        "categorical_columns": categorical_cols,
+        "sample": df.head(min(MAX_PROFILE_ROWS, len(df))).to_dict(orient="records"),
     }
+    return profile
 
+
+def _safe_json_loads(text: str) -> Optional[dict[str, Any]]:
+    content = text.strip()
+    if content.startswith("```"):
+        content = "\n".join(content.splitlines()[1:-1]).strip()
     try:
-        exec(code, namespace)
-
-        fig = namespace.get("fig")
-        if fig is None:
-            print("[CHART BUILDER] Code executed but no 'fig' variable found")
-            return None
-
-        return fig
-
-    except Exception as e:
-        print(f"[CHART BUILDER] Code execution error: {e}")
-        print(f"[CHART BUILDER] Traceback:\n{traceback.format_exc()}")
-        print(f"[CHART BUILDER] Code that failed:\n{code}")
+        return json.loads(content)
+    except Exception:
         return None
 
 
-# =============================================================================
-# MAIN ENTRY POINT
-# =============================================================================
+def _plan_chart(df: pd.DataFrame, question: str, llm_provider: str) -> tuple[Optional[dict[str, Any]], dict[str, int]]:
+    from llm_v2 import call_llm
+
+    profile = _profile_df(df)
+    prompt = (
+        f"QUESTION:\n{question}\n\n"
+        f"DATAFRAME_PROFILE_JSON:\n{json.dumps(profile, default=str)[:20000]}\n\n"
+        f"{VIS_PLANNING_GUIDELINES}\n"
+    )
+
+    response, tokens = call_llm(prompt, llm_provider)
+    plan = _safe_json_loads(response)
+    if not plan:
+        return None, tokens
+    return plan, tokens
+
+
+def _apply_plan(df: pd.DataFrame, plan: dict[str, Any]) -> pd.DataFrame:
+    out = df.copy()
+    x = plan.get("x")
+    y = plan.get("y")
+    agg = (plan.get("aggregation") or "none").lower()
+
+    if x and x in out.columns and pd.api.types.is_datetime64_any_dtype(pd.to_datetime(out[x], errors="coerce")):
+        out[x] = pd.to_datetime(out[x], errors="coerce")
+
+    if x and y and x in out.columns and y in out.columns and agg in {"sum", "avg", "count"}:
+        if agg == "sum":
+            out = out.groupby(x, as_index=False)[y].sum()
+        elif agg == "avg":
+            out = out.groupby(x, as_index=False)[y].mean()
+        else:
+            out = out.groupby(x, as_index=False)[y].count()
+
+    sort_mode = plan.get("sort")
+    if sort_mode == "time_asc" and x in out.columns:
+        out = out.sort_values(x, ascending=True)
+    elif sort_mode == "x_asc" and x in out.columns:
+        out = out.sort_values(x, ascending=True)
+    elif sort_mode == "x_desc" and x in out.columns:
+        out = out.sort_values(x, ascending=False)
+    elif sort_mode == "y_asc" and y in out.columns:
+        out = out.sort_values(y, ascending=True)
+    elif sort_mode == "y_desc" and y in out.columns:
+        out = out.sort_values(y, ascending=False)
+
+    limit = plan.get("limit", DEFAULT_TOP_N)
+    if isinstance(limit, int) and limit > 0 and len(out) > limit:
+        out = out.head(limit)
+
+    return out
+
+
+def _render_altair_chart(df: pd.DataFrame, plan: dict[str, Any]) -> bool:
+    import altair as alt
+
+    chart_type = plan.get("chart_type")
+    x = plan.get("x")
+    y = plan.get("y")
+    color = plan.get("color")
+    title = plan.get("title") or "Query Chart"
+
+    if not x or x not in df.columns:
+        return False
+
+    base = alt.Chart(df).properties(title=title).encode(x=alt.X(x, sort=None))
+
+    if chart_type in {"bar", "line", "area", "scatter"} and (not y or y not in df.columns):
+        return False
+
+    if chart_type == "bar":
+        chart = base.mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(y=alt.Y(y), color=color if color in df.columns else alt.value("#4F86C6"))
+    elif chart_type == "line":
+        chart = base.mark_line(point=True, strokeWidth=3).encode(y=alt.Y(y), color=color if color in df.columns else alt.value("#4F86C6"))
+    elif chart_type == "area":
+        chart = base.mark_area(opacity=0.65).encode(y=alt.Y(y), color=color if color in df.columns else alt.value("#4F86C6"))
+    elif chart_type == "scatter":
+        chart = base.mark_circle(size=100, opacity=0.8).encode(y=alt.Y(y), color=color if color in df.columns else alt.value("#4F86C6"), tooltip=list(df.columns))
+    else:
+        return False
+
+    st.altair_chart(chart.interactive(), use_container_width=True)
+    return True
+
+
+def _render_plotly_pie(df: pd.DataFrame, plan: dict[str, Any]) -> bool:
+    import plotly.express as px
+
+    x = plan.get("x")
+    y = plan.get("y")
+    if not x or not y or x not in df.columns or y not in df.columns:
+        return False
+
+    chart_type = plan.get("chart_type")
+    if chart_type == "donut":
+        fig = px.pie(df, names=x, values=y, hole=0.45, title=plan.get("title") or "Query Chart")
+    else:
+        fig = px.pie(df, names=x, values=y, title=plan.get("title") or "Query Chart")
+
+    fig.update_traces(textposition="inside", textinfo="percent+label")
+    fig.update_layout(template="plotly_white")
+    st.plotly_chart(fig, use_container_width=True)
+    return True
+
 
 def build_and_render_chart(
     df: pd.DataFrame,
@@ -247,45 +199,55 @@ def build_and_render_chart(
     llm_provider: str = "claude_sonnet"
 ) -> tuple[bool, dict]:
     """
-    Full pipeline: generate chart code → execute → render in Streamlit.
-
-    Args:
-        df: Query result DataFrame
-        question: Original user question
-        llm_provider: LLM to use for chart code generation
-
-    Returns:
-        Tuple of (rendered successfully, token usage dict)
+    Generate chart plan with LLM and render with modern chart libraries.
     """
     empty_tokens = {"input": 0, "output": 0}
 
     if df is None or df.empty:
-        st.dataframe(df, use_container_width=True)
         return False, empty_tokens
 
-    # Skip chart for single-column or very wide results
-    if len(df.columns) < 2 and len(df) > 1:
-        st.dataframe(df, use_container_width=True)
-        return False, empty_tokens
+    # Handle very small result sets smartly
+    if len(df) == 1:
+        st.info("📌 Single-row result detected. Showing key values instead of a chart.")
+        cols = st.columns(min(len(df.columns), 4))
+        row = df.iloc[0]
+        for i, col in enumerate(df.columns[:4]):
+            cols[i].metric(str(col), str(row[col]))
+        return True, empty_tokens
 
-    with st.spinner("📊 Building chart..."):
-        code, tokens = generate_chart_code(df, question, llm_provider)
+    with st.spinner("📊 Planning best visualization..."):
+        plan, tokens = _plan_chart(df, question, llm_provider)
 
-    if not code:
-        print("[CHART BUILDER] No code generated, falling back to table")
+    if not plan:
         return False, tokens
 
-    fig = execute_chart_code(code, df)
-
-    if fig is None:
-        print("[CHART BUILDER] Execution failed, falling back to table")
+    render = (plan.get("render") or "chart").lower()
+    if render == "table":
         return False, tokens
 
-    # Render chart
-    st.plotly_chart(fig, use_container_width=True)
+    if render == "metric":
+        numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if numeric_cols:
+            metric_col = numeric_cols[0]
+            st.metric(metric_col, f"{df[metric_col].iloc[0]:,.2f}" if len(df) else "0")
+            return True, tokens
+        return False, tokens
 
-    # Show generated code in expander for debugging
-    with st.expander("🔍 View generated chart code", expanded=False):
-        st.code(code, language="python")
+    prepared = _apply_plan(df, plan)
+    if prepared.empty:
+        return False, tokens
 
-    return True, tokens
+    chart_type = (plan.get("chart_type") or "").lower()
+
+    rendered = False
+    if chart_type in {"pie", "donut"}:
+        rendered = _render_plotly_pie(prepared, plan)
+    else:
+        rendered = _render_altair_chart(prepared, plan)
+
+    if rendered:
+        reason = plan.get("reason")
+        if reason:
+            st.caption(f"🧠 Chart logic: {reason}")
+
+    return rendered, tokens
