@@ -1134,7 +1134,8 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
                 schema_text=schema_text,
                 rules_compressed=rules_compressed,
                 config=config,
-                engine=engine
+                engine=engine,
+                use_opus_refinement=(result.complexity == "hard")
             )
             
             result.llm_trace.opus_input = opus_result.get("trace_opus_input", "")
@@ -1486,10 +1487,14 @@ def _run_opus_review(
     schema_text: str,
     rules_compressed: str,
     config: FlowConfig,
-    engine
+    engine,
+    use_opus_refinement: bool = False
 ) -> Dict[str, Any]:
     """
     Run Opus review with optional retry on INCORRECT verdict.
+
+    If use_opus_refinement=True (recommended for hard queries),
+    Opus also generates refinement SQL between review attempts.
     
     IMPORTANT: sql parameter must always be the FINAL executed SQL.
 
@@ -1583,9 +1588,10 @@ def _run_opus_review(
                 question, current_sql, review, schema_text, rules_compressed
             )
             
-            prefill = "{" if "claude" in config.reasoning_provider else None
+            refinement_provider = config.opus_provider if use_opus_refinement else config.reasoning_provider
+            prefill = "{" if "claude" in refinement_provider else None
             refine_response, refine_tokens = call_llm(
-                refine_prompt, config.reasoning_provider, prefill=prefill
+                refine_prompt, refinement_provider, prefill=prefill
             )
             
             refinement_tokens["input"] += refine_tokens["input"]
