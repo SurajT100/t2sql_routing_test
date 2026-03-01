@@ -79,7 +79,9 @@ def _profile_df(df: pd.DataFrame) -> dict[str, Any]:
 
 
 def _is_likely_datetime(series: pd.Series) -> bool:
-    """Heuristic: treat as datetime only when most rows parse successfully."""
+    """Heuristic: treat as datetime only when mostly parseable and not numeric-like."""
+    if pd.api.types.is_numeric_dtype(series):
+        return False
     converted = pd.to_datetime(series, errors="coerce")
     threshold = max(3, int(len(series) * 0.6))
     return converted.notna().sum() >= threshold
@@ -278,6 +280,100 @@ def _render_plotly_pie(df: pd.DataFrame, plan: dict[str, Any]) -> bool:
 
 
 
+
+
+def _find_column_by_keywords(df: pd.DataFrame, keywords: list[str], numeric_required: bool = False) -> Optional[str]:
+    for col in df.columns:
+        name = str(col).lower()
+        if any(k in name for k in keywords):
+            if numeric_required and not pd.api.types.is_numeric_dtype(df[col]):
+                coerced = pd.to_numeric(df[col], errors="coerce")
+                if coerced.notna().sum() < max(3, int(len(df) * 0.6)):
+                    continue
+            return col
+    return None
+
+
+def _build_wobby_like_recommendations(df: pd.DataFrame, question: str) -> list[dict[str, Any]]:
+    """Deterministic smart recommendations inspired by BI products."""
+    recommendations: list[dict[str, Any]] = []
+    q = question.lower()
+
+    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    cat_cols = [c for c in df.columns if c not in numeric_cols]
+
+    if not numeric_cols or not cat_cols:
+        return recommendations
+
+    region_col = _find_column_by_keywords(df, ["region", "state", "zone", "territory"])
+    pipeline_col = _find_column_by_keywords(df, ["pipeline", "potential", "open"], numeric_required=True)
+    conversion_col = _find_column_by_keywords(df, ["conversion", "win_rate", "win rate", "close_rate", "close rate"], numeric_required=True)
+
+    # Pattern: strong pipeline but poor conversion -> scatter + rank bar
+    if pipeline_col and conversion_col and ("pipeline" in q and ("conversion" in q or "win rate" in q or "poor" in q or "strong" in q)):
+        dim = region_col or cat_cols[0]
+        recommendations.append({
+            "label": "Recommended: Risk Quadrant",
+            "render": "chart",
+            "chart_type": "scatter",
+            "x": pipeline_col,
+            "y": conversion_col,
+            "color": dim,
+            "aggregation": "none",
+            "sort": "x_desc",
+            "limit": DEFAULT_TOP_N,
+            "title": f"{pipeline_col} vs {conversion_col} by {dim}",
+            "reason": "Shows high pipeline but low conversion outliers clearly."
+        })
+        recommendations.append({
+            "label": "Alternative: Conversion Ranking",
+            "render": "chart",
+            "chart_type": "bar",
+            "x": dim,
+            "y": conversion_col,
+            "color": None,
+            "aggregation": "none",
+            "sort": "y_asc",
+            "limit": DEFAULT_TOP_N,
+            "title": f"{conversion_col} by {dim} (low to high)",
+            "reason": "Ranks weakest conversion regions for action."
+        })
+        return recommendations
+
+    # Generic defaults
+    dim = region_col or cat_cols[0]
+    metric = numeric_cols[0]
+    recommendations.append({
+        "label": "Recommended: Category Comparison",
+        "render": "chart",
+        "chart_type": "bar",
+        "x": dim,
+        "y": metric,
+        "color": None,
+        "aggregation": "none",
+        "sort": "y_desc",
+        "limit": DEFAULT_TOP_N,
+        "title": f"{metric} by {dim}",
+        "reason": "Best default for comparing categories."
+    })
+
+    if len(numeric_cols) > 1:
+        recommendations.append({
+            "label": "Alternative: Metric Relationship",
+            "render": "chart",
+            "chart_type": "scatter",
+            "x": numeric_cols[0],
+            "y": numeric_cols[1],
+            "color": dim,
+            "aggregation": "none",
+            "sort": "x_desc",
+            "limit": DEFAULT_TOP_N,
+            "title": f"{numeric_cols[1]} vs {numeric_cols[0]}",
+            "reason": "Useful for relationship and outlier detection."
+        })
+
+    return recommendations
+
 def _render_manual_chart(df: pd.DataFrame) -> bool:
     """Render user-selected chart using chosen x/y axes."""
     import plotly.express as px
@@ -375,8 +471,18 @@ def build_and_render_chart(
         rendered = _render_manual_chart(df)
         return rendered, empty_tokens
 
-    with st.spinner("📊 Planning best visualization..."):
-        plan, tokens = _plan_chart(df, question, llm_provider)
+    # Wobby-like deterministic recommender first for consistency
+    deterministic_plans = _build_wobby_like_recommendations(df, question)
+    plan = None
+    tokens = empty_tokens
+
+    if deterministic_plans:
+        labels = [p.get("label", f"Option {i+1}") for i, p in enumerate(deterministic_plans)]
+        picked = st.selectbox("Smart Chart Recommendation", labels, index=0, key="smart_reco_pick")
+        plan = deterministic_plans[labels.index(picked)]
+    else:
+        with st.spinner("📊 Planning best visualization..."):
+            plan, tokens = _plan_chart(df, question, llm_provider)
 
     if not plan:
         return False, tokens
@@ -404,7 +510,6 @@ def build_and_render_chart(
     if chart_type in {"pie", "donut"}:
         rendered = _render_plotly_pie(prepared, plan)
     else:
-        # Prefer Plotly for xy charts to avoid blank mark rendering issues
         rendered = _render_plotly_xy(prepared, plan)
         if not rendered:
             rendered = _render_altair_chart(prepared, plan)
@@ -415,16 +520,20 @@ def build_and_render_chart(
             st.caption(f"🧠 Chart logic: {reason}")
 
     with st.expander("🔍 View chart planner input/output", expanded=False):
-        dbg = st.session_state.get('chart_planner_debug', {})
-        if dbg.get('prompt'):
-            st.caption("Planner Prompt")
-            st.code(dbg['prompt'][:8000])
-        if dbg.get('raw_response'):
-            st.caption("Planner Raw Response")
-            st.code(str(dbg['raw_response'])[:4000])
-        if dbg.get('plan'):
-            st.caption("Parsed Plan")
-            st.json(dbg['plan'])
+        if deterministic_plans:
+            st.caption("Deterministic recommendation plan")
+            st.json(plan)
+        else:
+            dbg = st.session_state.get('chart_planner_debug', {})
+            if dbg.get('prompt'):
+                st.caption("Planner Prompt")
+                st.code(dbg['prompt'][:8000])
+            if dbg.get('raw_response'):
+                st.caption("Planner Raw Response")
+                st.code(str(dbg['raw_response'])[:4000])
+            if dbg.get('plan'):
+                st.caption("Parsed Plan")
+                st.json(dbg['plan'])
         st.caption("Prepared table used for chart")
         st.dataframe(prepared.head(30), use_container_width=True)
 
