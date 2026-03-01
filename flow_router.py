@@ -1601,7 +1601,37 @@ def _run_opus_review(
             trace_refinement_output = refine_response
             
             new_sql = extract_sql_from_response(refine_response)
-            
+
+            # If model repeats same SQL after INCORRECT verdict, force a full regeneration
+            if (not new_sql or new_sql.strip() == current_sql.strip()) and verdict == "INCORRECT":
+                force_prompt = f"""Previous refinement repeated the same incorrect SQL.
+Generate a NEW corrected SQL from scratch that resolves all auditor failures.
+
+QUESTION:
+{question}
+
+AUDITOR FEEDBACK JSON:
+{json.dumps(review, ensure_ascii=False)}
+
+SCHEMA:
+{schema_text}
+
+BUSINESS RULES:
+{rules_compressed}
+
+REJECTED SQL:
+{current_sql}
+
+Return ONLY SQL. No explanation."""
+                force_provider = config.opus_provider if use_opus_refinement else config.reasoning_provider
+                force_prefill = "{" if "claude" in force_provider else None
+                force_response, force_tokens = call_llm(force_prompt, force_provider, prefill=force_prefill)
+                refinement_tokens["input"] += force_tokens.get("input", 0)
+                refinement_tokens["output"] += force_tokens.get("output", 0)
+                trace_refinement_input = force_prompt
+                trace_refinement_output = force_response
+                new_sql = extract_sql_from_response(force_response)
+
             if new_sql and new_sql != current_sql:
                 current_sql = new_sql
                 try:

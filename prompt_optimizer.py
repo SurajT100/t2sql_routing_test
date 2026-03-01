@@ -719,7 +719,7 @@ def create_refinement_prompt(
     issues_text = "\n".join(f"• {issue}" for issue in issues) if issues else "• Unknown issues"
     failed_checks_text = ", ".join(failed_checks) if failed_checks else "unspecified"
     
-    return f"""Fix a SQL query. The auditor found specific errors — fix ONLY those errors.
+    return f"""Fix a SQL query rejected by the auditor.
 
 ## WHAT FAILED
 Failed checks: {failed_checks_text}
@@ -732,28 +732,29 @@ Failed checks: {failed_checks_text}
 
 {f"## SUGGESTED FIX{chr(10)}{fix_suggestion}" if fix_suggestion else ""}
 
-## BUSINESS RULES (apply correctly — the auditor verified these were applied wrong)
+## BUSINESS RULES (must be applied correctly)
 {rules}
 
-## SCHEMA (use exact column names and data types from here)
+## SCHEMA (use exact column names and compatible data types)
 {schema}
 
 ## ORIGINAL QUESTION
 {question}
 
-## ORIGINAL SQL (fix only the failed checks, do not change passing parts)
+## REJECTED SQL
 ```sql
 {previous_sql}
 ```
 
 ## YOUR TASK
-1. Fix each failed check precisely
-2. Do NOT change anything the auditor did not flag
-3. Verify your fix uses the exact column name from the schema
-4. Verify your fix applies the business rule correctly (not just references it)
+1. Produce SQL that ANSWERS the original question end-to-end.
+2. Resolve every failed check above; do not keep logic that makes the query incomplete.
+3. Add missing joins/metrics/filters when required by question or business rules.
+4. If a type mismatch is possible (e.g. DATE/TEXT), cast safely.
+5. Return a materially corrected query (not a cosmetic rewrite).
 
 ## OUTPUT (JSON only)
-{{"analysis": "what you changed and why, referencing specific column names and rules", "sql": "corrected SQL query"}}"""
+{{"analysis": "what you changed and why, referencing specific columns/rules", "sql": "corrected SQL query"}}"""
 
 
 # =============================================================================
