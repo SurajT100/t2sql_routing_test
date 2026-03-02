@@ -2070,6 +2070,24 @@ with tab3:
                     help="Match similar questions (e.g., 'show sales' ≈ 'display sales')",
                     disabled=not enable_cache
                 )
+                enable_context_cache = st.checkbox(
+                    "Enable Context Cache",
+                    value=True,
+                    help="Reuse assembled schema/rules context across queries when schema+rules versions are unchanged"
+                )
+                context_cache_use_static_rules = st.checkbox(
+                    "Use Static Rules for Context Cache",
+                    value=True,
+                    help="Use full active rulebook for question-agnostic context reuse (can increase tokens if rulebook is large)",
+                    disabled=not enable_context_cache
+                )
+                if st.button("🧹 Clear Context Cache", use_container_width=True, disabled=not enable_context_cache):
+                    try:
+                        from context_cache import GLOBAL_CONTEXT_CACHE
+                        GLOBAL_CONTEXT_CACHE._store.clear()
+                        st.success("Context cache cleared")
+                    except Exception as e:
+                        st.warning(f"Unable to clear context cache: {e}")
                 enable_charts = st.checkbox(
                     "📊 Display Charts",
                     value=True,
@@ -2144,6 +2162,8 @@ with tab3:
                     enable_opus_descriptions=enable_opus_descriptions,
                     enable_cache=enable_cache,
                     enable_semantic_cache=enable_semantic_cache if enable_cache else False,
+                    enable_context_cache=enable_context_cache,
+                    context_cache_use_static_rules=context_cache_use_static_rules if enable_context_cache else False,
                     enable_resolver=enable_resolver,
                     compress_rules=compress_rules,
                     validate_sql=enable_sql_validation,
@@ -2206,6 +2226,12 @@ with tab3:
                     col_s4.metric("Status", f"⚡ Cache Hit ({result.cache_hit_type})")
                 else:
                     col_s4.metric("Status", "✅ Success" if result.success else "❌ Failed")
+
+                if enable_context_cache:
+                    st.caption(
+                        f"Context cache: {'✅ hit' if result.context_cache_hit else '🧊 miss'}"
+                        f" · key `{result.context_cache_key[:12]}...`"
+                    )
                 
                 st.caption(f"**Flow:** {result.flow_path}")
                 
@@ -2258,6 +2284,8 @@ with tab3:
                     col_ctx1, col_ctx2 = st.columns(2)
                     with col_ctx1:
                         st.metric("Rules Retrieved", result.rules_retrieved)
+                        if enable_context_cache:
+                            st.metric("Context Cache", "Hit" if result.context_cache_hit else "Miss")
                         if result.rules_compressed and result.rules_compressed != "[]":
                             # Show compressed preview
                             st.caption("**Compressed Rules (sent to LLM):**")
