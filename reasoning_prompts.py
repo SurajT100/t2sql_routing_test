@@ -382,7 +382,7 @@ def create_error_retry_prompt(
     metadata_text = format_metadata_for_prompt(metadata)
 
     opus_instruction = """
-You are Opus — fix this with maximum accuracy. Check every column name, 
+You are Opus — fix this with maximum accuracy. Check every column name,
 every data type, every filter value against the metadata below.""" if use_opus else ""
 
     return f"""Fix a failed SQL query using the original plan and column metadata.{opus_instruction}
@@ -408,14 +408,9 @@ ERROR:
 TASK:
 1. Identify what caused the error (type mismatch, wrong column name, syntax, etc.)
 2. Cross-check every column and filter value against the metadata above
-3. Fix the SQL — do not change parts that were correct
+3. Fix ONLY the specific error — preserve all tables, JOINs, and query structure exactly as in the failed SQL
 
-OUTPUT (JSON only):
-{{
-  "error_diagnosis": "what caused the error",
-  "fix_applied": "what you changed",
-  "sql": "corrected SQL query"
-}}"""
+Return ONLY the corrected SQL query. No explanation, no markdown, no JSON."""
 
 
 # =============================================================================

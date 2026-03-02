@@ -1062,9 +1062,8 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
                     dialect_info=config.dialect_info,
                     use_opus=False
                 )
-                prefill = "{" if "claude" in config.reasoning_provider else None
                 retry_response, retry_tokens = call_llm(
-                    retry_prompt, config.reasoning_provider, prefill=prefill
+                    retry_prompt, config.reasoning_provider
                 )
                 result.tokens.error_fix_reasoning = retry_tokens
                 result.llm_trace.error_fix_reasoning_input = retry_prompt
