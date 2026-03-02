@@ -220,6 +220,44 @@ def get_full_schema_with_opus(
     return "\n".join(lines)
 
 
+def _get_all_active_rules(vector_engine) -> List[Dict[str, Any]]:
+    """Load all active business rules (for static context-cache mode)."""
+    from sqlalchemy import text
+
+    rules = []
+    with vector_engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT id, rule_name, rule_type, rule_description, rule_data,
+                       trigger_keywords, applies_to_tables, priority, is_mandatory
+                FROM business_rules_v2
+                WHERE is_active = TRUE
+                ORDER BY priority ASC, id ASC
+                """
+            )
+        ).fetchall()
+
+    for r in rows:
+        rules.append({
+            "id": r[0],
+            "rule_name": r[1],
+            "rule_type": r[2],
+            "rule_description": r[3],
+            "rule_data": r[4],
+            "trigger_keywords": r[5],
+            "applies_to_tables": r[6],
+            "priority": r[7],
+            "is_mandatory": r[8],
+            # aliases used by some downstream logic
+            "keywords": r[5],
+            "tables": r[6],
+        })
+    return rules
+
+
+
+
 # =============================================================================
 # DATA CLASSES
 # =============================================================================
@@ -244,6 +282,10 @@ class FlowConfig:
     # Query Cache
     enable_cache: bool = True
     enable_semantic_cache: bool = True
+    
+    # Context Cache (reuse schema/rules across questions until versions change)
+    enable_context_cache: bool = True
+    context_cache_use_static_rules: bool = True
     
     # LLM Providers
     reasoning_provider: str = "claude_sonnet"
@@ -380,6 +422,8 @@ class QueryResult:
     cache_hit: bool = False
     cache_hit_type: str = ""  # "memory", "exact", "semantic"
     cache_key: str = ""
+    context_cache_hit: bool = False
+    context_cache_key: str = ""
     
     # Two-pass reasoning metadata (stored for error retry reuse)
     column_metadata: Dict = field(default_factory=dict)
@@ -543,101 +587,136 @@ def process_query(
         stage_start = time.time()
         
         from context_agent import get_bare_schema, ContextAgent
-        
-        bare_schema = get_bare_schema(engine, selected_tables, config.dialect)
-        
-        # Full schema still needed for SIMPLE flow (no Pass 1) and error recovery
-        schema_text = get_full_schema_with_opus(
-            engine, 
-            vector_engine,
-            selected_tables, 
-            config.dialect,
-            include_opus=config.enable_opus_descriptions
-        )
-        result.schema_text = schema_text
-        result.columns_retrieved = -1
-        
-        # ── RAG rules fetched upfront — ALL flows need them ──
-        # SIMPLE: rules go directly to SQL Coder
-        # ANALYTICAL/COMPLEX: rules go to Pass 1 (column mapping) AND 
-        #   Context Agent may fetch additional column-specific rules for Pass 2
+        from context_cache import GLOBAL_CONTEXT_CACHE, ContextBundle, ContextCache
+
         rules_context = []
         rules_compressed = "[]"
         examples = []
-        
-        if config.enable_rule_rag:
-            try:
-                from vector_utils_v2 import get_relevant_context
-                
-                context = get_relevant_context(
-                    vector_engine,
-                    question,
-                    enable_vector_search=True,
-                    similarity_threshold=config.rule_rag_threshold
-                )
-                
-                rules_context = context.get("rules", [])
-                result.rules_retrieved = len(rules_context)
-                
-                print(f"[STAGE2] Rules retrieved: {len(rules_context)}")
-                if rules_context:
-                    print(f"[STAGE2] Rule names: {[r.get('rule_name', 'unknown') for r in rules_context[:5]]}")
-                
-                examples = [r for r in rules_context if r.get("rule_type") in ["example", "query_example"]]
-                
-                if config.compress_rules:
-                    rules_compressed = compress_rules_for_llm(rules_context)
-                else:
-                    from prompt_optimizer import safe_json_dumps
-                    rules_compressed = safe_json_dumps(rules_context)
-                
-                # ── Skip auto_apply date rules if user specified explicit period ──
-                explicit_date_keywords = [
-                    "rolling", "last ", "past ", "previous ",
-                    "months", "weeks", "days", "since ", "between ",
-                    "year to date", "ytd", "quarter to date", "qtd",
-                    "january", "february", "march", "april", "may", "june",
-                    "july", "august", "september", "october", "november", "december",
-                    "jan ", "feb ", "mar ", "apr ", "jun ", "jul ", "aug ",
-                    "sep ", "oct ", "nov ", "dec ", "fy2", "20"
-                ]
-                
-                question_lower = question.lower()
-                user_specified_date = any(kw in question_lower for kw in explicit_date_keywords)
-                
-                if user_specified_date:
-                    try:
-                        rules_list = json.loads(rules_compressed)
-                        filtered_rules = []
-                        skipped = []
-                        
-                        for rule in rules_list:
-                            rule_data = rule.get("data", {})
-                            is_auto_date = (
-                                rule_data.get("auto_apply") == True and
-                                any(kw in str(rule_data).lower() for kw in 
-                                    ["date", "month", "year", "fy", "financial", "period"])
-                            )
-                            if is_auto_date:
-                                skipped.append(rule.get("name", "unknown"))
-                            else:
-                                filtered_rules.append(rule)
-                        
-                        if skipped:
-                            rules_compressed = json.dumps(filtered_rules)
-                            print(f"[STAGE2] Date override — skipped auto_apply: {skipped}")
-                    except Exception as e:
-                        print(f"[STAGE2] Date override filter error: {e}")
-                    
-            except Exception as e:
-                print(f"[STAGE2] RAG Error: {e}")
-                import traceback
-                traceback.print_exc()
-                rules_compressed = "[]"
-                result.rules_retrieved = 0
+
+        schema_version = ContextCache.compute_schema_version(engine, selected_tables)
+        rules_version = ContextCache.compute_rules_version(vector_engine) if config.enable_rule_rag else "no_rules"
+        context_cache_key = ContextCache.make_key(
+            selected_tables=selected_tables,
+            dialect=config.dialect,
+            include_opus=config.enable_opus_descriptions,
+            schema_version=schema_version,
+            rules_version=rules_version,
+        )
+        result.context_cache_key = context_cache_key
+
+        cached_bundle = GLOBAL_CONTEXT_CACHE.get(context_cache_key) if config.enable_context_cache else None
+
+        if cached_bundle:
+            bare_schema = cached_bundle.bare_schema
+            schema_text = cached_bundle.schema_text
+            rules_compressed = cached_bundle.rules_compressed
+            result.rules_retrieved = cached_bundle.rules_retrieved
+            result.context_cache_hit = True
+            print(f"[STAGE2] Context cache hit: {context_cache_key}")
         else:
-            result.rules_retrieved = 0
-            rules_compressed = "[]"
+            bare_schema = get_bare_schema(engine, selected_tables, config.dialect)
+
+            # Full schema still needed for SIMPLE flow (no Pass 1) and error recovery
+            schema_text = get_full_schema_with_opus(
+                engine,
+                vector_engine,
+                selected_tables,
+                config.dialect,
+                include_opus=config.enable_opus_descriptions
+            )
+
+            if config.enable_rule_rag:
+                try:
+                    if config.context_cache_use_static_rules:
+                        rules_context = _get_all_active_rules(vector_engine)
+                    else:
+                        from vector_utils_v2 import get_relevant_context
+                        context = get_relevant_context(
+                            vector_engine,
+                            question,
+                            enable_vector_search=True,
+                            similarity_threshold=config.rule_rag_threshold
+                        )
+                        rules_context = context.get("rules", [])
+
+                    result.rules_retrieved = len(rules_context)
+                    print(f"[STAGE2] Rules retrieved: {len(rules_context)}")
+                    if rules_context:
+                        print(f"[STAGE2] Rule names: {[r.get('rule_name', 'unknown') for r in rules_context[:5]]}")
+
+                    examples = [r for r in rules_context if r.get("rule_type") in ["example", "query_example"]]
+
+                    if config.compress_rules:
+                        rules_compressed = compress_rules_for_llm(rules_context)
+                    else:
+                        from prompt_optimizer import safe_json_dumps
+                        rules_compressed = safe_json_dumps(rules_context)
+
+                except Exception as e:
+                    print(f"[STAGE2] RAG Error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    rules_compressed = "[]"
+                    result.rules_retrieved = 0
+            else:
+                result.rules_retrieved = 0
+                rules_compressed = "[]"
+
+            # write context cache only for static-rule mode (question agnostic)
+            if config.enable_context_cache and (config.context_cache_use_static_rules or not config.enable_rule_rag):
+                GLOBAL_CONTEXT_CACHE.set(
+                    context_cache_key,
+                    ContextBundle(
+                        schema_version=schema_version,
+                        rules_version=rules_version,
+                        bare_schema=bare_schema,
+                        schema_text=schema_text,
+                        rules_compressed=rules_compressed,
+                        rules_retrieved=result.rules_retrieved,
+                    ),
+                )
+                print(f"[STAGE2] Context cache stored: {context_cache_key}")
+
+        result.schema_text = schema_text
+        result.columns_retrieved = -1
+
+        # ── Skip auto_apply date rules if user specified explicit period ──
+        explicit_date_keywords = [
+            "rolling", "last ", "past ", "previous ",
+            "months", "weeks", "days", "since ", "between ",
+            "year to date", "ytd", "quarter to date", "qtd",
+            "january", "february", "march", "april", "may", "june",
+            "july", "august", "september", "october", "november", "december",
+            "jan ", "feb ", "mar ", "apr ", "jun ", "jul ", "aug ",
+            "sep ", "oct ", "nov ", "dec ", "fy2", "20"
+        ]
+
+        question_lower = question.lower()
+        user_specified_date = any(kw in question_lower for kw in explicit_date_keywords)
+
+        if user_specified_date:
+            try:
+                rules_list = json.loads(rules_compressed)
+                filtered_rules = []
+                skipped = []
+
+                for rule in rules_list:
+                    rule_data = rule.get("data", rule.get("rule_data", {}))
+                    is_auto_date = (
+                        isinstance(rule_data, dict)
+                        and rule_data.get("auto_apply") is True
+                        and any(kw in str(rule_data).lower() for kw in ["date", "month", "year", "fy", "financial", "period"])
+                    )
+                    if is_auto_date:
+                        skipped.append(rule.get("name", rule.get("rule_name", "unknown")))
+                    else:
+                        filtered_rules.append(rule)
+
+                if skipped:
+                    rules_compressed = json.dumps(filtered_rules)
+                    print(f"[STAGE2] Date override — skipped auto_apply: {skipped}")
+            except Exception as e:
+                print(f"[STAGE2] Date override filter error: {e}")
         
         result.rules_compressed = rules_compressed
         result.stages_completed.append("schema_and_rag")
