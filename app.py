@@ -2523,46 +2523,50 @@ with tab3:
                 # ───────────────────────────────────────────────────────────
                 with st.expander("🔍 LLM Input/Output (Debug)", expanded=False):
                     st.caption("💡 Full prompts and responses - no truncation")
-                    
+
                     llm_tabs = st.tabs(["📊 Classifier", "🧠 Reasoning", "🔍 Resolver", "⚙️ SQL Coder", "🎯 Opus Review", "🔄 Refinement", "⚡ SQL Error Fix (Reasoning)", "🔧 SQL Error Fix (Opus)"])
 
-                    
+                    # Use query counter as key suffix so each new query gets fresh
+                    # widgets — prevents Streamlit from showing stale session state
+                    # values from the previous query.
+                    _qc = st.session_state.query_counter
+
                     with llm_tabs[0]:  # Classifier
                         if result.llm_trace.classifier_input:
                             st.write("**📥 INPUT PROMPT:**")
-                            st.text_area("Classifier Input", result.llm_trace.classifier_input, height=300, key="clf_in")
+                            st.text_area("Classifier Input", result.llm_trace.classifier_input, height=300, key=f"clf_in_{_qc}")
                             st.write("**📤 OUTPUT:**")
-                            st.text_area("Classifier Output", result.llm_trace.classifier_output, height=150, key="clf_out")
+                            st.text_area("Classifier Output", result.llm_trace.classifier_output, height=150, key=f"clf_out_{_qc}")
                         else:
                             st.info("Classifier used keyword-based classification (no LLM call)")
-                    
+
                     with llm_tabs[1]:  # Reasoning
                         has_pass1 = bool(result.llm_trace.reasoning_pass1_input)
                         has_pass2 = bool(result.llm_trace.reasoning_pass2_input)
                         has_legacy = bool(result.llm_trace.reasoning_input)
-                        
+
                         if has_pass1 or has_pass2:
                             # Two-pass reasoning flow
                             if has_pass1:
                                 st.write("**📥 PASS 1 — Column Identification:**")
-                                st.text_area("Pass 1 Input", result.llm_trace.reasoning_pass1_input, height=300, key="pass1_in")
+                                st.text_area("Pass 1 Input", result.llm_trace.reasoning_pass1_input, height=300, key=f"pass1_in_{_qc}")
                                 st.write("**📤 Pass 1 Output:**")
-                                st.text_area("Pass 1 Output", result.llm_trace.reasoning_pass1_output, height=200, key="pass1_out")
+                                st.text_area("Pass 1 Output", result.llm_trace.reasoning_pass1_output, height=200, key=f"pass1_out_{_qc}")
                                 st.divider()
                             if has_pass2:
                                 st.write("**📥 PASS 2 — Full Plan with Metadata:**")
-                                st.text_area("Pass 2 Input", result.llm_trace.reasoning_pass2_input, height=300, key="pass2_in")
+                                st.text_area("Pass 2 Input", result.llm_trace.reasoning_pass2_input, height=300, key=f"pass2_in_{_qc}")
                                 st.write("**📤 Pass 2 Output:**")
-                                st.text_area("Pass 2 Output", result.llm_trace.reasoning_pass2_output, height=200, key="pass2_out")
+                                st.text_area("Pass 2 Output", result.llm_trace.reasoning_pass2_output, height=200, key=f"pass2_out_{_qc}")
                         elif has_legacy:
                             # Legacy single-pass reasoning
                             st.write("**📥 INPUT PROMPT:**")
-                            st.text_area("Reasoning Input", result.llm_trace.reasoning_input, height=400, key="reason_in")
+                            st.text_area("Reasoning Input", result.llm_trace.reasoning_input, height=400, key=f"reason_in_{_qc}")
                             st.write("**📤 OUTPUT:**")
-                            st.text_area("Reasoning Output", result.llm_trace.reasoning_output, height=300, key="reason_out")
+                            st.text_area("Reasoning Output", result.llm_trace.reasoning_output, height=300, key=f"reason_out_{_qc}")
                         else:
                             st.info("Reasoning LLM not used for this query (SIMPLE flow skips reasoning)")
-                    
+
                     with llm_tabs[2]:  # Resolver
                         if hasattr(result, 'resolver_result') and result.resolver_result:
                             r = result.resolver_result
@@ -2584,42 +2588,42 @@ with tab3:
                                 st.caption(f"Query: `{res.query_used[:200]}`")
                                 st.divider()
                         elif result.llm_trace.resolver_summary:
-                            st.text_area("Resolver Summary", result.llm_trace.resolver_summary, height=300, key="resolver_summary")
+                            st.text_area("Resolver Summary", result.llm_trace.resolver_summary, height=300, key=f"resolver_summary_{_qc}")
                         else:
                             st.info("Entity Resolver not used (no string filters or disabled)")
-                    
+
                     with llm_tabs[3]:  # SQL Coder
                         if result.llm_trace.sql_gen_input:
                             st.write("**📥 INPUT PROMPT:**")
-                            st.text_area("SQL Coder Input", result.llm_trace.sql_gen_input, height=400, key="sql_in")
+                            st.text_area("SQL Coder Input", result.llm_trace.sql_gen_input, height=400, key=f"sql_in_{_qc}")
                             st.write("**📤 OUTPUT:**")
-                            st.text_area("SQL Coder Output", result.llm_trace.sql_gen_output, height=200, key="sql_out")
+                            st.text_area("SQL Coder Output", result.llm_trace.sql_gen_output, height=200, key=f"sql_out_{_qc}")
                         else:
                             st.info("SQL Coder not used for this query (EASY flow uses Reasoning only)")
-                    
+
                     with llm_tabs[4]:  # Opus
                         if result.llm_trace.opus_input:
                             st.write("**📥 INPUT PROMPT:**")
-                            st.text_area("Opus Input", result.llm_trace.opus_input, height=400, key="opus_in")
+                            st.text_area("Opus Input", result.llm_trace.opus_input, height=400, key=f"opus_in_{_qc}")
                             st.write("**📤 OUTPUT:**")
-                            st.text_area("Opus Output", result.llm_trace.opus_output, height=200, key="opus_out")
+                            st.text_area("Opus Output", result.llm_trace.opus_output, height=200, key=f"opus_out_{_qc}")
                         else:
                             st.info("Opus review not used for this query")
-                    
+
                     with llm_tabs[5]:  # Refinement
                         if result.llm_trace.refinement_input:
                             st.write("**📥 INPUT PROMPT:**")
-                            st.text_area("Refinement Input", result.llm_trace.refinement_input, height=400, key="refine_in")
+                            st.text_area("Refinement Input", result.llm_trace.refinement_input, height=400, key=f"refine_in_{_qc}")
                             st.write("**📤 OUTPUT:**")
-                            st.text_area("Refinement Output", result.llm_trace.refinement_output, height=200, key="refine_out")
+                            st.text_area("Refinement Output", result.llm_trace.refinement_output, height=200, key=f"refine_out_{_qc}")
                         else:
                             st.info("Refinement not triggered (query was correct or Opus not enabled)")
                     with llm_tabs[6]:  # Error Fix - Reasoning
                         if result.llm_trace.error_fix_reasoning_input:
                             st.write("**📥 INPUT PROMPT (Attempt 1 — Reasoning LLM):**")
-                            st.text_area("Error Fix Reasoning Input", result.llm_trace.error_fix_reasoning_input, height=400, key="err_reason_in")
+                            st.text_area("Error Fix Reasoning Input", result.llm_trace.error_fix_reasoning_input, height=400, key=f"err_reason_in_{_qc}")
                             st.write("**📤 OUTPUT:**")
-                            st.text_area("Error Fix Reasoning Output", result.llm_trace.error_fix_reasoning_output, height=200, key="err_reason_out")
+                            st.text_area("Error Fix Reasoning Output", result.llm_trace.error_fix_reasoning_output, height=200, key=f"err_reason_out_{_qc}")
                             if result.error_recovery_method == "reasoning_llm":
                                 st.success("✅ Reasoning LLM resolved the error")
                             else:
@@ -2630,15 +2634,15 @@ with tab3:
                     with llm_tabs[7]:  # Error Fix - Opus
                         if result.llm_trace.error_fix_opus_input:
                             st.write("**📥 INPUT PROMPT (Attempt 2 — Opus):**")
-                            st.text_area("Error Fix Opus Input", result.llm_trace.error_fix_opus_input, height=400, key="err_opus_in")
+                            st.text_area("Error Fix Opus Input", result.llm_trace.error_fix_opus_input, height=400, key=f"err_opus_in_{_qc}")
                             st.write("**📤 OUTPUT:**")
-                            st.text_area("Error Fix Opus Output", result.llm_trace.error_fix_opus_output, height=200, key="err_opus_out")
+                            st.text_area("Error Fix Opus Output", result.llm_trace.error_fix_opus_output, height=200, key=f"err_opus_out_{_qc}")
                             if result.error_recovery_method == "opus":
                                 st.success("✅ Opus fixed the error after Reasoning LLM could not")
                             else:
                                 st.error("❌ Opus also could not fix the error")
                         else:
-                            st.info("Opus error fix not needed for this query")                
+                            st.info("Opus error fix not needed for this query")
                 # ───────────────────────────────────────────────────────────
                 # LOG QUERY - COMPREHENSIVE TRACKING
                 # ───────────────────────────────────────────────────────────
