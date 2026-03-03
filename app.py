@@ -2244,7 +2244,13 @@ with tab3:
                     
                     if tokens.classifier["input"] + tokens.classifier["output"] > 0:
                         token_data.append({"Stage": "🏷️ Classifier", "Input": tokens.classifier["input"], "Output": tokens.classifier["output"]})
-                    if tokens.reasoning["input"] + tokens.reasoning["output"] > 0:
+                    # Show Pass 1 / Pass 2 separately when the two-pass flow ran;
+                    # fall back to the legacy "Reasoning" row for SIMPLE/legacy flows.
+                    if tokens.reasoning_pass1["input"] + tokens.reasoning_pass1["output"] > 0:
+                        token_data.append({"Stage": "🧠 Reasoning Pass 1", "Input": tokens.reasoning_pass1["input"], "Output": tokens.reasoning_pass1["output"]})
+                    if tokens.reasoning_pass2["input"] + tokens.reasoning_pass2["output"] > 0:
+                        token_data.append({"Stage": "🧠 Reasoning Pass 2", "Input": tokens.reasoning_pass2["input"], "Output": tokens.reasoning_pass2["output"]})
+                    if tokens.reasoning_pass1["input"] + tokens.reasoning_pass1["output"] == 0 and tokens.reasoning["input"] + tokens.reasoning["output"] > 0:
                         token_data.append({"Stage": "🧠 Reasoning", "Input": tokens.reasoning["input"], "Output": tokens.reasoning["output"]})
                     if tokens.sql_gen["input"] + tokens.sql_gen["output"] > 0:
                         token_data.append({"Stage": "⚙️ SQL Gen", "Input": tokens.sql_gen["input"], "Output": tokens.sql_gen["output"]})
@@ -2657,9 +2663,14 @@ with tab3:
                     "Classifier Input Tokens": result.tokens.classifier["input"],
                     "Classifier Output Tokens": result.tokens.classifier["output"],
                     
-                    # Reasoning LLM (Sonnet)
+                    # Reasoning LLM (Sonnet) — legacy single-pass field
                     "Reasoning Input Tokens": result.tokens.reasoning["input"],
                     "Reasoning Output Tokens": result.tokens.reasoning["output"],
+                    # Two-pass reasoning breakdown
+                    "Reasoning Pass1 Input Tokens": result.tokens.reasoning_pass1["input"],
+                    "Reasoning Pass1 Output Tokens": result.tokens.reasoning_pass1["output"],
+                    "Reasoning Pass2 Input Tokens": result.tokens.reasoning_pass2["input"],
+                    "Reasoning Pass2 Output Tokens": result.tokens.reasoning_pass2["output"],
                     
                     # SQL Coder (Llama/Groq)
                     "SQL Coder Input Tokens": result.tokens.sql_gen["input"],
