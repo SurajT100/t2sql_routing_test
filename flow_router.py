@@ -286,7 +286,12 @@ class FlowConfig:
     # Context Cache (reuse schema/rules across questions until versions change)
     enable_context_cache: bool = True
     context_cache_use_static_rules: bool = True
-    
+
+    # Prompt Caching (Anthropic cache_control on system prompt)
+    # When True: static content (schema/rules/dialect) goes in system prompt with cache_control.
+    # When False: everything is merged into the user message (no cache_control headers).
+    enable_prompt_caching: bool = True
+
     # LLM Providers
     reasoning_provider: str = "claude_sonnet"
     sql_provider: str = "groq"
@@ -858,10 +863,13 @@ def process_query(
                 extra_instructions=f"You are an expert {dialect_name_upper} SQL generator. "
                                    f"Output only valid SQL — no explanation.",
             )
+            _use_sql_sys = _is_claude_provider(config.sql_provider) and config.enable_prompt_caching
             sql_prompt = f"QUESTION: {question}\n\nOUTPUT: Only the SQL query. Start with SELECT or WITH."
+            if _is_claude_provider(config.sql_provider) and not config.enable_prompt_caching:
+                sql_prompt = f"{_sql_system}\n\n{sql_prompt}"
             sql_response, sql_tokens = call_llm(
                 sql_prompt, config.sql_provider,
-                system_prompt=_sql_system if _is_claude_provider(config.sql_provider) else None,
+                system_prompt=_sql_system if _use_sql_sys else None,
             )
             result.tokens.sql_gen = sql_tokens
             _accumulate_cache_tokens(result.tokens.sql_gen, sql_tokens)
@@ -896,7 +904,7 @@ def process_query(
                 f'"string_filter_columns": [...], "joins_needed": true/false}}'
             )
             prefill = "{" if _is_claude_provider(config.reasoning_provider) else None
-            if _is_claude_provider(config.reasoning_provider):
+            if _is_claude_provider(config.reasoning_provider) and config.enable_prompt_caching:
                 pass1_response, pass1_tokens = call_llm(
                     _p1_user, config.reasoning_provider,
                     prefill=prefill, system_prompt=_p1_system,
@@ -959,7 +967,7 @@ def process_query(
                     f"Produce a detailed query plan — no SQL yet."
                 ),
             )
-            if _is_claude_provider(config.reasoning_provider):
+            if _is_claude_provider(config.reasoning_provider) and config.enable_prompt_caching:
                 pass2_prompt = create_pass2_prompt(
                     question=question,
                     pass1_output=pass1_response,
@@ -1044,7 +1052,7 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
                 f'"string_filter_columns": [...], "joins_needed": true/false}}'
             )
             prefill = "{" if _is_claude_provider(config.reasoning_provider) else None
-            if _is_claude_provider(config.reasoning_provider):
+            if _is_claude_provider(config.reasoning_provider) and config.enable_prompt_caching:
                 pass1_response, pass1_tokens = call_llm(
                     _cp1_user, config.reasoning_provider,
                     prefill=prefill, system_prompt=_cp1_system,
@@ -1100,24 +1108,18 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
                     f"Analyze the question and generate a single correct SQL query."
                 ),
             )
+            _use_opus_cache = _is_claude_provider(config.opus_provider) and config.enable_prompt_caching
             opus_prompt = create_opus_complex_prompt(
                 question=question,
-                schema="",  # already in system_prompt
-                rules="",   # already in system_prompt
-                metadata=bundle.metadata,
-                dialect_info=config.dialect_info,
-                resolver_text=bundle.resolver_text
-            ) if _is_claude_provider(config.opus_provider) else create_opus_complex_prompt(
-                question=question,
-                schema=bundle.focused_schema,
-                rules=bundle.rules_compressed,
+                schema="" if _use_opus_cache else bundle.focused_schema,
+                rules="" if _use_opus_cache else bundle.rules_compressed,
                 metadata=bundle.metadata,
                 dialect_info=config.dialect_info,
                 resolver_text=bundle.resolver_text
             )
             opus_response, opus_complex_tokens = call_llm(
                 opus_prompt, config.opus_provider,
-                system_prompt=_opus_system if _is_claude_provider(config.opus_provider) else None,
+                system_prompt=_opus_system if _use_opus_cache else None,
             )
             result.tokens.opus_complex = opus_complex_tokens
             _accumulate_cache_tokens(result.tokens.opus_complex, opus_complex_tokens)
@@ -1143,7 +1145,7 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
                 dialect_syntax=dialect_syntax,
                 schema=schema_text,
                 rules=rules_compressed,
-            ) if _is_claude_provider(config.reasoning_provider) else None
+            ) if (_is_claude_provider(config.reasoning_provider) and config.enable_prompt_caching) else None
             prefill = "{" if _is_claude_provider(config.reasoning_provider) else None
             reasoning_response, reasoning_tokens = call_llm(
                 reasoning_prompt, config.reasoning_provider,
@@ -1732,7 +1734,7 @@ def _run_reasoning_error_fix(
         schema=schema_text,
         rules=rules_compressed,
         extra_instructions=f"You are a SQL expert. Fix failed {dialect_name} SQL queries.",
-    ) if _is_claude_provider(config.reasoning_provider) else None
+    ) if (_is_claude_provider(config.reasoning_provider) and config.enable_prompt_caching) else None
 
     if _fix_system:
         error_fix_prompt = (
@@ -1929,7 +1931,7 @@ def _run_opus_review(
     trace_refinement_output = ""
 
     use_prefill = _is_claude_provider(config.opus_provider)
-    use_cache = _is_claude_provider(config.opus_provider)
+    use_cache = _is_claude_provider(config.opus_provider) and config.enable_prompt_caching
 
     # Build cacheable system prompt (schema + rules) for Opus review
     _review_system = _build_static_system_prompt(
@@ -2104,7 +2106,7 @@ def _run_opus_error_fix(
         schema=schema_text,
         rules=rules_compressed,
         extra_instructions="You are an expert SQL debugger. Analyze the error and produce a corrected SQL.",
-    ) if _is_claude_provider(config.opus_provider) else None
+    ) if (_is_claude_provider(config.opus_provider) and config.enable_prompt_caching) else None
 
     for attempt in range(1, config.max_retries + 1):
         print(f"[TIER 3] Opus attempt {attempt}/{config.max_retries}")

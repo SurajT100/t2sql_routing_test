@@ -2114,6 +2114,12 @@ with tab3:
                     help="Match similar questions (e.g., 'show sales' ≈ 'display sales')",
                     disabled=not enable_cache
                 )
+                enable_prompt_caching = st.checkbox(
+                    "Enable Prompt Caching",
+                    value=True,
+                    help="Send static content (schema/rules/dialect) in the system prompt with Anthropic cache_control. "
+                         "Reduces cost on repeated queries. When OFF, everything goes in the user message."
+                )
                 enable_context_cache = st.checkbox(
                     "Enable Context Cache",
                     value=True,
@@ -2206,6 +2212,7 @@ with tab3:
                     enable_opus_descriptions=enable_opus_descriptions,
                     enable_cache=enable_cache,
                     enable_semantic_cache=enable_semantic_cache if enable_cache else False,
+                    enable_prompt_caching=enable_prompt_caching,
                     enable_context_cache=enable_context_cache,
                     context_cache_use_static_rules=context_cache_use_static_rules if enable_context_cache else False,
                     enable_resolver=enable_resolver,
