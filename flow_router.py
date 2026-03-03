@@ -851,15 +851,14 @@ OUTPUT: Only the SQL query. No explanation. Start with SELECT or WITH."""
             print(f"[STAGE3] Pass 2 complete — {pass2_tokens.get('input',0)+pass2_tokens.get('output',0)} tokens")
 
             # SQL Coder: receives Pass 2 plan + FOCUSED schema (only relevant cols have descriptions)
+            # Business rules are intentionally excluded — the Pass 2 plan already encodes every
+            # filter condition explicitly, so repeating rules here wastes tokens with no benefit.
             sql_prompt = f"""Generate a {dialect_name_upper} SQL query from this plan.
 
 {dialect_syntax}
 
 SCHEMA:
 {bundle.focused_schema}
-
-BUSINESS RULES:
-{bundle.rules_compressed}
 
 QUERY PLAN (implement this exactly — filters are pre-decided, do not change them):
 {pass2_response}

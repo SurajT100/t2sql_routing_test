@@ -118,35 +118,36 @@ class ContextAgent:
     ) -> ContextBundle:
         """
         Main entry point. Takes Pass 1 output and fetches everything needed.
-        
+
         Rules are pre-fetched in Stage 2 (needed for Pass 1 column mapping).
         This agent fetches: Opus descriptions, sample values, entity resolution.
-        Rules are passed through as-is.
-        
+        Rules are filtered to identified tables before being passed to Pass 2.
+
         Args:
             question: Original user question
             pass1_data: Parsed Pass 1 output with columns, tables, string_filter_columns
-            rules_compressed: Pre-fetched business rules from Stage 2
-        
+            rules_compressed: Pre-fetched business rules from Stage 2 (all rules, unfiltered)
+
         Returns:
             ContextBundle with focused schema, rules, metadata, resolver results
         """
         bundle = ContextBundle()
-        bundle.rules_compressed = rules_compressed  # Pass through pre-fetched rules
         start_time = time.time()
-        
+
         columns_by_table = pass1_data.get("columns", {})
         string_filter_columns = pass1_data.get("string_filter_columns", [])
         identified_tables = pass1_data.get("tables", [])
-        
+        joins_needed = pass1_data.get("joins_needed", False)
+
         if not columns_by_table:
             print("[CONTEXT AGENT] No columns identified by Pass 1 — returning empty bundle")
+            bundle.rules_compressed = rules_compressed
             bundle.total_time_ms = int((time.time() - start_time) * 1000)
             return bundle
-        
+
         total_cols = sum(len(v) for v in columns_by_table.values())
         print(f"[CONTEXT AGENT] Fetching context for {total_cols} columns across {len(columns_by_table)} tables")
-        
+
         # ── Step 1: Fetch column metadata + Opus descriptions ──
         stage_start = time.time()
         bundle.metadata = self._fetch_column_metadata(
@@ -156,22 +157,35 @@ class ContextAgent:
         bundle.opus_descriptions_fetched = self._count_descriptions(bundle.metadata)
         bundle.stage_times["metadata_fetch"] = int((time.time() - stage_start) * 1000)
         print(f"[CONTEXT AGENT] Metadata: {total_cols} columns, {bundle.opus_descriptions_fetched} descriptions ({bundle.stage_times['metadata_fetch']}ms)")
-        
-        # ── Step 2: Build focused schema (only relevant columns with descriptions) ──
+
+        # ── Step 2: Filter rules to only those relevant to identified tables ──
+        # Pass 1 received ALL rules (needed for column mapping).
+        # Pass 2 only needs rules for the tables it will actually query.
+        filtered_rules, join_extra_tables = self._filter_rules_by_tables(
+            rules_compressed, identified_tables, joins_needed
+        )
+        bundle.rules_compressed = filtered_rules
+        print(f"[CONTEXT AGENT] Rules filtered: {bundle.rules_retrieved} → kept for identified tables "
+              f"(joins_needed={joins_needed})")
+
+        # ── Step 3: Build focused schema (only identified tables; only relevant cols get descriptions) ──
+        # Pass 1 column keys give us the exact set of tables needed.
+        # When joins are needed, also include tables referenced by kept join rules.
         stage_start = time.time()
         bundle.focused_schema = self._build_focused_schema(
-            columns_by_table, bundle.metadata
+            columns_by_table, bundle.metadata,
+            extra_join_tables=join_extra_tables if joins_needed else set()
         )
         bundle.stage_times["schema_build"] = int((time.time() - stage_start) * 1000)
-        
-        # Rules are pre-fetched in Stage 2 — count them for diagnostics
+
+        # Count filtered rules for diagnostics
         try:
             rules_list = json.loads(bundle.rules_compressed)
             bundle.rules_retrieved = len(rules_list) if isinstance(rules_list, list) else 0
         except Exception:
             bundle.rules_retrieved = 0
         
-        # ── Step 3: Entity resolution (live DB) ──
+        # ── Step 4: Entity resolution (live DB) ──
         if self.enable_resolver and string_filter_columns:
             stage_start = time.time()
             try:
@@ -216,6 +230,105 @@ class ContextAgent:
         
         return bundle
     
+    # ═════════════════════════════════════════════════════════════════════
+    # INTERNAL: Rule Filtering by Identified Tables
+    # ═════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _filter_rules_by_tables(
+        rules_compressed: str,
+        identified_tables: List[str],
+        joins_needed: bool
+    ):
+        """
+        Filter rules_compressed to only rules relevant to identified tables.
+
+        Keep a rule if ANY of:
+          - No tables/table field (general rule, applies everywhere)
+          - tables field contains at least one identified table
+          - table field matches an identified table
+          - mandatory=true AND no tables/table field (explicit: always keep mandatory globals)
+          - mandatory=true AND tables/table includes an identified table
+
+        Drop a rule if:
+          - tables field references ONLY tables not in the identified set
+          - table field doesn't match any identified table
+
+        Join rule handling:
+          - joins_needed=false  → drop ALL type="join" rules
+          - joins_needed=true   → keep join rules that reference ≥1 identified table
+
+        Returns:
+            (filtered_rules_json, join_extra_tables)
+            join_extra_tables: set of normalized table names from kept join rules
+                               (for expanding the focused schema when joins are needed)
+        """
+        try:
+            rules_list = json.loads(rules_compressed)
+            if not isinstance(rules_list, list):
+                return rules_compressed, set()
+
+            # Build normalized lookup set for fast membership tests
+            identified_set: set = set()
+            for t in identified_tables:
+                identified_set.add(t.lower())
+                if "." in t:
+                    identified_set.add(t.split(".")[-1].lower())
+
+            filtered = []
+            join_extra_tables: set = set()
+
+            for rule in rules_list:
+                rule_type = rule.get("type", "")
+
+                # ── join rules: drop wholesale when joins not needed ──
+                if rule_type == "join" and not joins_needed:
+                    continue
+
+                tables_field = rule.get("tables")
+                table_field = rule.get("table")
+
+                # ── No table reference → general rule, always keep ──
+                if tables_field is None and table_field is None:
+                    filtered.append(rule)
+                    continue
+
+                # ── tables field (list or string) ──
+                if tables_field is not None:
+                    items = tables_field if isinstance(tables_field, list) else [tables_field]
+                    norm = set()
+                    for t in items:
+                        s = str(t)
+                        norm.add(s.lower())
+                        if "." in s:
+                            norm.add(s.split(".")[-1].lower())
+
+                    if norm & identified_set:
+                        filtered.append(rule)
+                        # Collect all tables referenced by kept join rules
+                        if rule_type == "join":
+                            join_extra_tables |= norm
+                    # else: ONLY non-identified tables → drop
+                    continue
+
+                # ── table field (single value) ──
+                if table_field is not None:
+                    s = str(table_field)
+                    t_norm = s.lower()
+                    t_clean = s.split(".")[-1].lower() if "." in s else t_norm
+                    if t_norm in identified_set or t_clean in identified_set:
+                        filtered.append(rule)
+                        if rule_type == "join":
+                            join_extra_tables.add(t_norm)
+                            join_extra_tables.add(t_clean)
+                    # else: table doesn't match → drop
+
+            return json.dumps(filtered), join_extra_tables
+
+        except Exception as e:
+            print(f"[CONTEXT AGENT] Rule filtering error (returning unfiltered): {e}")
+            return rules_compressed, set()
+
     # ═════════════════════════════════════════════════════════════════════
     # INTERNAL: Column Metadata + Opus Descriptions
     # ═════════════════════════════════════════════════════════════════════
@@ -311,69 +424,88 @@ class ContextAgent:
     def _build_focused_schema(
         self,
         columns_by_table: Dict[str, List[str]],
-        metadata: Dict[str, Any]
+        metadata: Dict[str, Any],
+        extra_join_tables: set = None
     ) -> str:
         """
-        Build schema text with descriptions for ONLY identified columns.
-        
-        SQL Coder needs to know column names, types, and quoting.
-        But it only needs descriptions for the columns Pass 1 identified.
-        
-        Other columns in the table are listed with name+type only (so SQL Coder 
-        doesn't accidentally reference non-existent columns), but without 
-        expensive descriptions.
+        Build schema text for ONLY the tables Pass 1 identified.
+
+        Only tables present in columns_by_table are included, reducing token
+        usage from irrelevant tables.  When joins_needed=true, tables referenced
+        by kept join rules (extra_join_tables) are also included even if Pass 1
+        didn't put any columns there explicitly.
+
+        Within each included table, identified columns get full descriptions;
+        other columns are listed with name+type only.
         """
         from sqlalchemy import inspect
-        
+
         q = self.quote_char
         qr = ']' if q == '[' else q
-        
+
         inspector = inspect(self.user_engine)
-        
+
+        # Normalize the set of tables Pass 1 identified (bare name, lowercase)
+        pass1_table_names: set = set()
+        for t in columns_by_table.keys():
+            pass1_table_names.add(t.lower())
+            if "." in t:
+                pass1_table_names.add(t.split(".")[-1].lower())
+
+        # Extra tables from kept join rules (already normalized by _filter_rules_by_tables)
+        join_tables: set = extra_join_tables or set()
+
+        # Union of tables to include in the schema output
+        tables_to_include: set = pass1_table_names | join_tables
+
         # Build set of identified columns for quick lookup
-        identified_cols = set()
+        identified_cols: set = set()
         for table, cols in columns_by_table.items():
             for col in cols:
                 identified_cols.add((table, col))
-        
+
         lines = [f"DATABASE: {self.dialect.upper()}"]
-        
+
         for full_name in self.selected_tables:
             if "." in full_name:
                 schema_name, table_name = full_name.split(".", 1)
             else:
                 schema_name = None
                 table_name = full_name
-            
+
+            # ── Skip tables Pass 1 didn't identify (and aren't needed for joins) ──
+            if table_name.lower() not in tables_to_include and full_name.lower() not in tables_to_include:
+                continue
+
             try:
                 columns = inspector.get_columns(table_name, schema=schema_name)
-                
+
                 # Format table name
                 if schema_name:
                     quoted_table = f"{q}{schema_name}{qr}.{q}{table_name}{qr}"
                 else:
                     quoted_table = f"{q}{table_name}{qr}"
-                
+
                 lines.append(f"\n{quoted_table}:")
-                
+
                 for col in columns:
                     col_name = col["name"]
                     col_type = str(col["type"])
                     nullable = "NULL" if col.get("nullable", True) else "NOT NULL"
                     quoted_col = f"{q}{col_name}{qr}"
-                    
+
                     # Check if this column was identified by Pass 1
                     is_identified = (full_name, col_name) in identified_cols
-                    
+
                     # Also check without schema prefix (Pass 1 might say "SAP" not "public.SAP")
                     if not is_identified:
                         is_identified = (table_name, col_name) in identified_cols
-                    
+
                     if is_identified:
                         # ── IDENTIFIED COLUMN: include full description ──
                         col_meta = metadata.get(full_name, metadata.get(table_name, {})).get(col_name, {})
                         desc = col_meta.get("description", "")
-                        
+
                         if desc:
                             desc_short = desc[:120] if len(desc) > 120 else desc
                             lines.append(f"  ★ {quoted_col} ({col_type}) {nullable} — {desc_short}")
@@ -382,11 +514,11 @@ class ContextAgent:
                     else:
                         # ── OTHER COLUMN: name + type only (no description) ──
                         lines.append(f"  • {quoted_col} ({col_type}) {nullable}")
-                
+
             except Exception as e:
                 print(f"[CONTEXT AGENT] Error reading {full_name}: {e}")
                 lines.append(f"  [Error reading {full_name}: {str(e)[:50]}]")
-        
+
         return "\n".join(lines)
     
     # ═════════════════════════════════════════════════════════════════════
