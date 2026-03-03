@@ -145,6 +145,13 @@ class ContextAgent:
             bundle.total_time_ms = int((time.time() - start_time) * 1000)
             return bundle
 
+        # ── Step 0: Inject mandatory columns from rule_column_dependencies ──
+        # Deterministically ensures columns required by business rules are
+        # always present — regardless of whether Pass 1 mentioned them.
+        columns_by_table = self._inject_dependency_columns(
+            columns_by_table, identified_tables
+        )
+
         total_cols = sum(len(v) for v in columns_by_table.values())
         print(f"[CONTEXT AGENT] Fetching context for {total_cols} columns across {len(columns_by_table)} tables")
 
@@ -330,9 +337,114 @@ class ContextAgent:
             return rules_compressed, set()
 
     # ═════════════════════════════════════════════════════════════════════
+    # INTERNAL: Rule Dependency Column Injection
+    # ═════════════════════════════════════════════════════════════════════
+
+    def _inject_dependency_columns(
+        self,
+        columns_by_table: Dict[str, List[str]],
+        identified_tables: List[str]
+    ) -> Dict[str, List[str]]:
+        """
+        Query rule_column_dependencies for the identified tables and inject
+        any mandatory columns not already in columns_by_table.
+
+        This makes mandatory filter columns deterministic — they are always
+        present in the focused context regardless of whether Pass 1 included
+        them in its column identification output.
+
+        Injected columns receive full metadata (descriptions, samples, ★ marker)
+        automatically because the metadata fetch and schema builder iterate over
+        whatever is in columns_by_table at the time they run.
+
+        Returns the (possibly augmented) columns_by_table dict.
+        """
+        if not identified_tables and not columns_by_table:
+            return columns_by_table
+
+        try:
+            from sqlalchemy import text
+
+            # Build a normalised lookup: lowercase bare name → canonical key
+            # as it appears in columns_by_table (so we can append to the right list).
+            canonical: Dict[str, str] = {}
+            for key in columns_by_table.keys():
+                canonical[key.lower()] = key
+                if "." in key:
+                    canonical[key.split(".")[-1].lower()] = key
+
+            # Collect all candidate table names to query (full + bare forms)
+            query_tables: List[str] = list(
+                set(identified_tables) | set(columns_by_table.keys())
+            )
+            bare_names = [t.split(".")[-1] for t in query_tables if "." in t]
+            query_tables = list(set(query_tables + bare_names))
+
+            with self.vector_engine.connect() as conn:
+                result = conn.execute(
+                    text("""
+                        SELECT table_name, column_name, dependency_type, reason
+                        FROM   rule_column_dependencies
+                        WHERE  auto_apply = TRUE
+                          AND  table_name = ANY(:tables)
+                        ORDER BY table_name, column_name
+                    """),
+                    {"tables": query_tables}
+                )
+                rows = result.fetchall()
+
+            injected = 0
+            for row in rows:
+                dep_table = row[0]
+                dep_col   = row[1]
+                dep_type  = row[2]
+                reason    = row[3]
+
+                dep_lower = dep_table.lower()
+                dep_bare  = dep_table.split(".")[-1].lower() if "." in dep_table else dep_lower
+
+                # Find which key in columns_by_table this table maps to
+                matched_key = canonical.get(dep_lower) or canonical.get(dep_bare)
+
+                # If the table isn't in columns_by_table yet, add it only if it
+                # belongs to one of the tables Pass 1 identified.
+                if matched_key is None:
+                    for t in identified_tables:
+                        t_lower = t.lower()
+                        t_bare  = t.split(".")[-1].lower() if "." in t else t_lower
+                        if t_lower == dep_lower or t_bare == dep_lower:
+                            matched_key = t
+                            columns_by_table[matched_key] = []
+                            canonical[t_lower] = matched_key
+                            canonical[t_bare]  = matched_key
+                            break
+
+                if matched_key is not None:
+                    if dep_col not in columns_by_table[matched_key]:
+                        columns_by_table[matched_key].append(dep_col)
+                        injected += 1
+                        print(
+                            f"[CONTEXT AGENT] Injected {matched_key}.{dep_col} "
+                            f"(type={dep_type}) from rule_column_dependencies "
+                            f"— {reason}"
+                        )
+
+            if injected:
+                print(f"[CONTEXT AGENT] rule_column_dependencies: "
+                      f"{injected} column(s) injected across tables")
+
+        except Exception as e:
+            # Non-fatal: if the table doesn't exist yet or query fails,
+            # continue without injection rather than breaking the whole pipeline.
+            print(f"[CONTEXT AGENT] rule_column_dependencies injection error "
+                  f"(non-fatal): {e}")
+
+        return columns_by_table
+
+    # ═════════════════════════════════════════════════════════════════════
     # INTERNAL: Column Metadata + Opus Descriptions
     # ═════════════════════════════════════════════════════════════════════
-    
+
     def _fetch_column_metadata(
         self,
         columns_by_table: Dict[str, List[str]],

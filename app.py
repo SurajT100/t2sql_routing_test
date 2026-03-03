@@ -1007,10 +1007,21 @@ with tab2:
                                         }
                                     )
                                     conn.commit()
-                                
+
+                                # Extract and upsert column dependencies (deterministic injection)
+                                try:
+                                    from rule_dependency_extractor import upsert_rule_dependencies
+                                    n_deps = upsert_rule_dependencies(
+                                        VECTOR_ENGINE, metric_name, rule_data, "metric"
+                                    )
+                                    if n_deps:
+                                        st.caption(f"🔗 {n_deps} column dependencies indexed for deterministic injection")
+                                except Exception as _dep_err:
+                                    print(f"[RULE DEPS] Non-fatal error indexing dependencies: {_dep_err}")
+
                                 st.success(f"✅ Metric '{metric_name}' saved successfully!")
                                 st.balloons()
-                                
+
                             except Exception as e:
                                 st.error(f"❌ Failed to save: {str(e)}")
         
@@ -1137,10 +1148,21 @@ with tab2:
                                         }
                                     )
                                     conn.commit()
-                                
+
+                                # Extract and upsert column dependencies (deterministic injection)
+                                try:
+                                    from rule_dependency_extractor import upsert_rule_dependencies
+                                    n_deps = upsert_rule_dependencies(
+                                        VECTOR_ENGINE, join_name, rule_data, "join"
+                                    )
+                                    if n_deps:
+                                        st.caption(f"🔗 {n_deps} column dependencies indexed for deterministic injection")
+                                except Exception as _dep_err:
+                                    print(f"[RULE DEPS] Non-fatal error indexing dependencies: {_dep_err}")
+
                                 st.success(f"✅ Relationship '{join_name}' saved! LLM will choose appropriate join type.")
                                 st.balloons()
-                                
+
                             except Exception as e:
                                 st.error(f"❌ Failed: {str(e)}")
         
@@ -1259,10 +1281,21 @@ with tab2:
                                         }
                                     )
                                     conn.commit()
-                                
+
+                                # Extract and upsert column dependencies (deterministic injection)
+                                try:
+                                    from rule_dependency_extractor import upsert_rule_dependencies
+                                    n_deps = upsert_rule_dependencies(
+                                        VECTOR_ENGINE, filter_name, rule_data, "filter"
+                                    )
+                                    if n_deps:
+                                        st.caption(f"🔗 {n_deps} column dependencies indexed for deterministic injection")
+                                except Exception as _dep_err:
+                                    print(f"[RULE DEPS] Non-fatal error indexing dependencies: {_dep_err}")
+
                                 st.success(f"✅ Filter '{filter_name}' saved!")
                                 st.balloons()
-                                
+
                             except Exception as e:
                                 st.error(f"❌ Failed: {str(e)}")
         
@@ -1370,11 +1403,22 @@ with tab2:
                                         }
                                     )
                                     conn.commit()
-                                
+
+                                # Extract and upsert column dependencies (deterministic injection)
+                                try:
+                                    from rule_dependency_extractor import upsert_rule_dependencies
+                                    n_deps = upsert_rule_dependencies(
+                                        VECTOR_ENGINE, rule_name, rule_data, "default"
+                                    )
+                                    if n_deps:
+                                        st.caption(f"🔗 {n_deps} column dependencies indexed for deterministic injection")
+                                except Exception as _dep_err:
+                                    print(f"[RULE DEPS] Non-fatal error indexing dependencies: {_dep_err}")
+
                                 st.success(f"✅ Critical rule '{rule_name}' saved!")
                                 st.info(f"🔍 Auto-generated {len(auto_keywords)} additional keywords: {', '.join(list(auto_keywords)[:10])}...")
                                 st.balloons()
-                                
+
                             except Exception as e:
                                 st.error(f"❌ Failed: {str(e)}")
         
