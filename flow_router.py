@@ -901,7 +901,11 @@ def process_query(
                 f"QUESTION: {question}\n\n"
                 f"Identify all tables and columns needed. Return JSON only:\n"
                 f'{{"tables": [...], "columns": {{"table": ["col1",...]}}, '
-                f'"string_filter_columns": [...], "joins_needed": true/false}}'
+                f'"string_filter_columns": [{{"table": "t", "column": "c", "user_value": "v", "filter_type": "include"}}], '
+                f'"joins_needed": true/false}}\n\n'
+                f"string_filter_columns: only columns where the user supplied a human-readable value "
+                f"that may not match exactly (names, categories, codes). "
+                f"Each entry MUST be a dict with keys: table, column, user_value, filter_type."
             )
             prefill = "{" if _is_claude_provider(config.reasoning_provider) else None
             if _is_claude_provider(config.reasoning_provider) and config.enable_prompt_caching:
@@ -1049,7 +1053,11 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
                 f"QUESTION: {question}\n\n"
                 f"Identify all tables and columns needed. Return JSON only:\n"
                 f'{{"tables": [...], "columns": {{"table": ["col1",...]}}, '
-                f'"string_filter_columns": [...], "joins_needed": true/false}}'
+                f'"string_filter_columns": [{{"table": "t", "column": "c", "user_value": "v", "filter_type": "include"}}], '
+                f'"joins_needed": true/false}}\n\n'
+                f"string_filter_columns: only columns where the user supplied a human-readable value "
+                f"that may not match exactly (names, categories, codes). "
+                f"Each entry MUST be a dict with keys: table, column, user_value, filter_type."
             )
             prefill = "{" if _is_claude_provider(config.reasoning_provider) else None
             if _is_claude_provider(config.reasoning_provider) and config.enable_prompt_caching:

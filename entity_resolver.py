@@ -113,6 +113,8 @@ def resolve_entities(
     start_time = time.time()
     
     for sf in string_filter_columns:
+        if not isinstance(sf, dict):
+            continue
         table_name = sf.get("table", "")
         column_name = sf.get("column", "")
         user_value = sf.get("user_value", "").strip()

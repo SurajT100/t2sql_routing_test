@@ -466,6 +466,8 @@ class ContextAgent:
         string_filter_set = set()
         if string_filter_columns:
             for sf in string_filter_columns:
+                if not isinstance(sf, dict):
+                    continue
                 string_filter_set.add((sf.get("table", ""), sf.get("column", "")))
         
         try:
