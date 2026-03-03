@@ -8,24 +8,35 @@ from openai import OpenAI
 load_dotenv()
 
 
-def call_llm(prompt: str, provider: str, prefill: str = None, stop_sequences: list = None):
+def call_llm(
+    prompt: str,
+    provider: str,
+    prefill: str = None,
+    stop_sequences: list = None,
+    system_prompt: str = None,
+):
     """
-    Universal LLM caller - routes to appropriate provider
+    Universal LLM caller - routes to appropriate provider.
     Returns: (response_text, token_dict)
-    
+
     Args:
-        prompt: The prompt text
-        provider: LLM provider code
-        prefill: Optional prefilled assistant response start (Claude only)
-        stop_sequences: Optional list of stop sequences
-    
+        prompt: The prompt text (dynamic / query-specific content).
+        provider: LLM provider code.
+        prefill: Optional prefilled assistant response start (Claude only).
+        stop_sequences: Optional list of stop sequences.
+        system_prompt: Optional static system prompt (Claude only).
+            When provided the content is sent with cache_control so Anthropic
+            can cache it across calls — saving cost on repeated schema/rules.
+            Non-Claude providers silently ignore this parameter.
+
     Supported providers:
     - nvidia_qwen3: NVIDIA Qwen 3 Next 80B (with thinking)
     - vertex_qwen_thinking: Vertex AI Qwen3-Next-80B Thinking (reviewer)
     - o1_mini: OpenAI o1-mini (best reasoning/price)
     - o1: OpenAI o1 (best reasoning, expensive)
-    - claude_sonnet: Claude Sonnet 4
-    - claude_haiku: Claude Haiku 4.5  
+    - claude_sonnet: Claude Sonnet 4.5
+    - claude_opus: Claude Opus 4.5
+    - claude_haiku: Claude Haiku 4.5
     - groq: Groq Llama 3.3 70B
     - grok: xAI Grok Beta
     - vertex_qwen: Qwen 2.5 Coder 32B
@@ -39,11 +50,11 @@ def call_llm(prompt: str, provider: str, prefill: str = None, stop_sequences: li
     elif provider == "o1":
         return call_o1(prompt)
     elif provider == "claude_sonnet":
-        return call_claude_sonnet(prompt, prefill, stop_sequences)
+        return call_claude_sonnet(prompt, prefill, stop_sequences, system_prompt)
     elif provider == "claude_opus":
-        return call_claude_opus(prompt, prefill, stop_sequences)
+        return call_claude_opus(prompt, prefill, stop_sequences, system_prompt)
     elif provider == "claude_haiku":
-        return call_claude_haiku(prompt, prefill, stop_sequences)
+        return call_claude_haiku(prompt, prefill, stop_sequences, system_prompt)
     elif provider == "vertex_qwen":
         return call_qwen_vertex(prompt)
     elif provider == "groq":
@@ -153,151 +164,186 @@ def call_nvidia_qwen3(prompt: str, stop_sequences: list = None):
 
 
 
-def call_claude_sonnet(prompt: str, prefill: str = None, stop_sequences: list = None):
+def call_claude_sonnet(
+    prompt: str,
+    prefill: str = None,
+    stop_sequences: list = None,
+    system_prompt: str = None,
+):
     """
-    Call Claude Sonnet 4.5 for reasoning and analysis
-    
+    Call Claude Sonnet 4.5 for reasoning and analysis.
+
     Args:
-        prompt: The prompt text
+        prompt: The prompt text (dynamic content — question, plan, etc.)
         prefill: Optional prefilled assistant response (e.g., "{" for JSON)
         stop_sequences: Optional list of strings to stop generation
-    
+        system_prompt: Optional static system prompt sent with cache_control.
+            Use for schema + rules + dialect to enable Anthropic prompt caching.
+
     Returns: (response_text, token_dict)
+        token_dict keys: input, output,
+                         cache_creation_input_tokens, cache_read_input_tokens
     """
-    client = anthropic.Anthropic(
-        api_key=os.environ.get("ANTHROPIC_API_KEY")
-    )
-    
-    # Build messages array
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
     messages = [{"role": "user", "content": prompt}]
-    
-    # Add prefill if provided
     if prefill:
         messages.append({"role": "assistant", "content": prefill})
-    
-    # Build request parameters
+
     params = {
         "model": "claude-sonnet-4-5-20250929",
         "max_tokens": 4096,
         "temperature": 0.0,
-        "messages": messages
+        "messages": messages,
     }
-    
-    # Add stop sequences if provided
+
+    # Attach cacheable system prompt when provided
+    if system_prompt:
+        params["system"] = [
+            {
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
     if stop_sequences:
         params["stop_sequences"] = stop_sequences
-    
+
     message = client.messages.create(**params)
-    
+
     tokens = {
         "input": message.usage.input_tokens,
-        "output": message.usage.output_tokens
+        "output": message.usage.output_tokens,
+        "cache_creation_input_tokens": getattr(message.usage, "cache_creation_input_tokens", 0) or 0,
+        "cache_read_input_tokens": getattr(message.usage, "cache_read_input_tokens", 0) or 0,
     }
-    
-    # If prefilled, prepend the prefill to the response
+
     response_text = message.content[0].text
     if prefill:
         response_text = prefill + response_text
-    
+
     return response_text, tokens
 
 
-def call_claude_opus(prompt: str, prefill: str = None, stop_sequences: list = None):
+def call_claude_opus(
+    prompt: str,
+    prefill: str = None,
+    stop_sequences: list = None,
+    system_prompt: str = None,
+):
     """
-    Call Claude Opus 4 for deep validation and review
-    Most accurate model - use for critical review tasks
-    
+    Call Claude Opus 4.5 for deep validation and review.
+    Most accurate model — use for critical review tasks.
+
     Args:
-        prompt: The prompt text
+        prompt: The prompt text (dynamic content)
         prefill: Optional prefilled assistant response (e.g., "{" for JSON)
         stop_sequences: Optional list of strings to stop generation
-    
+        system_prompt: Optional static system prompt sent with cache_control.
+
     Returns: (response_text, token_dict)
+        token_dict keys: input, output,
+                         cache_creation_input_tokens, cache_read_input_tokens
     """
-    client = anthropic.Anthropic(
-        api_key=os.environ.get("ANTHROPIC_API_KEY")
-    )
-    
-    # Build messages array
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
     messages = [{"role": "user", "content": prompt}]
-    
-    # Add prefill if provided
     if prefill:
         messages.append({"role": "assistant", "content": prefill})
-    
-    # Build request parameters
+
     params = {
         "model": "claude-opus-4-5-20251101",
         "max_tokens": 4096,
         "temperature": 0.0,
-        "messages": messages
+        "messages": messages,
     }
-    
-    # Add stop sequences if provided
+
+    if system_prompt:
+        params["system"] = [
+            {
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
     if stop_sequences:
         params["stop_sequences"] = stop_sequences
-    
+
     message = client.messages.create(**params)
-    
+
     tokens = {
         "input": message.usage.input_tokens,
-        "output": message.usage.output_tokens
+        "output": message.usage.output_tokens,
+        "cache_creation_input_tokens": getattr(message.usage, "cache_creation_input_tokens", 0) or 0,
+        "cache_read_input_tokens": getattr(message.usage, "cache_read_input_tokens", 0) or 0,
     }
-    
-    # If prefilled, prepend the prefill to the response
+
     response_text = message.content[0].text
     if prefill:
         response_text = prefill + response_text
-    
+
     return response_text, tokens
 
 
-def call_claude_haiku(prompt: str, prefill: str = None, stop_sequences: list = None):
+def call_claude_haiku(
+    prompt: str,
+    prefill: str = None,
+    stop_sequences: list = None,
+    system_prompt: str = None,
+):
     """
-    Call Claude Haiku 4.5 for fast reasoning
-    
+    Call Claude Haiku 4.5 for fast reasoning.
+
     Args:
-        prompt: The prompt text
+        prompt: The prompt text (dynamic content)
         prefill: Optional prefilled assistant response (e.g., "{" for JSON)
         stop_sequences: Optional list of strings to stop generation
-    
+        system_prompt: Optional static system prompt sent with cache_control.
+
     Returns: (response_text, token_dict)
+        token_dict keys: input, output,
+                         cache_creation_input_tokens, cache_read_input_tokens
     """
-    client = anthropic.Anthropic(
-        api_key=os.environ.get("ANTHROPIC_API_KEY")
-    )
-    
-    # Build messages array
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
     messages = [{"role": "user", "content": prompt}]
-    
-    # Add prefill if provided
     if prefill:
         messages.append({"role": "assistant", "content": prefill})
-    
-    # Build request parameters
+
     params = {
         "model": "claude-haiku-4-5-20251001",
         "max_tokens": 4096,
         "temperature": 0.0,
-        "messages": messages
+        "messages": messages,
     }
-    
-    # Add stop sequences if provided
+
+    if system_prompt:
+        params["system"] = [
+            {
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
     if stop_sequences:
         params["stop_sequences"] = stop_sequences
-    
+
     message = client.messages.create(**params)
-    
+
     tokens = {
         "input": message.usage.input_tokens,
-        "output": message.usage.output_tokens
+        "output": message.usage.output_tokens,
+        "cache_creation_input_tokens": getattr(message.usage, "cache_creation_input_tokens", 0) or 0,
+        "cache_read_input_tokens": getattr(message.usage, "cache_read_input_tokens", 0) or 0,
     }
-    
-    # If prefilled, prepend the prefill to the response
+
     response_text = message.content[0].text
     if prefill:
         response_text = prefill + response_text
-    
+
     return response_text, tokens
 
 

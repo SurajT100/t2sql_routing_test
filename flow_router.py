@@ -312,39 +312,69 @@ class FlowConfig:
     })
 
 
+def _zero_tok() -> Dict[str, int]:
+    return {"input": 0, "output": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+
+
 @dataclass
 class TokenUsage:
     """Track token usage across all stages."""
-    classifier: Dict[str, int] = field(default_factory=lambda: {"input": 0, "output": 0})
-    reasoning: Dict[str, int] = field(default_factory=lambda: {"input": 0, "output": 0})
-    reasoning_pass1: Dict[str, int] = field(default_factory=lambda: {"input": 0, "output": 0})
-    reasoning_pass2: Dict[str, int] = field(default_factory=lambda: {"input": 0, "output": 0})
-    opus_complex: Dict[str, int] = field(default_factory=lambda: {"input": 0, "output": 0})
-    sql_gen: Dict[str, int] = field(default_factory=lambda: {"input": 0, "output": 0})
-    resolver: Dict[str, int] = field(default_factory=lambda: {"input": 0, "output": 0})  # DB query time tracking (no LLM tokens — just timing)
-    opus: Dict[str, int] = field(default_factory=lambda: {"input": 0, "output": 0})
-    refinement: Dict[str, int] = field(default_factory=lambda: {"input": 0, "output": 0})
-    error_fix_reasoning: Dict[str, int] = field(default_factory=lambda: {"input": 0, "output": 0})
-    error_fix_opus: Dict[str, int] = field(default_factory=lambda: {"input": 0, "output": 0})
-    chart: Dict[str, int] = field(default_factory=lambda: {"input": 0, "output": 0})
+    classifier: Dict[str, int] = field(default_factory=_zero_tok)
+    reasoning: Dict[str, int] = field(default_factory=_zero_tok)
+    reasoning_pass1: Dict[str, int] = field(default_factory=_zero_tok)
+    reasoning_pass2: Dict[str, int] = field(default_factory=_zero_tok)
+    opus_complex: Dict[str, int] = field(default_factory=_zero_tok)
+    sql_gen: Dict[str, int] = field(default_factory=_zero_tok)
+    resolver: Dict[str, int] = field(default_factory=_zero_tok)  # DB query time (no LLM tokens)
+    opus: Dict[str, int] = field(default_factory=_zero_tok)
+    refinement: Dict[str, int] = field(default_factory=_zero_tok)
+    # Tier 1: Static Validator mini-retry (SQL Coder)
+    tier1_fix: Dict[str, int] = field(default_factory=_zero_tok)
+    # Tier 2: Error Classifier mini-retry (SQL Coder)
+    tier2_fix: Dict[str, int] = field(default_factory=_zero_tok)
+    # Tier 3: Existing LLM error fixer
+    error_fix_reasoning: Dict[str, int] = field(default_factory=_zero_tok)
+    error_fix_opus: Dict[str, int] = field(default_factory=_zero_tok)
+    chart: Dict[str, int] = field(default_factory=_zero_tok)
 
     def total(self) -> Dict[str, int]:
+        all_stages = [
+            self.classifier, self.reasoning,
+            self.reasoning_pass1, self.reasoning_pass2, self.opus_complex,
+            self.sql_gen, self.opus, self.refinement,
+            self.tier1_fix, self.tier2_fix,
+            self.error_fix_reasoning, self.error_fix_opus,
+        ]
         return {
-            "input": (self.classifier["input"] + self.reasoning["input"] +
-                     self.reasoning_pass1["input"] + self.reasoning_pass2["input"] +
-                     self.opus_complex["input"] +
-                     self.sql_gen["input"] + self.opus["input"] + self.refinement["input"] +
-                     self.error_fix_reasoning["input"] + self.error_fix_opus["input"]),
-            "output": (self.classifier["output"] + self.reasoning["output"] +
-                      self.reasoning_pass1["output"] + self.reasoning_pass2["output"] +
-                      self.opus_complex["output"] +
-                      self.sql_gen["output"] + self.opus["output"] + self.refinement["output"] +
-                      self.error_fix_reasoning["output"] + self.error_fix_opus["output"])
+            "input":  sum(s["input"]  for s in all_stages),
+            "output": sum(s["output"] for s in all_stages),
         }
 
     def total_tokens(self) -> int:
         t = self.total()
         return t["input"] + t["output"]
+
+    def cache_creation_total(self) -> int:
+        """Total tokens written to the Anthropic prompt cache across all stages."""
+        all_stages = [
+            self.classifier, self.reasoning,
+            self.reasoning_pass1, self.reasoning_pass2, self.opus_complex,
+            self.sql_gen, self.opus, self.refinement,
+            self.tier1_fix, self.tier2_fix,
+            self.error_fix_reasoning, self.error_fix_opus,
+        ]
+        return sum(s.get("cache_creation_input_tokens", 0) for s in all_stages)
+
+    def cache_read_total(self) -> int:
+        """Total tokens read from the Anthropic prompt cache across all stages."""
+        all_stages = [
+            self.classifier, self.reasoning,
+            self.reasoning_pass1, self.reasoning_pass2, self.opus_complex,
+            self.sql_gen, self.opus, self.refinement,
+            self.tier1_fix, self.tier2_fix,
+            self.error_fix_reasoning, self.error_fix_opus,
+        ]
+        return sum(s.get("cache_read_input_tokens", 0) for s in all_stages)
 
 
 @dataclass
@@ -367,6 +397,13 @@ class LLMTrace:
     opus_output: str = ""
     refinement_input: str = ""
     refinement_output: str = ""
+    # Tier 1 mini-retry trace
+    tier1_fix_input: str = ""
+    tier1_fix_output: str = ""
+    # Tier 2 mini-retry trace
+    tier2_fix_input: str = ""
+    tier2_fix_output: str = ""
+    # Tier 3 (existing) traces
     error_fix_reasoning_input: str = ""
     error_fix_reasoning_output: str = ""
     error_fix_opus_input: str = ""
@@ -437,6 +474,63 @@ class QueryResult:
     # Timing
     total_time_ms: int = 0
     stage_times: Dict[str, int] = field(default_factory=dict)
+
+
+# =============================================================================
+# PROMPT CACHING HELPERS
+# =============================================================================
+
+def _is_claude_provider(provider: str) -> bool:
+    """Return True when the provider is a Claude model (supports prompt caching)."""
+    return provider.startswith("claude_")
+
+
+def _build_static_system_prompt(
+    dialect_syntax: str = "",
+    schema: str = "",
+    rules: str = "",
+    extra_instructions: str = "",
+) -> str:
+    """
+    Build a cacheable system prompt from static content.
+
+    Claude caches system prompts byte-for-byte — so the output of this function
+    must be identical across calls that should share a cache entry.
+
+    Args:
+        dialect_syntax:     get_dialect_syntax_rules() output (static)
+        schema:             Schema text (stable within a session)
+        rules:              Compressed rules (may vary by RAG result)
+        extra_instructions: Any static model-role instructions
+
+    Returns:
+        Combined system prompt string, or "" if all inputs are empty.
+    """
+    parts = []
+    if extra_instructions:
+        parts.append(extra_instructions)
+    if dialect_syntax:
+        parts.append(dialect_syntax)
+    if schema:
+        parts.append(f"SCHEMA:\n{schema}")
+    if rules and rules.strip() and rules.strip() not in ("[]", ""):
+        parts.append(f"BUSINESS RULES:\n{rules}")
+    return "\n\n".join(parts)
+
+
+def _accumulate_cache_tokens(result_tokens_dict: Dict, llm_token_dict: Dict) -> None:
+    """
+    Copy cache token counts from an LLM response token dict into a stage's token dict.
+    Called after every Claude call to track cache creation / read tokens.
+    """
+    result_tokens_dict["cache_creation_input_tokens"] = (
+        result_tokens_dict.get("cache_creation_input_tokens", 0)
+        + llm_token_dict.get("cache_creation_input_tokens", 0)
+    )
+    result_tokens_dict["cache_read_input_tokens"] = (
+        result_tokens_dict.get("cache_read_input_tokens", 0)
+        + llm_token_dict.get("cache_read_input_tokens", 0)
+    )
 
 
 # =============================================================================
@@ -756,22 +850,21 @@ def process_query(
             result.flow_path = "SIMPLE: Question → Schema + RAG → SQL Coder → Execute"
             print(f"[STAGE3] SIMPLE flow")
 
-            sql_prompt = f"""Generate a {dialect_name_upper} SQL query for this question.
-
-{dialect_syntax}
-
-SCHEMA:
-{schema_text}
-
-BUSINESS RULES:
-{rules_compressed}
-
-QUESTION: {question}
-
-OUTPUT: Only the SQL query. No explanation. Start with SELECT or WITH."""
-
-            sql_response, sql_tokens = call_llm(sql_prompt, config.sql_provider)
+            # Prompt caching: schema + rules + dialect → system; question → user
+            _sql_system = _build_static_system_prompt(
+                dialect_syntax=dialect_syntax,
+                schema=schema_text,
+                rules=rules_compressed,
+                extra_instructions=f"You are an expert {dialect_name_upper} SQL generator. "
+                                   f"Output only valid SQL — no explanation.",
+            )
+            sql_prompt = f"QUESTION: {question}\n\nOUTPUT: Only the SQL query. Start with SELECT or WITH."
+            sql_response, sql_tokens = call_llm(
+                sql_prompt, config.sql_provider,
+                system_prompt=_sql_system if _is_claude_provider(config.sql_provider) else None,
+            )
             result.tokens.sql_gen = sql_tokens
+            _accumulate_cache_tokens(result.tokens.sql_gen, sql_tokens)
             result.sql = extract_sql_from_response(sql_response)
             result.llm_trace.sql_gen_input = sql_prompt
             result.llm_trace.sql_gen_output = sql_response
@@ -785,18 +878,41 @@ OUTPUT: Only the SQL query. No explanation. Start with SELECT or WITH."""
             # Rules are critical — they map business terms to column names
             # (e.g., "sales" → SUM("Margin"), not "Bottomline")
             # Descriptions are NOT needed here — deferred to Context Agent
-            pass1_prompt = create_pass1_prompt(
-                question=question,
+            # Prompt caching: schema + rules → system; question → user message
+            _p1_system = _build_static_system_prompt(
+                dialect_syntax=dialect_syntax,
                 schema=bare_schema,
                 rules=rules_compressed,
-                dialect_info=config.dialect_info
+                extra_instructions=(
+                    f"You are a SQL query planner for {dialect_name_upper}. "
+                    f"Your task is to identify which tables and columns are needed.\n"
+                    f"COLUMN FORMAT: {quote_char}column_name{quote_char}"
+                ),
             )
-            prefill = "{" if "claude" in config.reasoning_provider else None
-            pass1_response, pass1_tokens = call_llm(
-                pass1_prompt, config.reasoning_provider, prefill=prefill
+            _p1_user = (
+                f"QUESTION: {question}\n\n"
+                f"Identify all tables and columns needed. Return JSON only:\n"
+                f'{{"tables": [...], "columns": {{"table": ["col1",...]}}, '
+                f'"string_filter_columns": [...], "joins_needed": true/false}}'
             )
+            prefill = "{" if _is_claude_provider(config.reasoning_provider) else None
+            if _is_claude_provider(config.reasoning_provider):
+                pass1_response, pass1_tokens = call_llm(
+                    _p1_user, config.reasoning_provider,
+                    prefill=prefill, system_prompt=_p1_system,
+                )
+                result.llm_trace.reasoning_pass1_input = _p1_user
+            else:
+                pass1_prompt = create_pass1_prompt(
+                    question=question, schema=bare_schema,
+                    rules=rules_compressed, dialect_info=config.dialect_info,
+                )
+                pass1_response, pass1_tokens = call_llm(
+                    pass1_prompt, config.reasoning_provider, prefill=prefill,
+                )
+                result.llm_trace.reasoning_pass1_input = pass1_prompt
             result.tokens.reasoning_pass1 = pass1_tokens
-            result.llm_trace.reasoning_pass1_input = pass1_prompt
+            _accumulate_cache_tokens(result.tokens.reasoning_pass1, pass1_tokens)
             result.llm_trace.reasoning_pass1_output = pass1_response
             print(f"[STAGE3] Pass 1 complete — {pass1_tokens.get('input',0)+pass1_tokens.get('output',0)} tokens")
 
@@ -832,19 +948,44 @@ OUTPUT: Only the SQL query. No explanation. Start with SELECT or WITH."""
                   f"descs:{bundle.opus_descriptions_fetched} rules:{bundle.rules_retrieved} "
                   f"entities:{bundle.entities_resolved}")
 
-            # Pass 2: Full plan with FOCUSED context (descriptions + rules + resolver)
-            pass2_prompt = create_pass2_prompt(
-                question=question,
-                pass1_output=pass1_response,
-                metadata=bundle.metadata,
-                dialect_info=config.dialect_info,
-                resolver_text=bundle.resolver_text,
-                rules=bundle.rules_compressed
+            # Pass 2: Full plan with FOCUSED context
+            # Prompt caching: rules + dialect → system; question + metadata → user
+            _p2_system = _build_static_system_prompt(
+                dialect_syntax=dialect_syntax,
+                schema=bare_schema,
+                rules=bundle.rules_compressed,
+                extra_instructions=(
+                    f"You are a SQL query planner for {dialect_name_upper}. "
+                    f"Produce a detailed query plan — no SQL yet."
+                ),
             )
-            pass2_response, pass2_tokens = call_llm(
-                pass2_prompt, config.reasoning_provider, prefill=prefill
-            )
+            if _is_claude_provider(config.reasoning_provider):
+                pass2_prompt = create_pass2_prompt(
+                    question=question,
+                    pass1_output=pass1_response,
+                    metadata=bundle.metadata,
+                    dialect_info=config.dialect_info,
+                    resolver_text=bundle.resolver_text,
+                    rules="",  # already in system_prompt to avoid duplication
+                )
+                pass2_response, pass2_tokens = call_llm(
+                    pass2_prompt, config.reasoning_provider,
+                    prefill=prefill, system_prompt=_p2_system,
+                )
+            else:
+                pass2_prompt = create_pass2_prompt(
+                    question=question,
+                    pass1_output=pass1_response,
+                    metadata=bundle.metadata,
+                    dialect_info=config.dialect_info,
+                    resolver_text=bundle.resolver_text,
+                    rules=bundle.rules_compressed,
+                )
+                pass2_response, pass2_tokens = call_llm(
+                    pass2_prompt, config.reasoning_provider, prefill=prefill,
+                )
             result.tokens.reasoning_pass2 = pass2_tokens
+            _accumulate_cache_tokens(result.tokens.reasoning_pass2, pass2_tokens)
             result.llm_trace.reasoning_pass2_input = pass2_prompt
             result.llm_trace.reasoning_pass2_output = pass2_response
             result.pass2_plan = pass2_response
@@ -885,19 +1026,41 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
             result.flow_path = "COMPLEX: Question → Bare Schema + Rules → Pass 1 → Context Agent [descs + samples + resolver] → Opus → Execute"
             print(f"[STAGE3] COMPLEX flow — Opus handles reasoning + SQL")
 
-            # Quick Pass 1 using bare schema + rules
-            pass1_prompt = create_pass1_prompt(
-                question=question,
+            # Quick Pass 1 using bare schema + rules (with caching for Claude)
+            _cp1_system = _build_static_system_prompt(
+                dialect_syntax=dialect_syntax,
                 schema=bare_schema,
                 rules=rules_compressed,
-                dialect_info=config.dialect_info
+                extra_instructions=(
+                    f"You are a SQL query planner for {dialect_name_upper}. "
+                    f"Identify which tables and columns are needed.\n"
+                    f"COLUMN FORMAT: {quote_char}column_name{quote_char}"
+                ),
             )
-            prefill = "{" if "claude" in config.reasoning_provider else None
-            pass1_response, pass1_tokens = call_llm(
-                pass1_prompt, config.reasoning_provider, prefill=prefill
+            _cp1_user = (
+                f"QUESTION: {question}\n\n"
+                f"Identify all tables and columns needed. Return JSON only:\n"
+                f'{{"tables": [...], "columns": {{"table": ["col1",...]}}, '
+                f'"string_filter_columns": [...], "joins_needed": true/false}}'
             )
+            prefill = "{" if _is_claude_provider(config.reasoning_provider) else None
+            if _is_claude_provider(config.reasoning_provider):
+                pass1_response, pass1_tokens = call_llm(
+                    _cp1_user, config.reasoning_provider,
+                    prefill=prefill, system_prompt=_cp1_system,
+                )
+                result.llm_trace.reasoning_pass1_input = _cp1_user
+            else:
+                pass1_prompt = create_pass1_prompt(
+                    question=question, schema=bare_schema,
+                    rules=rules_compressed, dialect_info=config.dialect_info,
+                )
+                pass1_response, pass1_tokens = call_llm(
+                    pass1_prompt, config.reasoning_provider, prefill=prefill,
+                )
+                result.llm_trace.reasoning_pass1_input = pass1_prompt
             result.tokens.reasoning_pass1 = pass1_tokens
-            result.llm_trace.reasoning_pass1_input = pass1_prompt
+            _accumulate_cache_tokens(result.tokens.reasoning_pass1, pass1_tokens)
             result.llm_trace.reasoning_pass1_output = pass1_response
 
             # ── CONTEXT AGENT ──
@@ -928,7 +1091,23 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
             result.stage_times["context_agent"] = bundle.total_time_ms
 
             # Opus single call: FOCUSED schema + rules + metadata + resolutions → SQL
+            _opus_system = _build_static_system_prompt(
+                dialect_syntax=dialect_syntax,
+                schema=bundle.focused_schema,
+                rules=bundle.rules_compressed,
+                extra_instructions=(
+                    f"You are an expert {dialect_name_upper} SQL analyst. "
+                    f"Analyze the question and generate a single correct SQL query."
+                ),
+            )
             opus_prompt = create_opus_complex_prompt(
+                question=question,
+                schema="",  # already in system_prompt
+                rules="",   # already in system_prompt
+                metadata=bundle.metadata,
+                dialect_info=config.dialect_info,
+                resolver_text=bundle.resolver_text
+            ) if _is_claude_provider(config.opus_provider) else create_opus_complex_prompt(
                 question=question,
                 schema=bundle.focused_schema,
                 rules=bundle.rules_compressed,
@@ -936,8 +1115,12 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
                 dialect_info=config.dialect_info,
                 resolver_text=bundle.resolver_text
             )
-            opus_response, opus_complex_tokens = call_llm(opus_prompt, config.opus_provider)
+            opus_response, opus_complex_tokens = call_llm(
+                opus_prompt, config.opus_provider,
+                system_prompt=_opus_system if _is_claude_provider(config.opus_provider) else None,
+            )
             result.tokens.opus_complex = opus_complex_tokens
+            _accumulate_cache_tokens(result.tokens.opus_complex, opus_complex_tokens)
             result.llm_trace.opus_complex_input = opus_prompt
             result.llm_trace.opus_complex_output = opus_response
             result.sql = extract_sql_from_response(opus_response)
@@ -956,11 +1139,19 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
                 dialect_info=config.dialect_info,
                 output_type="analysis"
             )
-            prefill = "{" if "claude" in config.reasoning_provider else None
+            _fb_system = _build_static_system_prompt(
+                dialect_syntax=dialect_syntax,
+                schema=schema_text,
+                rules=rules_compressed,
+            ) if _is_claude_provider(config.reasoning_provider) else None
+            prefill = "{" if _is_claude_provider(config.reasoning_provider) else None
             reasoning_response, reasoning_tokens = call_llm(
-                reasoning_prompt, config.reasoning_provider, prefill=prefill
+                reasoning_prompt, config.reasoning_provider,
+                prefill=prefill,
+                system_prompt=_fb_system,
             )
             result.tokens.reasoning = reasoning_tokens
+            _accumulate_cache_tokens(result.tokens.reasoning, reasoning_tokens)
             result.llm_trace.reasoning_input = reasoning_prompt
             result.llm_trace.reasoning_output = reasoning_response
 
@@ -977,7 +1168,65 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
         
         result.stages_completed.append("sql_generation")
         result.stage_times["sql_generation"] = int((time.time() - stage_start) * 1000)
-        
+
+        # ═══════════════════════════════════════════════════════════════════
+        # TIER 1: STATIC VALIDATOR (pre-execution, no LLM)
+        # ─────────────────────────────────────────────────────────────────
+        # Checks SQL for type mismatches, GROUP BY issues, quote style,
+        # date vs text comparisons, and missing mandatory filters.
+        # If issues found → one mini-retry with SQL Coder (small prompt).
+        # One attempt only — proceed to Stage 4 regardless of outcome.
+        # ═══════════════════════════════════════════════════════════════════
+        if result.sql:
+            try:
+                from sql_static_validator import validate_sql_static, build_tier1_mini_retry_prompt
+                _tier1_col_meta = result.column_metadata or {}
+                _dialect_quote_chars = {
+                    "postgresql": '"', "mysql": "`", "mssql": "[",
+                    "oracle": '"', "sqlite": '"',
+                }
+                _tier1_quote_char = _dialect_quote_chars.get(config.dialect, '"')
+
+                tier1_issues = validate_sql_static(
+                    sql=result.sql,
+                    column_metadata=_tier1_col_meta,
+                    dialect=config.dialect,
+                    mandatory_columns=[],  # populated by rule_column_dependencies if available
+                )
+
+                if tier1_issues:
+                    print(f"[TIER 1] Static validator found {len(tier1_issues)} issue(s). Mini-retry with SQL Coder.")
+                    for _iss in tier1_issues:
+                        print(f"  [{_iss.issue_type}] {_iss.detail}")
+
+                    _t1_prompt = build_tier1_mini_retry_prompt(
+                        original_sql=result.sql,
+                        issues=tier1_issues,
+                        dialect=config.dialect,
+                        quote_char=_tier1_quote_char,
+                    )
+                    _t1_response, _t1_tokens = call_llm(_t1_prompt, config.sql_provider)
+                    _t1_fixed = extract_sql_from_response(_t1_response)
+
+                    result.tokens.tier1_fix = _t1_tokens
+                    result.llm_trace.tier1_fix_input = _t1_prompt
+                    result.llm_trace.tier1_fix_output = _t1_response
+
+                    if _t1_fixed and _t1_fixed != result.sql:
+                        result.sql = _t1_fixed
+                        result.sql_fixed = True
+                        result.fixes_applied.append("tier1_static_validator")
+                        result.stages_completed.append("tier1_fix_applied")
+                        print(f"[TIER 1] ✅ SQL Coder applied fix.")
+                    else:
+                        result.stages_completed.append("tier1_fix_unchanged")
+                        print(f"[TIER 1] SQL Coder returned same SQL — proceeding anyway.")
+                else:
+                    print(f"[TIER 1] Static validator: no issues found.")
+                    result.stages_completed.append("tier1_clean")
+            except Exception as _t1_err:
+                print(f"[TIER 1] Static validator error (non-fatal): {_t1_err}")
+
         # ═══════════════════════════════════════════════════════════════════
         # STAGE 4: VALIDATE + AUTO-FIX SQL
         # ═══════════════════════════════════════════════════════════════════
@@ -1032,157 +1281,224 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
         # ═══════════════════════════════════════════════════════════════════
         # STAGE 6: ERROR RECOVERY (only if execution failed)
         # ─────────────────────────────────────────────────────────────────
-        # Strategy:
-        #   Attempt 1 → Reasoning LLM (cheap, fast, handles common errors)
-        #   Attempt 2 → Opus (powerful, handles complex schema/type issues)
-        #   Both fail → Return descriptive error to user
+        # Tiered recovery strategy:
+        #   Tier 2 → Error Classifier + SQL Coder mini-retry (no LLM classification)
+        #   Tier 3 → Reasoning LLM (cheap, fast)  [only if Tier 2 didn't fix it]
+        #   Tier 3 → Opus (powerful)               [only if Reasoning LLM failed]
+        #   All fail → Return descriptive error to user
         # ═══════════════════════════════════════════════════════════════════
         if not result.success and result.error and "Query blocked" not in result.error:
             stage_start = time.time()
             result.error_recovery_attempted = True
             result.original_sql = result.sql  # Capture SQL before any recovery changes it
 
-            # Use stored metadata + plan if available (two-pass flow)
-            # This avoids re-fetching metadata and re-sending schema/rules
-            has_two_pass_context = bool(result.pass2_plan and result.column_metadata)
+            # ── TIER 2: Error Classifier + SQL Coder mini-retry ─────────
+            # Classify the database error with zero LLM cost, then send a
+            # targeted mini-retry to SQL Coder (small prompt — SQL + diagnosis).
+            # high/medium confidence → mini-retry → if fixed: done, else → Tier 3
+            # low / unclassifiable  → skip mini-retry, go directly to Tier 3
+            _tier2_fixed = False
+            try:
+                from sql_error_classifier import classify_sql_error, build_tier2_mini_retry_prompt
+                _dialect_quote_chars = {
+                    "postgresql": '"', "mysql": "`", "mssql": "[",
+                    "oracle": '"', "sqlite": '"',
+                }
+                _t2_quote_char = _dialect_quote_chars.get(config.dialect, '"')
 
-            # ── Attempt 1: Reasoning LLM ────────────────────────────────
-            print(f"[ERROR RECOVERY] Attempt 1: Reasoning LLM fixing error...")
+                diagnosis = classify_sql_error(result.error, result.sql, config.dialect)
 
-            if has_two_pass_context:
-                # Use new metadata-aware retry prompt (cheap — no schema/rules)
-                from reasoning_prompts import create_error_retry_prompt
-                retry_prompt = create_error_retry_prompt(
-                    question=question,
-                    pass2_plan=result.pass2_plan,
-                    metadata=result.column_metadata,
-                    failed_sql=result.sql,
-                    error_message=result.error,
-                    dialect_info=config.dialect_info,
-                    use_opus=False
-                )
-                prefill = "{" if "claude" in config.reasoning_provider else None
-                retry_response, retry_tokens = call_llm(
-                    retry_prompt, config.reasoning_provider, prefill=prefill
-                )
-                result.tokens.error_fix_reasoning = retry_tokens
-                result.llm_trace.error_fix_reasoning_input = retry_prompt
-                result.llm_trace.error_fix_reasoning_output = retry_response
+                if diagnosis:
+                    print(
+                        f"[TIER 2] Classified error: {diagnosis.error_category} "
+                        f"(confidence={diagnosis.confidence})"
+                    )
+                    if diagnosis.confidence in ("high", "medium"):
+                        _t2_prompt = build_tier2_mini_retry_prompt(
+                            original_sql=result.sql,
+                            diagnosis=diagnosis,
+                            dialect=config.dialect,
+                            quote_char=_t2_quote_char,
+                        )
+                        _t2_response, _t2_tokens = call_llm(_t2_prompt, config.sql_provider)
+                        _t2_fixed_sql = extract_sql_from_response(_t2_response)
 
-                # Extract fixed SQL from retry response
-                fixed_sql = extract_sql_from_response(retry_response)
-                reasoning_fix_result = {"fixed_sql": fixed_sql, "tokens": retry_tokens}
+                        result.tokens.tier2_fix = _t2_tokens
+                        result.llm_trace.tier2_fix_input = _t2_prompt
+                        result.llm_trace.tier2_fix_output = _t2_response
 
-                if fixed_sql and fixed_sql != result.sql:
-                    try:
-                        from db import run_sql
-                        fix_results = run_sql(engine, fixed_sql)
-                        reasoning_fix_result["success"] = True
-                        reasoning_fix_result["results"] = fix_results
-                        reasoning_fix_result["error"] = None
-                    except Exception as fix_err:
-                        reasoning_fix_result["success"] = False
-                        reasoning_fix_result["error"] = str(fix_err)
+                        if _t2_fixed_sql:
+                            try:
+                                from db import run_sql as _run_sql
+                                _t2_results = _run_sql(engine, _t2_fixed_sql)
+                                # Tier 2 fixed it
+                                result.sql = _t2_fixed_sql
+                                result.results = _t2_results
+                                result.success = True
+                                result.error = None
+                                result.error_recovery_method = "tier2_classifier"
+                                result.sql_fixed = True
+                                result.fixes_applied.append("tier2_error_classifier")
+                                result.stages_completed.append("tier2_fix_success")
+                                _tier2_fixed = True
+                                print(f"[TIER 2] ✅ SQL Coder mini-retry succeeded.")
+                            except Exception as _t2_exec_err:
+                                result.error = str(_t2_exec_err)
+                                result.stages_completed.append("tier2_fix_failed")
+                                print(
+                                    f"[TIER 2] Mini-retry failed: {str(_t2_exec_err)[:100]}. "
+                                    f"Escalating to Tier 3."
+                                )
+                        else:
+                            result.stages_completed.append("tier2_no_sql")
+                            print(f"[TIER 2] SQL Coder returned no SQL. Escalating to Tier 3.")
+                    else:
+                        result.stages_completed.append("tier2_low_confidence_skip")
+                        print(f"[TIER 2] Low confidence — skipping mini-retry, going to Tier 3.")
                 else:
-                    reasoning_fix_result["success"] = False
-                    reasoning_fix_result["error"] = result.error
-            else:
-                # Fallback: original error fix method
-                reasoning_fix_result = _run_reasoning_error_fix(
-                    question=question,
-                    sql=result.sql,
-                    error=result.error,
-                    schema_text=schema_text,
-                    rules_compressed=rules_compressed,
-                    config=config,
-                    engine=engine
-                )
-                result.tokens.error_fix_reasoning = reasoning_fix_result.get("tokens", {"input": 0, "output": 0})
-                result.llm_trace.error_fix_reasoning_input = reasoning_fix_result.get("trace_input", "")
-                result.llm_trace.error_fix_reasoning_output = reasoning_fix_result.get("trace_output", "")
-            
-            if reasoning_fix_result.get("success"):
-                # Reasoning LLM fixed it
-                result.sql = reasoning_fix_result["fixed_sql"]
-                result.results = reasoning_fix_result["results"]
-                result.success = True
-                result.error = None
-                result.error_recovery_method = "reasoning_llm"
-                result.sql_fixed = True
-                result.fixes_applied.append("reasoning_llm_error_fix")
-                result.stages_completed.append("error_recovery_reasoning_success")
-                print(f"[ERROR RECOVERY] ✅ Reasoning LLM fixed the error")
-            else:
-                # Attempt 1 failed → Escalate to Opus
-                print(f"[ERROR RECOVERY] Reasoning LLM failed. Attempt 2: Opus fixing error...")
+                    result.stages_completed.append("tier2_unclassified")
+                    print(f"[TIER 2] Could not classify error. Going to Tier 3.")
+            except Exception as _t2_err:
+                print(f"[TIER 2] Classifier error (non-fatal): {_t2_err}. Going to Tier 3.")
+
+            if not _tier2_fixed:
+                # ── TIER 3: Reasoning LLM then Opus (existing flow) ─────
+                # Only reached when Tier 2 couldn't fix the error.
+                # Use stored metadata + plan if available (two-pass flow)
+                has_two_pass_context = bool(result.pass2_plan and result.column_metadata)
+
+                # Attempt 1: Reasoning LLM
+                print(f"[TIER 3 / ERROR RECOVERY] Attempt 1: Reasoning LLM fixing error...")
 
                 if has_two_pass_context:
                     from reasoning_prompts import create_error_retry_prompt
-                    opus_retry_prompt = create_error_retry_prompt(
+                    retry_prompt = create_error_retry_prompt(
                         question=question,
                         pass2_plan=result.pass2_plan,
                         metadata=result.column_metadata,
-                        failed_sql=reasoning_fix_result.get("fixed_sql", result.sql),
-                        error_message=reasoning_fix_result.get("error", result.error),
+                        failed_sql=result.sql,
+                        error_message=result.error,
                         dialect_info=config.dialect_info,
-                        use_opus=True  # Adds stronger Opus-specific instruction
+                        use_opus=False
                     )
-                    opus_retry_response, opus_retry_tokens = call_llm(
-                        opus_retry_prompt, config.opus_provider
+                    prefill = "{" if "claude" in config.reasoning_provider else None
+                    retry_response, retry_tokens = call_llm(
+                        retry_prompt, config.reasoning_provider, prefill=prefill
                     )
-                    result.tokens.error_fix_opus = opus_retry_tokens
-                    result.llm_trace.error_fix_opus_input = opus_retry_prompt
-                    result.llm_trace.error_fix_opus_output = opus_retry_response
+                    result.tokens.error_fix_reasoning = retry_tokens
+                    result.llm_trace.error_fix_reasoning_input = retry_prompt
+                    result.llm_trace.error_fix_reasoning_output = retry_response
 
-                    fixed_sql = extract_sql_from_response(opus_retry_response)
-                    opus_fix_result = {"fixed_sql": fixed_sql, "tokens": opus_retry_tokens}
+                    fixed_sql = extract_sql_from_response(retry_response)
+                    reasoning_fix_result = {"fixed_sql": fixed_sql, "tokens": retry_tokens}
 
-                    if fixed_sql:
+                    if fixed_sql and fixed_sql != result.sql:
                         try:
                             from db import run_sql
                             fix_results = run_sql(engine, fixed_sql)
-                            opus_fix_result["success"] = True
-                            opus_fix_result["results"] = fix_results
+                            reasoning_fix_result["success"] = True
+                            reasoning_fix_result["results"] = fix_results
+                            reasoning_fix_result["error"] = None
                         except Exception as fix_err:
-                            opus_fix_result["success"] = False
-                            opus_fix_result["error"] = str(fix_err)
+                            reasoning_fix_result["success"] = False
+                            reasoning_fix_result["error"] = str(fix_err)
                     else:
-                        opus_fix_result["success"] = False
-                        opus_fix_result["error"] = result.error
+                        reasoning_fix_result["success"] = False
+                        reasoning_fix_result["error"] = result.error
                 else:
-                    opus_fix_result = _run_opus_error_fix(
+                    reasoning_fix_result = _run_reasoning_error_fix(
                         question=question,
-                        sql=reasoning_fix_result.get("fixed_sql", result.sql),
-                        error=reasoning_fix_result.get("error", result.error),
+                        sql=result.sql,
+                        error=result.error,
                         schema_text=schema_text,
                         rules_compressed=rules_compressed,
                         config=config,
                         engine=engine
                     )
-                    result.tokens.error_fix_opus = opus_fix_result.get("tokens", {"input": 0, "output": 0})
-                    result.llm_trace.error_fix_opus_input = opus_fix_result.get("trace_opus_input", "")
-                    result.llm_trace.error_fix_opus_output = opus_fix_result.get("trace_opus_output", "")
-                
-                if opus_fix_result.get("success"):
-                    result.sql = opus_fix_result["fixed_sql"]
-                    result.results = opus_fix_result["results"]
+                    result.tokens.error_fix_reasoning = reasoning_fix_result.get("tokens", {"input": 0, "output": 0})
+                    result.llm_trace.error_fix_reasoning_input = reasoning_fix_result.get("trace_input", "")
+                    result.llm_trace.error_fix_reasoning_output = reasoning_fix_result.get("trace_output", "")
+
+                if reasoning_fix_result.get("success"):
+                    result.sql = reasoning_fix_result["fixed_sql"]
+                    result.results = reasoning_fix_result["results"]
                     result.success = True
                     result.error = None
-                    result.error_recovery_method = "opus"
+                    result.error_recovery_method = "reasoning_llm"
                     result.sql_fixed = True
-                    result.fixes_applied.append("opus_error_fix")
-                    result.stages_completed.append("error_recovery_opus_success")
-                    print(f"[ERROR RECOVERY] ✅ Opus fixed the error")
+                    result.fixes_applied.append("reasoning_llm_error_fix")
+                    result.stages_completed.append("error_recovery_reasoning_success")
+                    print(f"[TIER 3] ✅ Reasoning LLM fixed the error")
                 else:
-                    # Both failed — build a user-friendly error message
-                    result.error_recovery_method = "none"
-                    result.error = _build_user_friendly_error(
-                        original_error=result.original_error,
-                        schema_text=schema_text
-                    )
-                    result.stages_completed.append("error_recovery_failed")
-                    print(f"[ERROR RECOVERY] ❌ Both attempts failed. Returning friendly error.")
-            
+                    # Attempt 2: Opus
+                    print(f"[TIER 3] Reasoning LLM failed. Attempt 2: Opus fixing error...")
+
+                    if has_two_pass_context:
+                        from reasoning_prompts import create_error_retry_prompt
+                        opus_retry_prompt = create_error_retry_prompt(
+                            question=question,
+                            pass2_plan=result.pass2_plan,
+                            metadata=result.column_metadata,
+                            failed_sql=reasoning_fix_result.get("fixed_sql", result.sql),
+                            error_message=reasoning_fix_result.get("error", result.error),
+                            dialect_info=config.dialect_info,
+                            use_opus=True
+                        )
+                        opus_retry_response, opus_retry_tokens = call_llm(
+                            opus_retry_prompt, config.opus_provider
+                        )
+                        result.tokens.error_fix_opus = opus_retry_tokens
+                        result.llm_trace.error_fix_opus_input = opus_retry_prompt
+                        result.llm_trace.error_fix_opus_output = opus_retry_response
+
+                        fixed_sql = extract_sql_from_response(opus_retry_response)
+                        opus_fix_result = {"fixed_sql": fixed_sql, "tokens": opus_retry_tokens}
+
+                        if fixed_sql:
+                            try:
+                                from db import run_sql
+                                fix_results = run_sql(engine, fixed_sql)
+                                opus_fix_result["success"] = True
+                                opus_fix_result["results"] = fix_results
+                            except Exception as fix_err:
+                                opus_fix_result["success"] = False
+                                opus_fix_result["error"] = str(fix_err)
+                        else:
+                            opus_fix_result["success"] = False
+                            opus_fix_result["error"] = result.error
+                    else:
+                        opus_fix_result = _run_opus_error_fix(
+                            question=question,
+                            sql=reasoning_fix_result.get("fixed_sql", result.sql),
+                            error=reasoning_fix_result.get("error", result.error),
+                            schema_text=schema_text,
+                            rules_compressed=rules_compressed,
+                            config=config,
+                            engine=engine
+                        )
+                        result.tokens.error_fix_opus = opus_fix_result.get("tokens", {"input": 0, "output": 0})
+                        result.llm_trace.error_fix_opus_input = opus_fix_result.get("trace_opus_input", "")
+                        result.llm_trace.error_fix_opus_output = opus_fix_result.get("trace_opus_output", "")
+
+                    if opus_fix_result.get("success"):
+                        result.sql = opus_fix_result["fixed_sql"]
+                        result.results = opus_fix_result["results"]
+                        result.success = True
+                        result.error = None
+                        result.error_recovery_method = "opus"
+                        result.sql_fixed = True
+                        result.fixes_applied.append("opus_error_fix")
+                        result.stages_completed.append("error_recovery_opus_success")
+                        print(f"[TIER 3] ✅ Opus fixed the error")
+                    else:
+                        result.error_recovery_method = "none"
+                        result.error = _build_user_friendly_error(
+                            original_error=result.original_error,
+                            schema_text=schema_text
+                        )
+                        result.stages_completed.append("error_recovery_failed")
+                        print(f"[TIER 3] ❌ All recovery attempts failed. Returning friendly error.")
+
             result.stage_times["error_recovery"] = int((time.time() - stage_start) * 1000)
         
         # ═══════════════════════════════════════════════════════════════════
@@ -1409,32 +1725,43 @@ def _run_reasoning_error_fix(
     from prompt_optimizer import extract_sql_from_response
     
     dialect_name = config.dialect.upper()
-    
-    # Build a focused error-fix prompt for the reasoning LLM
-    # Keep it concise — reasoning LLM is good at mechanical fixes
-    error_fix_prompt = f"""You are a SQL expert. Fix this failed {dialect_name} SQL query.
 
-QUESTION: {question}
+    # Prompt caching: put schema in system_prompt (stable) for Claude providers
+    _fix_system = _build_static_system_prompt(
+        dialect_syntax=get_dialect_syntax_rules(config.dialect),
+        schema=schema_text,
+        rules=rules_compressed,
+        extra_instructions=f"You are a SQL expert. Fix failed {dialect_name} SQL queries.",
+    ) if _is_claude_provider(config.reasoning_provider) else None
 
-FAILED SQL:
-{sql}
+    if _fix_system:
+        error_fix_prompt = (
+            f"QUESTION: {question}\n\n"
+            f"FAILED SQL:\n{sql}\n\n"
+            f"ERROR:\n{error}\n\n"
+            f"COMMON FIXES:\n"
+            f"- text/date mismatch → CAST(col AS DATE) or col::date\n"
+            f"- text/integer mismatch → CAST(col AS INTEGER)\n"
+            f"- column not found → check schema for exact name and quoting\n"
+            f"- ambiguous column → add table alias prefix\n\n"
+            f"Return ONLY the corrected SQL. No explanation."
+        )
+    else:
+        error_fix_prompt = (
+            f"You are a SQL expert. Fix this failed {dialect_name} SQL query.\n\n"
+            f"QUESTION: {question}\n\n"
+            f"FAILED SQL:\n{sql}\n\n"
+            f"ERROR:\n{error}\n\n"
+            f"SCHEMA (check column names and data types carefully):\n{schema_text}\n\n"
+            f"COMMON FIXES:\n"
+            f"- text/date mismatch → CAST(col AS DATE) or DATE 'YYYY-MM-DD' format\n"
+            f"- text/integer mismatch → CAST(col AS INTEGER)\n"
+            f"- column not found → check schema for exact column name and quoting\n"
+            f"- ambiguous column → add table alias prefix\n\n"
+            f"Return ONLY the corrected SQL. No explanation."
+        )
 
-ERROR:
-{error}
-
-SCHEMA (check column names and data types carefully):
-{schema_text}
-
-COMMON FIXES:
-- text/date mismatch → CAST("column" AS DATE) or use DATE 'YYYY-MM-DD' format
-- text/integer mismatch → CAST("column" AS INTEGER)
-- column not found → check schema for exact column name and quoting
-- ambiguous column → add table alias prefix
-- operator does not exist → check data types match the operator
-
-Return ONLY the corrected SQL. No explanation."""
-
-    response, tokens = call_llm(error_fix_prompt, config.reasoning_provider)
+    response, tokens = call_llm(error_fix_prompt, config.reasoning_provider, system_prompt=_fix_system)
     fixed_sql = extract_sql_from_response(response)
     
     if not fixed_sql or fixed_sql == sql:
@@ -1591,8 +1918,8 @@ def _run_opus_review(
         extract_columns_from_sql
     )
     
-    total_tokens = {"input": 0, "output": 0}
-    refinement_tokens = {"input": 0, "output": 0}
+    total_tokens = {"input": 0, "output": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+    refinement_tokens = {"input": 0, "output": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
     current_sql = sql
     current_results = results
 
@@ -1601,33 +1928,46 @@ def _run_opus_review(
     trace_refinement_input = ""
     trace_refinement_output = ""
 
-    use_prefill = "claude" in config.opus_provider
+    use_prefill = _is_claude_provider(config.opus_provider)
+    use_cache = _is_claude_provider(config.opus_provider)
+
+    # Build cacheable system prompt (schema + rules) for Opus review
+    _review_system = _build_static_system_prompt(
+        schema=schema_text,
+        rules=rules_compressed,
+    ) if use_cache else None
+
     review = {}
-    
+
     for attempt in range(1, config.max_retries + 1):
         if hasattr(current_results, 'head'):
             results_preview = current_results.head(10).to_string()
         else:
             results_preview = str(current_results)[:1500]
-        
+
         columns_used = extract_columns_from_sql(current_sql)
-        
+
+        # When caching, omit schema+rules from user message (already in system)
         opus_prompt = create_opus_review_prompt_optimized(
             question=question,
             sql=current_sql,
             results_preview=results_preview,
             columns_used=columns_used,
-            schema_text=schema_text,        
-            rules_compressed=rules_compressed 
+            schema_text="" if use_cache else schema_text,
+            rules_compressed="" if use_cache else rules_compressed,
         )
-        
+
         if use_prefill:
-            opus_response, opus_tokens = call_llm(opus_prompt, config.opus_provider, prefill="{")
+            opus_response, opus_tokens = call_llm(
+                opus_prompt, config.opus_provider, prefill="{", system_prompt=_review_system,
+            )
         else:
             opus_response, opus_tokens = call_llm(opus_prompt, config.opus_provider)
-        
+
         total_tokens["input"] += opus_tokens["input"]
         total_tokens["output"] += opus_tokens["output"]
+        total_tokens["cache_creation_input_tokens"] += opus_tokens.get("cache_creation_input_tokens", 0)
+        total_tokens["cache_read_input_tokens"] += opus_tokens.get("cache_read_input_tokens", 0)
 
         if attempt == 1:
             trace_opus_input = opus_prompt
@@ -1752,50 +2092,59 @@ def _run_opus_error_fix(
     from db import run_sql
     from prompt_optimizer import extract_sql_from_response
     
-    total_tokens = {"input": 0, "output": 0}
+    total_tokens = {"input": 0, "output": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
     errors_seen = [error]
     current_sql = sql
     trace_opus_input = ""
     trace_opus_output = ""
-    
+
+    # Prompt caching: schema + rules in system_prompt (stable across retry attempts)
+    _fix_opus_system = _build_static_system_prompt(
+        dialect_syntax=get_dialect_syntax_rules(config.dialect),
+        schema=schema_text,
+        rules=rules_compressed,
+        extra_instructions="You are an expert SQL debugger. Analyze the error and produce a corrected SQL.",
+    ) if _is_claude_provider(config.opus_provider) else None
+
     for attempt in range(1, config.max_retries + 1):
-        print(f"[ERROR RECOVERY] Opus attempt {attempt}/{config.max_retries}")
-        
-        error_fix_prompt = f"""You are a SQL expert. The following SQL query failed even after an initial fix attempt.
-Analyze the error carefully and provide a corrected SQL.
+        print(f"[TIER 3] Opus attempt {attempt}/{config.max_retries}")
 
-DATABASE: {config.dialect.upper()}
+        # Dynamic part: only the failed SQL + error (schema/rules already in system)
+        if _fix_opus_system:
+            error_fix_prompt = (
+                f"DATABASE: {config.dialect.upper()}\n\n"
+                f"ORIGINAL QUESTION: {question}\n\n"
+                f"FAILED SQL:\n{current_sql}\n\n"
+                f"ERROR MESSAGE:\n{errors_seen[-1]}\n\n"
+                f"ANALYSIS REQUIRED:\n"
+                f"1. Exact error type (type mismatch, missing column, syntax, etc.)\n"
+                f"2. Column/table causing the issue\n"
+                f"3. Correct data type from the schema\n"
+                f"4. Precise fix\n\n"
+                f"Common fixes:\n"
+                f"- text vs date → CAST(col AS DATE) or col::date\n"
+                f"- text vs integer → CAST(col AS INTEGER)\n\n"
+                f"Return ONLY the corrected SQL. No explanation."
+            )
+        else:
+            error_fix_prompt = (
+                f"You are a SQL expert. The following SQL query failed.\n\n"
+                f"DATABASE: {config.dialect.upper()}\n\n"
+                f"ORIGINAL QUESTION: {question}\n\n"
+                f"FAILED SQL:\n{current_sql}\n\n"
+                f"ERROR MESSAGE:\n{errors_seen[-1]}\n\n"
+                f"SCHEMA (pay close attention to data types):\n{schema_text}\n\n"
+                f"BUSINESS RULES:\n{rules_compressed}\n\n"
+                f"Return ONLY the corrected SQL. No explanation, no markdown."
+            )
 
-ORIGINAL QUESTION: {question}
-
-FAILED SQL:
-{current_sql}
-
-ERROR MESSAGE:
-{errors_seen[-1]}
-
-SCHEMA (pay close attention to data types):
-{schema_text}
-
-BUSINESS RULES:
-{rules_compressed}
-
-ANALYSIS REQUIRED:
-1. What is the exact error type? (type mismatch, missing column, syntax, etc.)
-2. Which column/table is causing the issue?
-3. What is the correct data type from the schema?
-4. What is the precise fix?
-
-Common fixes for type errors:
-- text compared to date → CAST("column" AS DATE) or TO_DATE("column", 'YYYY-MM-DD')
-- text compared to integer → CAST("column" AS INTEGER) or CAST("column" AS NUMERIC)
-- operator does not exist: text >= date → means column is TEXT, use CAST
-
-Return ONLY the corrected SQL. No explanation, no markdown."""
-
-        response, tokens = call_llm(error_fix_prompt, config.opus_provider)
+        response, tokens = call_llm(
+            error_fix_prompt, config.opus_provider, system_prompt=_fix_opus_system,
+        )
         total_tokens["input"] += tokens["input"]
         total_tokens["output"] += tokens["output"]
+        total_tokens["cache_creation_input_tokens"] += tokens.get("cache_creation_input_tokens", 0)
+        total_tokens["cache_read_input_tokens"] += tokens.get("cache_read_input_tokens", 0)
 
         if attempt == 1:
             trace_opus_input = error_fix_prompt

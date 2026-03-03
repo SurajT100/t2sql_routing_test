@@ -2285,7 +2285,7 @@ with tab3:
                 with st.expander("💰 Token Usage Breakdown", expanded=True):
                     tokens = result.tokens
                     token_data = []
-                    
+
                     if tokens.classifier["input"] + tokens.classifier["output"] > 0:
                         token_data.append({"Stage": "🏷️ Classifier", "Input": tokens.classifier["input"], "Output": tokens.classifier["output"]})
                     # Show Pass 1 / Pass 2 separately when the two-pass flow ran;
@@ -2298,11 +2298,19 @@ with tab3:
                         token_data.append({"Stage": "🧠 Reasoning", "Input": tokens.reasoning["input"], "Output": tokens.reasoning["output"]})
                     if tokens.sql_gen["input"] + tokens.sql_gen["output"] > 0:
                         token_data.append({"Stage": "⚙️ SQL Gen", "Input": tokens.sql_gen["input"], "Output": tokens.sql_gen["output"]})
+                    if tokens.tier1_fix["input"] + tokens.tier1_fix["output"] > 0:
+                        token_data.append({"Stage": "🔍 Tier 1 Static Fix", "Input": tokens.tier1_fix["input"], "Output": tokens.tier1_fix["output"]})
+                    if tokens.tier2_fix["input"] + tokens.tier2_fix["output"] > 0:
+                        token_data.append({"Stage": "⚡ Tier 2 Error Fix", "Input": tokens.tier2_fix["input"], "Output": tokens.tier2_fix["output"]})
+                    if tokens.error_fix_reasoning["input"] + tokens.error_fix_reasoning["output"] > 0:
+                        token_data.append({"Stage": "🔧 Tier 3 Reasoning Fix", "Input": tokens.error_fix_reasoning["input"], "Output": tokens.error_fix_reasoning["output"]})
+                    if tokens.error_fix_opus["input"] + tokens.error_fix_opus["output"] > 0:
+                        token_data.append({"Stage": "🔧 Tier 3 Opus Fix", "Input": tokens.error_fix_opus["input"], "Output": tokens.error_fix_opus["output"]})
                     if tokens.opus["input"] + tokens.opus["output"] > 0:
-                        token_data.append({"Stage": "🎯 Opus", "Input": tokens.opus["input"], "Output": tokens.opus["output"]})
+                        token_data.append({"Stage": "🎯 Opus Review", "Input": tokens.opus["input"], "Output": tokens.opus["output"]})
                     if tokens.chart["input"] + tokens.chart["output"] > 0:
                         token_data.append({"Stage": "📊 Chart Builder", "Input": tokens.chart["input"], "Output": tokens.chart["output"]})
-                    
+
                     # Show resolver stats (no LLM tokens — DB query time)
                     if hasattr(result, 'resolver_result') and result.resolver_result:
                         resolver_r = result.resolver_result
@@ -2310,17 +2318,32 @@ with tab3:
                             "Stage": f"🔍 Resolver ({resolver_r.queries_run} queries, {resolver_r.total_time_ms}ms)",
                             "Input": 0,
                             "Output": 0
-                        })                    
+                        })
+
                     if token_data:
                         for row in token_data:
                             row["Total"] = row["Input"] + row["Output"]
-                        
+
                         df_tokens = pd.DataFrame(token_data)
                         total_row = {"Stage": "**TOTAL**", "Input": df_tokens["Input"].sum(), "Output": df_tokens["Output"].sum(), "Total": df_tokens["Total"].sum()}
                         df_tokens = pd.concat([df_tokens, pd.DataFrame([total_row])], ignore_index=True)
                         st.dataframe(df_tokens, use_container_width=True, hide_index=True)
-                        
-                        # Savings calculation
+
+                        # Prompt cache savings
+                        cache_created = tokens.cache_creation_total()
+                        cache_read = tokens.cache_read_total()
+                        if cache_read > 0:
+                            # Cache reads are billed at ~10% of input token cost
+                            saved_tokens = int(cache_read * 0.9)
+                            st.success(
+                                f"🗄️ **Prompt cache hit:** {cache_read:,} tokens read from cache "
+                                f"(~{saved_tokens:,} tokens saved vs full input)."
+                                + (f"  |  {cache_created:,} tokens written to cache this call." if cache_created > 0 else "")
+                            )
+                        elif cache_created > 0:
+                            st.info(f"🗄️ **Prompt cache written:** {cache_created:,} tokens cached — future calls will be cheaper.")
+
+                        # Legacy savings calculation (vs fixed baseline)
                         baseline = 15000
                         actual = total_row["Total"]
                         if actual < baseline:
@@ -2719,16 +2742,30 @@ with tab3:
                     # SQL Coder (Llama/Groq)
                     "SQL Coder Input Tokens": result.tokens.sql_gen["input"],
                     "SQL Coder Output Tokens": result.tokens.sql_gen["output"],
-                    
+
+                    # Tiered Error Handling
+                    "Tier1 Fix Input Tokens": result.tokens.tier1_fix["input"],
+                    "Tier1 Fix Output Tokens": result.tokens.tier1_fix["output"],
+                    "Tier2 Fix Input Tokens": result.tokens.tier2_fix["input"],
+                    "Tier2 Fix Output Tokens": result.tokens.tier2_fix["output"],
+                    "Tier3 Reasoning Fix Input Tokens": result.tokens.error_fix_reasoning["input"],
+                    "Tier3 Reasoning Fix Output Tokens": result.tokens.error_fix_reasoning["output"],
+                    "Tier3 Opus Fix Input Tokens": result.tokens.error_fix_opus["input"],
+                    "Tier3 Opus Fix Output Tokens": result.tokens.error_fix_opus["output"],
+
                     # Opus Reviewer
                     "Opus Input Tokens": result.tokens.opus["input"],
                     "Opus Output Tokens": result.tokens.opus["output"],
                     "Opus Verdict": result.final_verdict or "Not Used",
-                    
+
                     # Refinement (if Opus found error)
                     "Refinement Input Tokens": result.tokens.refinement["input"],
                     "Refinement Output Tokens": result.tokens.refinement["output"],
-                    
+
+                    # Prompt Cache (Anthropic only)
+                    "Cache Creation Tokens": result.tokens.cache_creation_total(),
+                    "Cache Read Tokens": result.tokens.cache_read_total(),
+
                     # Total Tokens
                     "Total Input Tokens": result.tokens.classifier["input"] + result.tokens.reasoning["input"] + result.tokens.sql_gen["input"] + result.tokens.opus["input"] + result.tokens.refinement["input"],
                     "Total Output Tokens": result.tokens.classifier["output"] + result.tokens.reasoning["output"] + result.tokens.sql_gen["output"] + result.tokens.opus["output"] + result.tokens.refinement["output"],
