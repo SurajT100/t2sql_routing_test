@@ -477,34 +477,41 @@ class ContextAgent:
                 for col in columns:
                     try:
                         # Single query per column: gets data_type + samples + opus_description + user_description
-                        result = self.vector_engine.table("schema_columns").select(
-                            "column_name, data_type, sample_values, "
-                            "opus_description, user_description, friendly_name"
-                        ).eq("table_name", table_name).eq("column_name", col).execute()
-                        
-                        if result.data:
-                            row = result.data[0]
-                            sample_values = row.get("sample_values") or []
-                            
+                        from sqlalchemy import text as _text
+                        with self.vector_engine.connect() as _conn:
+                            _row = _conn.execute(
+                                _text(
+                                    "SELECT column_name, data_type, sample_values, "
+                                    "opus_description, user_description, friendly_name "
+                                    "FROM schema_columns "
+                                    "WHERE table_name = :tname AND column_name = :cname "
+                                    "LIMIT 1"
+                                ),
+                                {"tname": table_name, "cname": col}
+                            ).mappings().fetchone()
+
+                        if _row:
+                            sample_values = _row.get("sample_values") or []
+
                             if isinstance(sample_values, str):
                                 try:
                                     sample_values = json.loads(sample_values)
                                 except Exception:
                                     sample_values = []
-                            
+
                             sample_values = sample_values[:10]
-                            
+
                             # Priority: user_description > opus_description > friendly_name
                             description = (
-                                row.get("user_description") or 
-                                row.get("opus_description") or 
-                                row.get("friendly_name") or ""
+                                _row.get("user_description") or
+                                _row.get("opus_description") or
+                                _row.get("friendly_name") or ""
                             )
-                            
+
                             needs_partial = (table_name, col) in string_filter_set
-                            
+
                             metadata[table_name][col] = {
-                                "data_type": row.get("data_type", "unknown"),
+                                "data_type": _row.get("data_type", "unknown"),
                                 "sample_values": sample_values,
                                 "description": description,
                                 "needs_partial_match": needs_partial
