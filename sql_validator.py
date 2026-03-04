@@ -361,13 +361,17 @@ def _check_basic_structure(sql_upper: str, result: SQLValidationResult):
 def is_select_query(sql: str) -> bool:
     """Check if SQL is a SELECT query (safe to execute)."""
     sql_upper = sql.strip().upper()
-    
-    # Allow WITH (CTE) followed by SELECT
+
+    # Allow WITH (CTE) followed by SELECT.
+    # Use word-boundary regex so column names like "created_at" or "updated_at"
+    # don't falsely match "CREATE" / "UPDATE" via substring search.
     if sql_upper.startswith("WITH"):
-        return "SELECT" in sql_upper and not any(
-            kw in sql_upper for kw in ["INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "TRUNCATE"]
-        )
-    
+        has_select = bool(re.search(r'\bSELECT\b', sql_upper))
+        has_ddl = bool(re.search(
+            r'\b(INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE)\b\s', sql_upper
+        ))
+        return has_select and not has_ddl
+
     return sql_upper.startswith("SELECT")
 
 

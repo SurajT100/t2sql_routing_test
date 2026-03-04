@@ -17,6 +17,7 @@ Usage:
 
 from typing import Dict, Any
 import json
+import re
 
 
 # =============================================================================
@@ -172,10 +173,23 @@ def classify_query(
 
         raw_response, tokens = call_llm(prompt, llm_provider, stop_sequences=["}"])
 
-        # Ensure JSON is complete (stop_sequences strips the closing brace)
+        print(f"[CLASSIFIER] Raw LLM response ({llm_provider}): {raw_response!r}")
+
+        # Strip markdown code fences if the model wrapped the JSON
         text = raw_response.strip()
+        if text.startswith("```"):
+            text = re.sub(r'^```(?:json)?\s*', '', text)
+            text = re.sub(r'\s*```$', '', text.strip()).strip()
+
+        # stop_sequences=["}"] strips the closing brace — add it back
         if not text.endswith("}"):
             text += "}"
+
+        # If there's extra text before the JSON object, extract just the object
+        if not text.startswith("{"):
+            m = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+            if m:
+                text = m.group(0)
 
         result = json.loads(text)
         complexity = result.get("complexity", "medium").lower()
