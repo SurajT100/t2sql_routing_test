@@ -649,8 +649,16 @@ class SQLAnalyzer:
     def _make_sub_config(self):
         """
         Return a FlowConfig for sub-queries.
-        Disables query cache (each sub-query is bespoke) and Opus review
-        (we do a single Opus review on the final synthesis SQL instead).
+
+        Sub-queries must NEVER re-enter the Analyzer — that would cause infinite
+        recursion.  Enforce this with two independent guards:
+          - enable_analyzer = False  : hard block even if complexity == "analysis"
+          - enable_classification = False : skip the LLM classifier entirely;
+                process_query defaults to "medium" → analytical flow
+                (Pass 1 → Context Agent → Pass 2 → SQL Coder)
+
+        Also disables query cache (each sub-query is bespoke) and Opus review
+        (a single Opus review runs on the final synthesis SQL instead).
         """
         from flow_router import FlowConfig
         import copy
@@ -658,6 +666,9 @@ class SQLAnalyzer:
         cfg = copy.copy(self.config) if self.config else FlowConfig()
         cfg.enable_cache = False
         cfg.enable_opus = False
+        cfg.enable_analyzer = False        # prevent Analyzer re-entry
+        cfg.enable_classification = False  # skip re-classification; use medium flow
+        cfg.initial_classification = None  # clear any pre-computed result from the UI
         return cfg
 
     def _pick_next_step(
