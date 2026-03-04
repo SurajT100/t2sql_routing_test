@@ -2315,6 +2315,8 @@ with tab3:
                         token_data.append({"Stage": "🔧 Tier 3 Opus Fix", "Input": tokens.error_fix_opus["input"], "Output": tokens.error_fix_opus["output"]})
                     if tokens.opus["input"] + tokens.opus["output"] > 0:
                         token_data.append({"Stage": "🎯 Opus Review", "Input": tokens.opus["input"], "Output": tokens.opus["output"]})
+                    if tokens.refinement["input"] + tokens.refinement["output"] > 0:
+                        token_data.append({"Stage": "🔧 Refinement", "Input": tokens.refinement["input"], "Output": tokens.refinement["output"]})
                     if tokens.chart["input"] + tokens.chart["output"] > 0:
                         token_data.append({"Stage": "📊 Chart Builder", "Input": tokens.chart["input"], "Output": tokens.chart["output"]})
 
@@ -2761,8 +2763,8 @@ with tab3:
                     "Tier3 Opus Fix Output Tokens": result.tokens.error_fix_opus["output"],
 
                     # Opus Reviewer
-                    "Opus Input Tokens": result.tokens.opus["input"],
-                    "Opus Output Tokens": result.tokens.opus["output"],
+                    "Opus Review Input Tokens": result.tokens.opus["input"],
+                    "Opus Review Output Tokens": result.tokens.opus["output"],
                     "Opus Verdict": result.final_verdict or "Not Used",
 
                     # Refinement (if Opus found error)
@@ -2878,8 +2880,8 @@ with st.sidebar:
             "SQL Coder Output Tokens",
             
             # Opus Reviewer
-            "Opus Input Tokens",
-            "Opus Output Tokens",
+            "Opus Review Input Tokens",
+            "Opus Review Output Tokens",
             "Opus Verdict",
             
             # Refinement
@@ -2974,7 +2976,7 @@ with st.sidebar:
                     df_export["Classifier Input Tokens"].sum() + df_export["Classifier Output Tokens"].sum() if "Classifier Input Tokens" in df_export.columns else 0,
                     df_export["Reasoning Input Tokens"].sum() + df_export["Reasoning Output Tokens"].sum() if "Reasoning Input Tokens" in df_export.columns else 0,
                     df_export["SQL Coder Input Tokens"].sum() + df_export["SQL Coder Output Tokens"].sum() if "SQL Coder Input Tokens" in df_export.columns else 0,
-                    df_export["Opus Input Tokens"].sum() + df_export["Opus Output Tokens"].sum() if "Opus Input Tokens" in df_export.columns else 0,
+                    df_export["Opus Review Input Tokens"].sum() + df_export["Opus Review Output Tokens"].sum() if "Opus Review Input Tokens" in df_export.columns else 0,
                     df_export["Refinement Input Tokens"].sum() + df_export["Refinement Output Tokens"].sum() if "Refinement Input Tokens" in df_export.columns else 0,
                     df_export["Total Tokens"].sum() if "Total Tokens" in df_export.columns else 0,
                     "",
