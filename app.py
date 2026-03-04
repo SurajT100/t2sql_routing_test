@@ -2067,9 +2067,14 @@ with tab3:
             with col_opt1:
                 st.write("**Query Classification**")
                 enable_classification = st.checkbox(
-                    "Enable Llama Classification", 
+                    "Enable Llama Classification",
                     value=True,
-                    help="Classify queries as Easy/Medium/Hard to optimize tokens"
+                    help="Classify queries as Easy/Medium/Hard/Analysis to optimize tokens"
+                )
+                enable_analyzer = st.checkbox(
+                    "Enable Analyzer Agent",
+                    value=True,
+                    help="For Analysis-complexity queries: decompose into sub-questions, run each through the pipeline, then synthesize a final SQL answer. Disable to fall back to Hard flow."
                 )
             
             with col_opt2:
@@ -2207,6 +2212,7 @@ with tab3:
                 # Create config
                 config = FlowConfig(
                     enable_classification=enable_classification,
+                    enable_analyzer=enable_analyzer,
                     classification_provider="groq",
                     enable_rule_rag=enable_rule_rag,
                     enable_opus_descriptions=enable_opus_descriptions,

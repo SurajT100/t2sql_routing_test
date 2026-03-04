@@ -1,7 +1,7 @@
 """
 Query Classifier
 =================
-Classifies user questions as EASY, MEDIUM, or HARD using Llama via Groq.
+Classifies user questions as EASY, MEDIUM, HARD, or ANALYSIS using Llama via Groq.
 This enables tiered processing to optimize tokens and accuracy.
 
 Usage:
@@ -21,6 +21,7 @@ class QueryComplexity(Enum):
     EASY = "easy"
     MEDIUM = "medium"
     HARD = "hard"
+    ANALYSIS = "analysis"
 
 
 # =============================================================================
@@ -78,10 +79,25 @@ Examples:
 - "Revenue by product category as percentage of total"
 - "Customers who ordered more this year than last year"
 
+**ANALYSIS** - Multi-step reasoning required (cannot be answered in a single SQL query):
+• Requires two or more SEPARATE queries whose results must be combined
+• What-if / scenario simulation (e.g. "what would revenue be if we raised prices by 10%?")
+• Impact analysis that needs a baseline query then an adjustment query
+• Trend analysis where each period must be fetched independently before comparing
+• Comparative ranking where rank depends on a metric computed in a prior step
+• Any question that explicitly asks for derived metrics across multiple independent datasets
+• Multi-metric dashboards where each metric needs its own query
+Use ANALYSIS only when a single SQL query (even with CTEs) is genuinely insufficient — the answer requires running multiple queries and combining their outputs programmatically.
+Examples:
+- "What would happen to our margin if we removed the top 5 loss-making products?"
+- "Which customers improved their order frequency compared to the same period last year, and what is the revenue impact?"
+- "Show me the top 3 regions by growth rate and then drill into each region's product mix"
+- "Simulate the effect of a 15% price increase on our top-selling SKUs"
+
 USER QUESTION: {question}
 
 Respond with ONLY this JSON (no other text):
-{{"complexity": "easy|medium|hard", "reason": "brief explanation"}}"""
+{{"complexity": "easy|medium|hard|analysis", "reason": "brief explanation"}}"""
 
 
 # =============================================================================
@@ -132,6 +148,22 @@ HARD_INDICATORS = [
     "more than average", "above average", "below average",
 ]
 
+ANALYSIS_INDICATORS = [
+    # What-if / simulation
+    "what if", "what would happen", "simulate", "simulation",
+    "if we", "if prices", "if we raised", "if we removed",
+    "scenario", "hypothetical",
+    # Impact analysis
+    "impact of", "effect of", "impact on", "effect on",
+    "revenue impact", "margin impact",
+    # Multi-step reasoning
+    "and then", "followed by", "based on those", "using those results",
+    "drill into", "drill down",
+    # Improvement / change detection across independent datasets
+    "improved their", "who improved", "who changed",
+    "compared to same period", "compared to last year",
+]
+
 
 def _quick_classify(question: str) -> tuple:
     """
@@ -139,27 +171,34 @@ def _quick_classify(question: str) -> tuple:
     Returns (suggested_complexity, confidence)
     """
     q_lower = question.lower()
-    
+
+    analysis_score = sum(1 for ind in ANALYSIS_INDICATORS if ind in q_lower)
     hard_score = sum(1 for ind in HARD_INDICATORS if ind in q_lower)
     medium_score = sum(1 for ind in MEDIUM_INDICATORS if ind in q_lower)
     easy_score = sum(1 for ind in EASY_INDICATORS if ind in q_lower)
-    
+
+    # Strong analysis signal — multiple indicators or a single very strong one
+    if analysis_score >= 2:
+        return QueryComplexity.ANALYSIS, 0.85
+    if analysis_score >= 1 and hard_score >= 1:
+        return QueryComplexity.ANALYSIS, 0.7
+
     # If multiple hard indicators, definitely hard
     if hard_score >= 2:
         return QueryComplexity.HARD, 0.9
-    
+
     # If one hard indicator and some medium, likely hard
     if hard_score >= 1 and medium_score >= 1:
         return QueryComplexity.HARD, 0.7
-    
+
     # If medium indicators present
     if medium_score >= 1:
         return QueryComplexity.MEDIUM, 0.8
-    
+
     # If easy indicators or very short/simple question
     if easy_score >= 1 or len(question.split()) <= 5:
         return QueryComplexity.EASY, 0.6
-    
+
     # Default to medium with low confidence (will use LLM)
     return QueryComplexity.MEDIUM, 0.3
 
@@ -229,7 +268,7 @@ def classify_query(
         result = json.loads(response)
         
         complexity = result.get("complexity", "medium").lower()
-        if complexity not in ["easy", "medium", "hard"]:
+        if complexity not in ["easy", "medium", "hard", "analysis"]:
             complexity = "medium"
         
         return {
@@ -333,9 +372,20 @@ def get_flow_config(complexity: str) -> Dict[str, Any]:
             "max_retries": 3,
             "expected_tokens": 8000,
             "description": "Full flow with Opus validation"
+        },
+        "analysis": {
+            "use_reasoning_llm": True,
+            "use_rule_rag": True,
+            "use_schema_rag": True,
+            "schema_rag_top_k": 20,
+            "rule_rag_top_k": 8,
+            "enable_opus": True,
+            "max_retries": 3,
+            "expected_tokens": 20000,
+            "description": "Multi-step Analyzer Agent with sub-query decomposition"
         }
     }
-    
+
     return configs.get(complexity, configs["medium"])
 
 

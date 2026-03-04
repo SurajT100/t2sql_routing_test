@@ -308,6 +308,9 @@ class FlowConfig:
     validate_sql: bool = True
     auto_fix_sql: bool = True
     
+    # Analyzer Agent (multi-step decomposition for analysis-complexity queries)
+    enable_analyzer: bool = True
+
     # Dialect
     dialect: str = "postgresql"
     dialect_info: Dict = field(default_factory=lambda: {
@@ -847,8 +850,13 @@ def process_query(
 
         # Normalise legacy complexity values
         complexity_norm = result.complexity
-        legacy_map = {"easy": "simple", "medium": "analytical", "hard": "comparative"}
+        legacy_map = {"easy": "simple", "medium": "analytical", "hard": "comparative", "analysis": "analysis"}
         complexity_norm = legacy_map.get(complexity_norm, complexity_norm)
+
+        # If analysis complexity but Analyzer Agent is disabled, fall back to hard flow
+        if complexity_norm == "analysis" and not config.enable_analyzer:
+            print(f"[STAGE3] Analyzer Agent disabled — routing analysis query as comparative")
+            complexity_norm = "comparative"
 
         if complexity_norm == "simple":
             # ── SIMPLE: SQL Coder only (schema + rules already fetched in Stage 2) ──
@@ -1139,6 +1147,38 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
 
             # Legacy reasoning token compat
             result.tokens.reasoning = pass1_tokens
+
+        elif complexity_norm == "analysis":
+            # ── ANALYSIS: multi-step Analyzer Agent ──────────────────────────
+            # Decomposes the question into sub-queries, executes each through
+            # the existing pipeline, and synthesizes a final answer.
+            # If enable_analyzer is False the normalization block above already
+            # remapped complexity_norm to "comparative", so this branch only
+            # runs when the Analyzer Agent is enabled.
+            result.flow_path = "ANALYSIS: Analyzer Agent → Sub-query decomposition → Synthesis → Opus Review"
+            print(f"[STAGE3] ANALYSIS flow via SQLAnalyzer")
+            from sql_analyzer import SQLAnalyzer
+            analyzer = SQLAnalyzer(
+                engine=engine,
+                vector_engine=vector_engine,
+                selected_tables=selected_tables,
+                config=config,
+                schema_text=schema_text,
+                bare_schema=bare_schema,
+                rules_compressed=rules_compressed,
+                dialect_info=config.dialect_info,
+            )
+            analyzer_result = analyzer.analyze(question)
+            result.sql = analyzer_result.synthesis_sql
+            result.results = analyzer_result.final_results
+            result.success = bool(analyzer_result.synthesis_sql and analyzer_result.final_results is not None)
+            result.opus_verdict = analyzer_result.opus_verdict
+            # Accumulate sub-query tokens into reasoning bucket for token display
+            sq_tok = analyzer_result.total_tokens.get("sub_queries", {})
+            result.tokens.reasoning["input"] += sq_tok.get("input", 0)
+            result.tokens.reasoning["output"] += sq_tok.get("output", 0)
+            # Store analyzer trace for debugging
+            result.llm_trace.reasoning = str(analyzer_result.trace)
 
         else:
             # Fallback — treat as analytical
