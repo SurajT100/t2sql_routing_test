@@ -53,6 +53,7 @@ class EntityResolution:
     # Recommended strategy
     strategy: str = "exact"            # "exact", "ilike", "in_list", "no_match"
     filter_condition: str = ""         # Ready-to-use condition string
+    condition_is_full_expression: bool = False  # True = includes column ref (use verbatim); False = right-hand side only (prefix with column)
     confidence: str = "high"           # "high", "medium", "low"
     
     # Diagnostics
@@ -112,6 +113,8 @@ def resolve_entities(
     start_time = time.time()
     
     for sf in string_filter_columns:
+        if not isinstance(sf, dict):
+            continue
         table_name = sf.get("table", "")
         column_name = sf.get("column", "")
         user_value = sf.get("user_value", "").strip()
@@ -198,60 +201,65 @@ def resolve_entities(
                 print(f"[RESOLVER] ✅ CI multi match: {user_value} → {ci_matches}")
                 continue
             
-            # ── Step 3: Try ILIKE / partial match ──
+            # ── Step 3: Case-insensitive partial match against live DB ──
+            # Fetch at most 6 rows.  If we get ≤5, those are the real stored
+            # values → use them as deterministic exact conditions.
+            # If we get 6, that means >5 distinct matches → too ambiguous,
+            # fall through to NO_MATCH just like zero matches.
             partial_query = _build_partial_query(
                 table_name, column_name, user_value, dialect, quote_char,
-                max_results=max_results
+                max_results=6
             )
-            
+
             partial_matches = _run_resolve_query(user_engine, partial_query)
             result.queries_run += 1
-            
-            if partial_matches:
+
+            if 1 <= len(partial_matches) <= 5:
+                # Deterministic resolution: use actual stored values, not patterns
                 resolution.partial_matches = partial_matches
                 resolution.match_count = len(partial_matches)
-                
+
                 if len(partial_matches) == 1:
-                    # Single partial match — use exact value
+                    # Single match — use exact value
                     resolution.strategy = "exact"
                     resolution.filter_condition = f"= '{_escape_sql(partial_matches[0])}'"
                     resolution.confidence = "high"
-                    print(f"[RESOLVER] ✅ Single partial: {user_value} → {partial_matches[0]}")
-                    
-                elif len(partial_matches) <= 5:
-                    # Small set — use IN list
+                    print(f"[RESOLVER] ✅ Partial→exact: {user_value} → {partial_matches[0]}")
+                else:
+                    # 2-5 matches — use IN list with real stored values
                     resolution.strategy = "in_list"
                     escaped = [f"'{_escape_sql(v)}'" for v in partial_matches]
                     resolution.filter_condition = f"IN ({', '.join(escaped)})"
                     resolution.confidence = "high"
-                    print(f"[RESOLVER] ✅ IN list: {user_value} → {partial_matches}")
-                    
-                else:
-                    # Many matches — use ILIKE for broader matching
-                    resolution.strategy = "ilike"
-                    resolution.filter_condition = _build_ilike_condition(
-                        user_value, dialect
-                    )
-                    resolution.confidence = "medium"
-                    resolution.warning = (
-                        f"Found {len(partial_matches)} partial matches. "
-                        f"Using ILIKE. First 5: {partial_matches[:5]}"
-                    )
-                    print(f"[RESOLVER] ⚠️ ILIKE ({len(partial_matches)} matches): {user_value}")
+                    print(f"[RESOLVER] ✅ Partial→IN list: {user_value} → {partial_matches}")
+
             else:
-                # ── Step 4: No matches at all ──
+                # ── Step 4: No match OR too many matches (>5 = ambiguous) ──
+                # Use a dialect-appropriate fallback pattern, clearly labeled.
+                if len(partial_matches) > 5:
+                    resolution.match_count = len(partial_matches)
+                    resolution.warning = (
+                        f"More than 5 partial matches for '{user_value}' in "
+                        f"{table_name}.{column_name} — too ambiguous to resolve. "
+                        f"Falling back to pattern match; narrow your search term."
+                    )
+                    print(f"[RESOLVER] ⚠️ Too many matches (>5): {user_value} in {table_name}.{column_name}")
+                else:
+                    resolution.match_count = 0
+                    resolution.warning = (
+                        f"No matches found for '{user_value}' in {table_name}.{column_name}. "
+                        f"Falling back to pattern match — results may be empty."
+                    )
+                    print(f"[RESOLVER] ❌ No match: {user_value} in {table_name}.{column_name}")
+
                 resolution.strategy = "no_match"
-                resolution.match_count = 0
                 resolution.confidence = "low"
-                resolution.filter_condition = _build_ilike_condition(
-                    user_value, dialect
+                fallback_cond, is_full = _build_ilike_condition(
+                    user_value, dialect, column_name, quote_char
                 )
-                resolution.warning = (
-                    f"No matches found for '{user_value}' in {table_name}.{column_name}. "
-                    f"Using ILIKE as fallback — results may be empty."
-                )
+                resolution.filter_condition = fallback_cond
+                resolution.condition_is_full_expression = is_full
                 result.all_resolved = False
-                print(f"[RESOLVER] ❌ No match: {user_value} in {table_name}.{column_name}")
             
             resolution.query_time_ms = int((time.time() - query_start) * 1000)
             resolution.query_used = partial_query
@@ -259,10 +267,14 @@ def resolve_entities(
             
         except Exception as e:
             print(f"[RESOLVER] Error resolving {user_value} in {table_name}.{column_name}: {e}")
-            resolution.strategy = "ilike"
-            resolution.filter_condition = _build_ilike_condition(user_value, dialect)
+            fallback_cond, is_full = _build_ilike_condition(
+                user_value, dialect, column_name, quote_char
+            )
+            resolution.strategy = "no_match"
+            resolution.filter_condition = fallback_cond
+            resolution.condition_is_full_expression = is_full
             resolution.confidence = "low"
-            resolution.warning = f"Resolution failed: {str(e)[:100]}. Using ILIKE fallback."
+            resolution.warning = f"Resolution failed: {str(e)[:100]}. Using pattern-match fallback."
             resolution.query_time_ms = int((time.time() - query_start) * 1000)
             result.resolutions.append(resolution)
             result.all_resolved = False
@@ -378,12 +390,40 @@ def _build_partial_query(
         )
 
 
-def _build_ilike_condition(value: str, dialect: str) -> str:
-    """Build the ILIKE/LIKE condition string for use in the final SQL."""
-    if dialect == "postgresql":
-        return f"ILIKE '%{_escape_sql(value)}%'"
-    else:
-        return f"LIKE '%{_escape_sql(value.lower())}%'"
+def _build_ilike_condition(
+    value: str,
+    dialect: str,
+    column: str = None,
+    quote_char: str = '"',
+) -> Tuple[str, bool]:
+    """
+    Build the dialect-appropriate fallback condition for NO_MATCH cases.
+
+    Returns:
+        (condition_string, is_full_expression)
+
+        is_full_expression=False  PostgreSQL/Snowflake:
+            condition = "ILIKE '%value%'" — caller prefixes with the column name.
+        is_full_expression=True   MySQL / SQL Server / BigQuery:
+            condition = "LOWER(\\"col\\") LIKE LOWER('%value%')" — use verbatim in
+            WHERE; the column reference is already embedded.
+    """
+    escaped = _escape_sql(value)
+
+    if dialect in ("postgresql", "snowflake"):
+        # Native case-insensitive LIKE — no column reference needed here
+        return f"ILIKE '%{escaped}%'", False
+
+    # MySQL, SQL Server, BigQuery, Oracle, etc.
+    # LOWER(col) LIKE LOWER('%val%') is safe across all collations / case settings.
+    if column:
+        q = quote_char
+        qr = "]" if q == "[" else q
+        col_ref = f"{q}{column}{qr}"
+        return f"LOWER({col_ref}) LIKE LOWER('%{escaped}%')", True
+
+    # No column name available (shouldn't happen in normal flow)
+    return f"LIKE LOWER('%{_escape_sql(value.lower())}%')", False
 
 
 # =============================================================================
@@ -441,8 +481,16 @@ def format_resolutions_for_prompt(resolver_result: ResolverResult) -> str:
         lines.append(f"  {action}: {res.table}.{res.column}")
         lines.append(f"    User typed: \"{res.user_value}\"")
         lines.append(f"    Strategy: {res.strategy.upper()} (confidence: {res.confidence})")
-        lines.append(f"    → Use condition: {res.filter_condition}")
-        
+        # condition_is_full_expression=True  → the condition includes the column
+        # reference (e.g. LOWER("col") LIKE LOWER('%val%')); use it verbatim in
+        # the WHERE clause.
+        # condition_is_full_expression=False → right-hand side only (e.g.
+        # ILIKE '%val%' or = 'Val'); prefix with the quoted column name.
+        if res.condition_is_full_expression:
+            lines.append(f"    → Full expression (use verbatim in WHERE — do NOT prefix with column): {res.filter_condition}")
+        else:
+            lines.append(f"    → Use condition: {res.filter_condition}")
+
         if res.exact_match:
             lines.append(f"    Exact value in DB: \"{res.exact_match}\"")
         elif res.partial_matches:
@@ -524,8 +572,15 @@ if __name__ == "__main__":
     print("Resolution flow per entity:")
     print("  Step 1: Exact match (TRIM + =)")
     print("  Step 2: Case-insensitive exact (LOWER + TRIM + =)")
-    print("  Step 3: Partial match (ILIKE / LOWER+LIKE)")
-    print("  Step 4: No match → ILIKE fallback + warning")
+    print("  Step 3: Case-insensitive partial (LOWER+LIKE '%val%', limit 6)")
+    print("          1-5 matches → deterministic exact / IN list (real stored values)")
+    print("          >5 matches  → NO_MATCH (too ambiguous)")
+    print("          0 matches   → NO_MATCH")
+    print("  Step 4: NO_MATCH → dialect-appropriate pattern fallback + warning")
     print()
-    print("Strategies: exact | in_list | ilike | no_match")
+    print("Strategies: exact | in_list | no_match")
+    print()
+    print("Fallback dialect patterns:")
+    print("  PostgreSQL / Snowflake : ILIKE '%value%'")
+    print("  MySQL / MSSQL / BigQuery: LOWER(\"col\") LIKE LOWER('%value%')")
     print("=" * 70)

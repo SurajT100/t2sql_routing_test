@@ -116,6 +116,33 @@ CREATE TABLE IF NOT EXISTS schema_objects (
 );
 
 -- ============================================================================
+-- TABLE: rule_column_dependencies
+-- Deterministic map of which columns each rule mandates be included.
+-- Populated by rule_dependency_extractor.py whenever rules are saved.
+-- Queried by context_agent.py to inject mandatory columns even when the
+-- LLM omits them from Pass 1 column identification.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS rule_column_dependencies (
+    id              SERIAL PRIMARY KEY,
+    table_name      TEXT NOT NULL,       -- Table the column belongs to
+    column_name     TEXT NOT NULL,       -- Column that must be included
+    rule_name       TEXT NOT NULL,       -- Business rule that requires this column
+    reason          TEXT,                -- Why this column is required
+    dependency_type TEXT DEFAULT 'filter',  -- 'filter', 'metric', 'date', 'join'
+    auto_apply      BOOLEAN DEFAULT TRUE,   -- Whether to auto-inject into context
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+
+    UNIQUE(table_name, column_name, rule_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rule_col_deps_table
+ON rule_column_dependencies(table_name);
+
+CREATE INDEX IF NOT EXISTS idx_rule_col_deps_auto_apply
+ON rule_column_dependencies(auto_apply) WHERE auto_apply = TRUE;
+
+-- ============================================================================
 -- INDEXES for performance
 -- ============================================================================
 

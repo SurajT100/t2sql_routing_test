@@ -148,6 +148,8 @@ def fetch_column_metadata(
     string_filter_set = set()
     if string_filter_columns:
         for sf in string_filter_columns:
+            if not isinstance(sf, dict):
+                continue
             string_filter_set.add((sf.get("table", ""), sf.get("column", "")))
 
     try:
@@ -502,6 +504,11 @@ def parse_pass1_output(response: str) -> Dict:
     """
     Safely parse Pass 1 JSON output.
     Returns empty dict on failure.
+
+    Also normalises string_filter_columns: if the model returned a flat list of
+    column-name strings (e.g. ["U_Ordertype"]) instead of the expected list of
+    dicts, each string is converted to a minimal dict so downstream .get() calls
+    never see a string.
     """
     try:
         cleaned = response.strip()
@@ -509,7 +516,7 @@ def parse_pass1_output(response: str) -> Dict:
             import re
             cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
             cleaned = re.sub(r'\s*```$', '', cleaned)
-        return json.loads(cleaned)
+        parsed = json.loads(cleaned)
     except Exception as e:
         print(f"[PASS1 PARSE] Failed: {e}")
         return {
@@ -518,6 +525,23 @@ def parse_pass1_output(response: str) -> Dict:
             "string_filter_columns": [],
             "joins_needed": False
         }
+
+    # Normalise string_filter_columns: model sometimes returns bare strings
+    raw_sfc = parsed.get("string_filter_columns") or []
+    normalised = []
+    for item in raw_sfc:
+        if isinstance(item, dict):
+            normalised.append(item)
+        elif isinstance(item, str) and item.strip():
+            print(f"[PASS1 PARSE] string_filter_columns: normalising bare string {item!r} → dict")
+            normalised.append({
+                "table": "",
+                "column": item.strip(),
+                "user_value": "",
+                "filter_type": "include",
+            })
+    parsed["string_filter_columns"] = normalised
+    return parsed
 
 
 def parse_pass2_output(response: str) -> Dict:

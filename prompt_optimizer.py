@@ -37,115 +37,160 @@ def safe_json_dumps(obj, **kwargs) -> str:
 
 def compress_rules_for_llm(rules: List[Dict]) -> str:
     """
-    Convert verbose business rules to compact format.
-    
-    BEFORE (80 tokens per rule):
-    ─────────────────────────────
-    Rule: Revenue Calculation
-    Description: Revenue is calculated by summing the Amount column 
-    from the Orders table. Important: You must exclude all records where 
-    Status equals 'Cancelled' as these are not completed orders.
-    
-    AFTER (20 tokens per rule):
-    ────────────────────────────
-    {"type": "metric", "name": "Revenue", "formula": "SUM(Amount)", "filter": "Status <> 'Cancelled'"}
-    
-    Args:
-        rules: List of rule dictionaries from RAG
-    
-    Returns:
-        Compact JSON string of rules
+    Quality-first rule compression.
+
+    Goal: reduce token size while preserving business logic fidelity.
+    We keep critical semantics (formula/sql_pattern/conditions/filters/mappings)
+    and only trim verbose narrative text.
     """
     compressed = []
-    
+
     for rule in rules:
         rule_type = rule.get("rule_type", "other")
         rule_name = rule.get("rule_name", "Unknown")
+        rule_desc = rule.get("rule_description", "")
         rule_data = rule.get("rule_data", {})
-        
-        # Parse rule_data if it's a string
+
         if isinstance(rule_data, str):
             try:
                 rule_data = json.loads(rule_data)
-            except:
+            except Exception:
                 rule_data = {}
-        
-        # ALL rules get name and type for display
-        compact_rule = {"type": rule_type, "name": rule_name}
-        
+
+        compact_rule = {
+            "type": rule_type,
+            "name": rule_name,
+        }
+
+        # Preserve lightweight metadata that helps ranking/applicability
+        if rule.get("priority") is not None:
+            compact_rule["priority"] = rule.get("priority")
+        if rule.get("is_mandatory") is not None:
+            compact_rule["mandatory"] = bool(rule.get("is_mandatory"))
+        if rule.get("keywords"):
+            compact_rule["keywords"] = rule.get("keywords")[:12]
+        if rule.get("tables"):
+            compact_rule["tables"] = rule.get("tables")[:8]
+
         if rule_type == "metric":
-            compact_rule.update({
-                "formula": rule_data.get("formula", ""),
-            })
-            if rule_data.get("condition"):
-                compact_rule["filter"] = rule_data["condition"]
-            if rule_data.get("note"):
-                compact_rule["note"] = rule_data["note"][:80]
-        
-        elif rule_type == "join":
-            compact_rule.update({
-                "tables": rule_data.get("tables", []),
-                "on": rule_data.get("join_condition", ""),
-            })
-            if rule_data.get("join_type"):
-                compact_rule["join_type"] = rule_data["join_type"]
-        
-        elif rule_type == "filter":
-            compact_rule.update({
-                "apply": rule_data.get("sql_pattern", ""),
-            })
+            # Keep core metric semantics intact
+            for key, out_key in [
+                ("formula", "formula"),
+                ("aggregation", "aggregation"),
+                ("table", "table"),
+                ("column", "column"),
+                ("transform", "transform"),
+                ("display_unit", "unit"),
+                ("condition", "filter"),
+            ]:
+                val = rule_data.get(key)
+                if val not in (None, "", [], {}):
+                    compact_rule[out_key] = val
+
+            # Preserve mandatory filters/business-term aliases (high-value for accuracy)
+            if rule_data.get("mandatory_filters"):
+                compact_rule["mandatory_filters"] = rule_data["mandatory_filters"]
+            if rule_data.get("user_terms"):
+                compact_rule["user_terms"] = rule_data["user_terms"][:12]
             if rule_data.get("description"):
-                compact_rule["desc"] = rule_data["description"][:60]
-        
-        elif rule_type == "mapping" or rule_type == "value_mapping":
-            compact_rule.update({
-                "maps": rule_data.get("mappings", rule_data.get("values", {})),
-            })
-        
-        elif rule_type == "dialect" or rule_type == "default":
-            # For dialect rules: only keep essential syntax info, strip everything else
+                compact_rule["desc"] = str(rule_data["description"])[:220]
+            elif rule_desc:
+                compact_rule["desc"] = str(rule_desc)[:220]
+
+        elif rule_type == "join":
+            # Join condition must remain exact
+            compact_rule["on"] = rule_data.get("join_condition", "")
+            if rule_data.get("tables"):
+                compact_rule["tables"] = rule_data.get("tables", [])[:8]
+            if rule_data.get("join_type"):
+                compact_rule["join_type"] = rule_data.get("join_type")
+            if rule_data.get("description"):
+                compact_rule["desc"] = str(rule_data["description"])[:180]
+            elif rule_desc:
+                compact_rule["desc"] = str(rule_desc)[:180]
+
+        elif rule_type == "filter":
+            # Preserve full filter logic; this is accuracy-critical
+            if rule_data.get("sql_pattern"):
+                compact_rule["apply"] = rule_data.get("sql_pattern")
+            for key in ["table", "column", "operator", "values", "filter_name", "user_terms"]:
+                val = rule_data.get(key)
+                if val not in (None, "", [], {}):
+                    compact_rule[key] = val
+            if rule_data.get("description"):
+                compact_rule["desc"] = str(rule_data["description"])[:180]
+            elif rule_desc:
+                compact_rule["desc"] = str(rule_desc)[:180]
+
+        elif rule_type in ("mapping", "value_mapping", "term_alias"):
+            # Mapping structure is usually compact and highly informative
+            mappings = rule_data.get("mappings", rule_data.get("values", {}))
+            if mappings:
+                compact_rule["maps"] = mappings
+            for key in ["source", "target", "table", "column", "description_type", "description", "user_terms"]:
+                val = rule_data.get(key)
+                if val not in (None, "", [], {}):
+                    compact_rule[key] = val
+            if rule_desc and "description" not in compact_rule:
+                compact_rule["desc"] = str(rule_desc)[:200]
+
+        elif rule_type in ("dialect", "default"):
             if rule_type == "dialect":
+                # Keep dialect directives exact and complete
                 compact_rule = {
                     "type": "dialect",
+                    "name": rule_name,
                     "db": rule_data.get("dialect", ""),
                     "quote": rule_data.get("quote_char", '"'),
-                    "str_quote": rule_data.get("string_quote", "'")
+                    "str_quote": rule_data.get("string_quote", "'"),
+                    "schema_hint": rule_data.get("schema_qualification", ""),
+                    "date_functions": rule_data.get("date_functions", {}),
+                    "limit_syntax": rule_data.get("limit_syntax", ""),
                 }
             else:
-                # default rules: keep sql_pattern and description (business logic critical)
-                if rule_data.get("sql_pattern"):
-                    compact_rule["apply"] = rule_data["sql_pattern"]
+                # Default/critical business rules should retain full logic
+                for key, out_key in [
+                    ("sql_pattern", "apply"),
+                    ("condition", "condition"),
+                    ("auto_apply", "auto_apply"),
+                    ("rule_type", "subtype"),
+                    ("applies_to_queries", "applies_to_queries"),
+                ]:
+                    val = rule_data.get(key)
+                    if val not in (None, "", [], {}):
+                        compact_rule[out_key] = val
                 if rule_data.get("description"):
-                    compact_rule["desc"] = rule_data["description"][:100]
-                if rule_data.get("condition"):
-                    compact_rule["filter"] = rule_data["condition"]
-        
-        elif rule_type == "example" or rule_type == "query_example":
+                    compact_rule["desc"] = str(rule_data["description"])[:260]
+                elif rule_desc:
+                    compact_rule["desc"] = str(rule_desc)[:260]
+
+        elif rule_type in ("example", "query_example"):
+            # Keep concise examples (still useful but token-capped)
             compact_rule.update({
-                "q": rule_data.get("question", rule.get("rule_name", ""))[:100],
-                "sql": rule_data.get("sql", ""),
+                "q": rule_data.get("question", rule_name)[:160],
+                "sql": rule_data.get("sql", "")[:500],
             })
-        
-        elif rule_type == "column" or rule_type == "table_column":
+
+        elif rule_type in ("column", "table_column"):
             compact_rule.update({
-                "col": rule_data.get("column_name", rule.get("rule_name", "")),
-                "desc": rule_data.get("description", rule.get("rule_description", ""))[:100],
+                "col": rule_data.get("column_name", rule_name),
+                "table": rule_data.get("table_name", rule_data.get("table", "")),
+                "desc": rule_data.get("description", rule_desc)[:220],
             })
             if rule_data.get("business_terms"):
-                compact_rule["terms"] = rule_data["business_terms"][:5]
-        
+                compact_rule["terms"] = rule_data["business_terms"][:12]
+
         else:
-            # Generic compression for unknown types
-            compact_rule.update({
-                "desc": rule.get("rule_description", "")[:100],
-            })
-        
-        # Remove empty values
-        compact_rule = {k: v for k, v in compact_rule.items() if v}
-        
-        if len(compact_rule) > 1:  # Has more than just 'type'
+            # Generic safe fallback
+            if rule_data:
+                compact_rule["data"] = rule_data
+            if rule_desc:
+                compact_rule["desc"] = str(rule_desc)[:200]
+
+        compact_rule = {k: v for k, v in compact_rule.items() if v not in (None, "", [], {})}
+        if len(compact_rule) > 1:
             compressed.append(compact_rule)
-    
+
     return safe_json_dumps(compressed, separators=(',', ':'))
 
 
@@ -609,16 +654,44 @@ not just plausible. Be critical. Wrong column = wrong answer even if the query r
 ## RESULTS PREVIEW
 {results_preview}
 
+## INTENT VERIFICATION — Answer these THREE questions first:
+
+**Question 1 — WHAT is the user actually asking for?**
+Restate the user's question as a precise analytical requirement.
+What computation, comparison, or insight does the user expect?
+What would a correct result set look like — what columns, what relationships between rows,
+what would make the user say 'yes this answers my question'?
+
+**Question 2 — DOES this SQL produce that?**
+Trace the SQL logic step by step. What does each CTE/subquery compute?
+What does the final SELECT actually return?
+Describe the result set this SQL would produce in plain English.
+Would a business user looking at these results get the answer, or would they say
+'this isn't what I asked for'?
+
+**Question 3 — Is there a GAP between Question 1 and Question 2?**
+- If the SQL produces exactly what the user asked for → intent_match = PASS
+- If the SQL produces something related but simpler or different → intent_match = FAIL.
+  Note: 'User asked for [X]. SQL produces [Y]. Missing: [specific gap].'
+- If the SQL produces the right thing but with a logical flaw in how it computes it → intent_match = FAIL.
+  Note the specific flaw.
+
+---
+
 ## AUDIT CHECKLIST — verify each point against schema and rules above:
+
+0. INTENT MATCH ← MOST IMPORTANT CHECK
+   Answer Question 3 above.
+   If intent does not match, mark INCORRECT immediately — nothing else matters.
 
 1. COLUMN VERIFICATION
    - Do all column names exist exactly in the schema? (check spelling, casing, quoting)
-   - Is the correct column used for each metric? 
+   - Is the correct column used for each metric?
      Example: if rules say "sales = SUM(Margin)" but SQL uses SUM(Revenue), that is INCORRECT
    - Are data types compatible with the operations applied?
      Example: comparing a TEXT column to a DATE using >= will fail or give wrong results
 
-2. FILTER VERIFICATION  
+2. FILTER VERIFICATION
    - Are all mandatory filters from business rules present?
      Example: if a rule says "always exclude Rebate" but WHERE clause is missing this, it is INCORRECT
    - Are filter values exactly correct? (case-sensitive string matching matters)
@@ -638,12 +711,14 @@ not just plausible. Be critical. Wrong column = wrong answer even if the query r
    - Are there unexpected NULLs, zeros, or extreme values?
 
 ## VERDICT CRITERIA
-- CORRECT: All 5 checks pass. Column names exact, filters complete, aggregations right.
-- INCORRECT: Any check fails. Specify exactly which check and what is wrong.
-- UNCERTAIN: Results look plausible but you cannot verify without data samples.
+- CORRECT: Intent matches AND all other checks pass.
+- INCORRECT: Intent does NOT match → always INCORRECT regardless of other checks.
+  OR: Intent matches but another check fails.
+  In either case, state: 'User asked for [X]. SQL produces [Y]. Missing/wrong: [gap].'
+- UNCERTAIN: Intent plausibly matches but you cannot fully verify without data samples.
 
 ## OUTPUT (JSON only, no markdown)
-{{"verdict": "CORRECT|INCORRECT|UNCERTAIN", "confidence": 0.0-1.0, "checks": {{"columns": "pass|fail|unknown", "filters": "pass|fail|unknown", "aggregations": "pass|fail|unknown", "joins": "pass|fail|unknown|na", "results": "pass|fail|unknown"}}, "issues": ["specific problem if any"], "reasoning": "brief explanation citing specific column names and rule names"}}"""
+{{"verdict": "CORRECT|INCORRECT|UNCERTAIN", "confidence": 0.0-1.0, "checks": {{"intent_match": "pass|fail|unknown", "columns": "pass|fail|unknown", "filters": "pass|fail|unknown", "aggregations": "pass|fail|unknown", "joins": "pass|fail|unknown|na", "results": "pass|fail|unknown"}}, "issues": ["specific problem if any — lead with intent gap if present"], "reasoning": "Start with intent verification result (Q1→Q2→Q3), then column/filter details. If intent fails, stop here."}}"""
     
     return prompt
 
@@ -674,7 +749,7 @@ def create_refinement_prompt(
     issues_text = "\n".join(f"• {issue}" for issue in issues) if issues else "• Unknown issues"
     failed_checks_text = ", ".join(failed_checks) if failed_checks else "unspecified"
     
-    return f"""Fix a SQL query. The auditor found specific errors — fix ONLY those errors.
+    return f"""Fix a SQL query rejected by the auditor.
 
 ## WHAT FAILED
 Failed checks: {failed_checks_text}
@@ -687,28 +762,29 @@ Failed checks: {failed_checks_text}
 
 {f"## SUGGESTED FIX{chr(10)}{fix_suggestion}" if fix_suggestion else ""}
 
-## BUSINESS RULES (apply correctly — the auditor verified these were applied wrong)
+## BUSINESS RULES (must be applied correctly)
 {rules}
 
-## SCHEMA (use exact column names and data types from here)
+## SCHEMA (use exact column names and compatible data types)
 {schema}
 
 ## ORIGINAL QUESTION
 {question}
 
-## ORIGINAL SQL (fix only the failed checks, do not change passing parts)
+## REJECTED SQL
 ```sql
 {previous_sql}
 ```
 
 ## YOUR TASK
-1. Fix each failed check precisely
-2. Do NOT change anything the auditor did not flag
-3. Verify your fix uses the exact column name from the schema
-4. Verify your fix applies the business rule correctly (not just references it)
+1. Produce SQL that ANSWERS the original question end-to-end.
+2. Resolve every failed check above; do not keep logic that makes the query incomplete.
+3. Add missing joins/metrics/filters when required by question or business rules.
+4. If a type mismatch is possible (e.g. DATE/TEXT), cast safely.
+5. Return a materially corrected query (not a cosmetic rewrite).
 
 ## OUTPUT (JSON only)
-{{"analysis": "what you changed and why, referencing specific column names and rules", "sql": "corrected SQL query"}}"""
+{{"analysis": "what you changed and why, referencing specific columns/rules", "sql": "corrected SQL query"}}"""
 
 
 # =============================================================================

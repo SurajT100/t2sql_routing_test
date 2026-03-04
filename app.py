@@ -1007,10 +1007,21 @@ with tab2:
                                         }
                                     )
                                     conn.commit()
-                                
+
+                                # Extract and upsert column dependencies (deterministic injection)
+                                try:
+                                    from rule_dependency_extractor import upsert_rule_dependencies
+                                    n_deps = upsert_rule_dependencies(
+                                        VECTOR_ENGINE, metric_name, rule_data, "metric"
+                                    )
+                                    if n_deps:
+                                        st.caption(f"🔗 {n_deps} column dependencies indexed for deterministic injection")
+                                except Exception as _dep_err:
+                                    print(f"[RULE DEPS] Non-fatal error indexing dependencies: {_dep_err}")
+
                                 st.success(f"✅ Metric '{metric_name}' saved successfully!")
                                 st.balloons()
-                                
+
                             except Exception as e:
                                 st.error(f"❌ Failed to save: {str(e)}")
         
@@ -1137,10 +1148,21 @@ with tab2:
                                         }
                                     )
                                     conn.commit()
-                                
+
+                                # Extract and upsert column dependencies (deterministic injection)
+                                try:
+                                    from rule_dependency_extractor import upsert_rule_dependencies
+                                    n_deps = upsert_rule_dependencies(
+                                        VECTOR_ENGINE, join_name, rule_data, "join"
+                                    )
+                                    if n_deps:
+                                        st.caption(f"🔗 {n_deps} column dependencies indexed for deterministic injection")
+                                except Exception as _dep_err:
+                                    print(f"[RULE DEPS] Non-fatal error indexing dependencies: {_dep_err}")
+
                                 st.success(f"✅ Relationship '{join_name}' saved! LLM will choose appropriate join type.")
                                 st.balloons()
-                                
+
                             except Exception as e:
                                 st.error(f"❌ Failed: {str(e)}")
         
@@ -1259,10 +1281,21 @@ with tab2:
                                         }
                                     )
                                     conn.commit()
-                                
+
+                                # Extract and upsert column dependencies (deterministic injection)
+                                try:
+                                    from rule_dependency_extractor import upsert_rule_dependencies
+                                    n_deps = upsert_rule_dependencies(
+                                        VECTOR_ENGINE, filter_name, rule_data, "filter"
+                                    )
+                                    if n_deps:
+                                        st.caption(f"🔗 {n_deps} column dependencies indexed for deterministic injection")
+                                except Exception as _dep_err:
+                                    print(f"[RULE DEPS] Non-fatal error indexing dependencies: {_dep_err}")
+
                                 st.success(f"✅ Filter '{filter_name}' saved!")
                                 st.balloons()
-                                
+
                             except Exception as e:
                                 st.error(f"❌ Failed: {str(e)}")
         
@@ -1370,11 +1403,22 @@ with tab2:
                                         }
                                     )
                                     conn.commit()
-                                
+
+                                # Extract and upsert column dependencies (deterministic injection)
+                                try:
+                                    from rule_dependency_extractor import upsert_rule_dependencies
+                                    n_deps = upsert_rule_dependencies(
+                                        VECTOR_ENGINE, rule_name, rule_data, "default"
+                                    )
+                                    if n_deps:
+                                        st.caption(f"🔗 {n_deps} column dependencies indexed for deterministic injection")
+                                except Exception as _dep_err:
+                                    print(f"[RULE DEPS] Non-fatal error indexing dependencies: {_dep_err}")
+
                                 st.success(f"✅ Critical rule '{rule_name}' saved!")
                                 st.info(f"🔍 Auto-generated {len(auto_keywords)} additional keywords: {', '.join(list(auto_keywords)[:10])}...")
                                 st.balloons()
-                                
+
                             except Exception as e:
                                 st.error(f"❌ Failed: {str(e)}")
         
@@ -2070,6 +2114,30 @@ with tab3:
                     help="Match similar questions (e.g., 'show sales' ≈ 'display sales')",
                     disabled=not enable_cache
                 )
+                enable_prompt_caching = st.checkbox(
+                    "Enable Prompt Caching",
+                    value=True,
+                    help="Send static content (schema/rules/dialect) in the system prompt with Anthropic cache_control. "
+                         "Reduces cost on repeated queries. When OFF, everything goes in the user message."
+                )
+                enable_context_cache = st.checkbox(
+                    "Enable Context Cache",
+                    value=True,
+                    help="Reuse assembled schema/rules context across queries when schema+rules versions are unchanged"
+                )
+                context_cache_use_static_rules = st.checkbox(
+                    "Use Static Rules for Context Cache",
+                    value=True,
+                    help="Use full active rulebook for question-agnostic context reuse (can increase tokens if rulebook is large)",
+                    disabled=not enable_context_cache
+                )
+                if st.button("🧹 Clear Context Cache", use_container_width=True, disabled=not enable_context_cache):
+                    try:
+                        from context_cache import GLOBAL_CONTEXT_CACHE
+                        GLOBAL_CONTEXT_CACHE._store.clear()
+                        st.success("Context cache cleared")
+                    except Exception as e:
+                        st.warning(f"Unable to clear context cache: {e}")
                 enable_charts = st.checkbox(
                     "📊 Display Charts",
                     value=True,
@@ -2144,6 +2212,9 @@ with tab3:
                     enable_opus_descriptions=enable_opus_descriptions,
                     enable_cache=enable_cache,
                     enable_semantic_cache=enable_semantic_cache if enable_cache else False,
+                    enable_prompt_caching=enable_prompt_caching,
+                    enable_context_cache=enable_context_cache,
+                    context_cache_use_static_rules=context_cache_use_static_rules if enable_context_cache else False,
                     enable_resolver=enable_resolver,
                     compress_rules=compress_rules,
                     validate_sql=enable_sql_validation,
@@ -2206,6 +2277,12 @@ with tab3:
                     col_s4.metric("Status", f"⚡ Cache Hit ({result.cache_hit_type})")
                 else:
                     col_s4.metric("Status", "✅ Success" if result.success else "❌ Failed")
+
+                if enable_context_cache:
+                    st.caption(
+                        f"Context cache: {'✅ hit' if result.context_cache_hit else '🧊 miss'}"
+                        f" · key `{result.context_cache_key[:12]}...`"
+                    )
                 
                 st.caption(f"**Flow:** {result.flow_path}")
                 
@@ -2215,18 +2292,34 @@ with tab3:
                 with st.expander("💰 Token Usage Breakdown", expanded=True):
                     tokens = result.tokens
                     token_data = []
-                    
+
                     if tokens.classifier["input"] + tokens.classifier["output"] > 0:
                         token_data.append({"Stage": "🏷️ Classifier", "Input": tokens.classifier["input"], "Output": tokens.classifier["output"]})
-                    if tokens.reasoning["input"] + tokens.reasoning["output"] > 0:
+                    # Show Pass 1 / Pass 2 separately when the two-pass flow ran;
+                    # fall back to the legacy "Reasoning" row for SIMPLE/legacy flows.
+                    if tokens.reasoning_pass1["input"] + tokens.reasoning_pass1["output"] > 0:
+                        token_data.append({"Stage": "🧠 Reasoning Pass 1", "Input": tokens.reasoning_pass1["input"], "Output": tokens.reasoning_pass1["output"]})
+                    if tokens.reasoning_pass2["input"] + tokens.reasoning_pass2["output"] > 0:
+                        token_data.append({"Stage": "🧠 Reasoning Pass 2", "Input": tokens.reasoning_pass2["input"], "Output": tokens.reasoning_pass2["output"]})
+                    if tokens.reasoning_pass1["input"] + tokens.reasoning_pass1["output"] == 0 and tokens.reasoning["input"] + tokens.reasoning["output"] > 0:
                         token_data.append({"Stage": "🧠 Reasoning", "Input": tokens.reasoning["input"], "Output": tokens.reasoning["output"]})
                     if tokens.sql_gen["input"] + tokens.sql_gen["output"] > 0:
                         token_data.append({"Stage": "⚙️ SQL Gen", "Input": tokens.sql_gen["input"], "Output": tokens.sql_gen["output"]})
+                    if tokens.tier1_fix["input"] + tokens.tier1_fix["output"] > 0:
+                        token_data.append({"Stage": "🔍 Tier 1 Static Fix", "Input": tokens.tier1_fix["input"], "Output": tokens.tier1_fix["output"]})
+                    if tokens.tier2_fix["input"] + tokens.tier2_fix["output"] > 0:
+                        token_data.append({"Stage": "⚡ Tier 2 Error Fix", "Input": tokens.tier2_fix["input"], "Output": tokens.tier2_fix["output"]})
+                    if tokens.error_fix_reasoning["input"] + tokens.error_fix_reasoning["output"] > 0:
+                        token_data.append({"Stage": "🔧 Tier 3 Reasoning Fix", "Input": tokens.error_fix_reasoning["input"], "Output": tokens.error_fix_reasoning["output"]})
+                    if tokens.error_fix_opus["input"] + tokens.error_fix_opus["output"] > 0:
+                        token_data.append({"Stage": "🔧 Tier 3 Opus Fix", "Input": tokens.error_fix_opus["input"], "Output": tokens.error_fix_opus["output"]})
                     if tokens.opus["input"] + tokens.opus["output"] > 0:
-                        token_data.append({"Stage": "🎯 Opus", "Input": tokens.opus["input"], "Output": tokens.opus["output"]})
+                        token_data.append({"Stage": "🎯 Opus Review", "Input": tokens.opus["input"], "Output": tokens.opus["output"]})
+                    if tokens.refinement["input"] + tokens.refinement["output"] > 0:
+                        token_data.append({"Stage": "🔧 Refinement", "Input": tokens.refinement["input"], "Output": tokens.refinement["output"]})
                     if tokens.chart["input"] + tokens.chart["output"] > 0:
                         token_data.append({"Stage": "📊 Chart Builder", "Input": tokens.chart["input"], "Output": tokens.chart["output"]})
-                    
+
                     # Show resolver stats (no LLM tokens — DB query time)
                     if hasattr(result, 'resolver_result') and result.resolver_result:
                         resolver_r = result.resolver_result
@@ -2234,17 +2327,32 @@ with tab3:
                             "Stage": f"🔍 Resolver ({resolver_r.queries_run} queries, {resolver_r.total_time_ms}ms)",
                             "Input": 0,
                             "Output": 0
-                        })                    
+                        })
+
                     if token_data:
                         for row in token_data:
                             row["Total"] = row["Input"] + row["Output"]
-                        
+
                         df_tokens = pd.DataFrame(token_data)
                         total_row = {"Stage": "**TOTAL**", "Input": df_tokens["Input"].sum(), "Output": df_tokens["Output"].sum(), "Total": df_tokens["Total"].sum()}
                         df_tokens = pd.concat([df_tokens, pd.DataFrame([total_row])], ignore_index=True)
                         st.dataframe(df_tokens, use_container_width=True, hide_index=True)
-                        
-                        # Savings calculation
+
+                        # Prompt cache savings
+                        cache_created = tokens.cache_creation_total()
+                        cache_read = tokens.cache_read_total()
+                        if cache_read > 0:
+                            # Cache reads are billed at ~10% of input token cost
+                            saved_tokens = int(cache_read * 0.9)
+                            st.success(
+                                f"🗄️ **Prompt cache hit:** {cache_read:,} tokens read from cache "
+                                f"(~{saved_tokens:,} tokens saved vs full input)."
+                                + (f"  |  {cache_created:,} tokens written to cache this call." if cache_created > 0 else "")
+                            )
+                        elif cache_created > 0:
+                            st.info(f"🗄️ **Prompt cache written:** {cache_created:,} tokens cached — future calls will be cheaper.")
+
+                        # Legacy savings calculation (vs fixed baseline)
                         baseline = 15000
                         actual = total_row["Total"]
                         if actual < baseline:
@@ -2258,6 +2366,8 @@ with tab3:
                     col_ctx1, col_ctx2 = st.columns(2)
                     with col_ctx1:
                         st.metric("Rules Retrieved", result.rules_retrieved)
+                        if enable_context_cache:
+                            st.metric("Context Cache", "Hit" if result.context_cache_hit else "Miss")
                         if result.rules_compressed and result.rules_compressed != "[]":
                             # Show compressed preview
                             st.caption("**Compressed Rules (sent to LLM):**")
@@ -2495,46 +2605,50 @@ with tab3:
                 # ───────────────────────────────────────────────────────────
                 with st.expander("🔍 LLM Input/Output (Debug)", expanded=False):
                     st.caption("💡 Full prompts and responses - no truncation")
-                    
+
                     llm_tabs = st.tabs(["📊 Classifier", "🧠 Reasoning", "🔍 Resolver", "⚙️ SQL Coder", "🎯 Opus Review", "🔄 Refinement", "⚡ SQL Error Fix (Reasoning)", "🔧 SQL Error Fix (Opus)"])
 
-                    
+                    # Use query counter as key suffix so each new query gets fresh
+                    # widgets — prevents Streamlit from showing stale session state
+                    # values from the previous query.
+                    _qc = st.session_state.query_counter
+
                     with llm_tabs[0]:  # Classifier
                         if result.llm_trace.classifier_input:
                             st.write("**📥 INPUT PROMPT:**")
-                            st.text_area("Classifier Input", result.llm_trace.classifier_input, height=300, key="clf_in")
+                            st.text_area("Classifier Input", result.llm_trace.classifier_input, height=300, key=f"clf_in_{_qc}")
                             st.write("**📤 OUTPUT:**")
-                            st.text_area("Classifier Output", result.llm_trace.classifier_output, height=150, key="clf_out")
+                            st.text_area("Classifier Output", result.llm_trace.classifier_output, height=150, key=f"clf_out_{_qc}")
                         else:
                             st.info("Classifier used keyword-based classification (no LLM call)")
-                    
+
                     with llm_tabs[1]:  # Reasoning
                         has_pass1 = bool(result.llm_trace.reasoning_pass1_input)
                         has_pass2 = bool(result.llm_trace.reasoning_pass2_input)
                         has_legacy = bool(result.llm_trace.reasoning_input)
-                        
+
                         if has_pass1 or has_pass2:
                             # Two-pass reasoning flow
                             if has_pass1:
                                 st.write("**📥 PASS 1 — Column Identification:**")
-                                st.text_area("Pass 1 Input", result.llm_trace.reasoning_pass1_input, height=300, key="pass1_in")
+                                st.text_area("Pass 1 Input", result.llm_trace.reasoning_pass1_input, height=300, key=f"pass1_in_{_qc}")
                                 st.write("**📤 Pass 1 Output:**")
-                                st.text_area("Pass 1 Output", result.llm_trace.reasoning_pass1_output, height=200, key="pass1_out")
+                                st.text_area("Pass 1 Output", result.llm_trace.reasoning_pass1_output, height=200, key=f"pass1_out_{_qc}")
                                 st.divider()
                             if has_pass2:
                                 st.write("**📥 PASS 2 — Full Plan with Metadata:**")
-                                st.text_area("Pass 2 Input", result.llm_trace.reasoning_pass2_input, height=300, key="pass2_in")
+                                st.text_area("Pass 2 Input", result.llm_trace.reasoning_pass2_input, height=300, key=f"pass2_in_{_qc}")
                                 st.write("**📤 Pass 2 Output:**")
-                                st.text_area("Pass 2 Output", result.llm_trace.reasoning_pass2_output, height=200, key="pass2_out")
+                                st.text_area("Pass 2 Output", result.llm_trace.reasoning_pass2_output, height=200, key=f"pass2_out_{_qc}")
                         elif has_legacy:
                             # Legacy single-pass reasoning
                             st.write("**📥 INPUT PROMPT:**")
-                            st.text_area("Reasoning Input", result.llm_trace.reasoning_input, height=400, key="reason_in")
+                            st.text_area("Reasoning Input", result.llm_trace.reasoning_input, height=400, key=f"reason_in_{_qc}")
                             st.write("**📤 OUTPUT:**")
-                            st.text_area("Reasoning Output", result.llm_trace.reasoning_output, height=300, key="reason_out")
+                            st.text_area("Reasoning Output", result.llm_trace.reasoning_output, height=300, key=f"reason_out_{_qc}")
                         else:
                             st.info("Reasoning LLM not used for this query (SIMPLE flow skips reasoning)")
-                    
+
                     with llm_tabs[2]:  # Resolver
                         if hasattr(result, 'resolver_result') and result.resolver_result:
                             r = result.resolver_result
@@ -2556,42 +2670,42 @@ with tab3:
                                 st.caption(f"Query: `{res.query_used[:200]}`")
                                 st.divider()
                         elif result.llm_trace.resolver_summary:
-                            st.text_area("Resolver Summary", result.llm_trace.resolver_summary, height=300, key="resolver_summary")
+                            st.text_area("Resolver Summary", result.llm_trace.resolver_summary, height=300, key=f"resolver_summary_{_qc}")
                         else:
                             st.info("Entity Resolver not used (no string filters or disabled)")
-                    
+
                     with llm_tabs[3]:  # SQL Coder
                         if result.llm_trace.sql_gen_input:
                             st.write("**📥 INPUT PROMPT:**")
-                            st.text_area("SQL Coder Input", result.llm_trace.sql_gen_input, height=400, key="sql_in")
+                            st.text_area("SQL Coder Input", result.llm_trace.sql_gen_input, height=400, key=f"sql_in_{_qc}")
                             st.write("**📤 OUTPUT:**")
-                            st.text_area("SQL Coder Output", result.llm_trace.sql_gen_output, height=200, key="sql_out")
+                            st.text_area("SQL Coder Output", result.llm_trace.sql_gen_output, height=200, key=f"sql_out_{_qc}")
                         else:
                             st.info("SQL Coder not used for this query (EASY flow uses Reasoning only)")
-                    
+
                     with llm_tabs[4]:  # Opus
                         if result.llm_trace.opus_input:
                             st.write("**📥 INPUT PROMPT:**")
-                            st.text_area("Opus Input", result.llm_trace.opus_input, height=400, key="opus_in")
+                            st.text_area("Opus Input", result.llm_trace.opus_input, height=400, key=f"opus_in_{_qc}")
                             st.write("**📤 OUTPUT:**")
-                            st.text_area("Opus Output", result.llm_trace.opus_output, height=200, key="opus_out")
+                            st.text_area("Opus Output", result.llm_trace.opus_output, height=200, key=f"opus_out_{_qc}")
                         else:
                             st.info("Opus review not used for this query")
-                    
+
                     with llm_tabs[5]:  # Refinement
                         if result.llm_trace.refinement_input:
                             st.write("**📥 INPUT PROMPT:**")
-                            st.text_area("Refinement Input", result.llm_trace.refinement_input, height=400, key="refine_in")
+                            st.text_area("Refinement Input", result.llm_trace.refinement_input, height=400, key=f"refine_in_{_qc}")
                             st.write("**📤 OUTPUT:**")
-                            st.text_area("Refinement Output", result.llm_trace.refinement_output, height=200, key="refine_out")
+                            st.text_area("Refinement Output", result.llm_trace.refinement_output, height=200, key=f"refine_out_{_qc}")
                         else:
                             st.info("Refinement not triggered (query was correct or Opus not enabled)")
                     with llm_tabs[6]:  # Error Fix - Reasoning
                         if result.llm_trace.error_fix_reasoning_input:
                             st.write("**📥 INPUT PROMPT (Attempt 1 — Reasoning LLM):**")
-                            st.text_area("Error Fix Reasoning Input", result.llm_trace.error_fix_reasoning_input, height=400, key="err_reason_in")
+                            st.text_area("Error Fix Reasoning Input", result.llm_trace.error_fix_reasoning_input, height=400, key=f"err_reason_in_{_qc}")
                             st.write("**📤 OUTPUT:**")
-                            st.text_area("Error Fix Reasoning Output", result.llm_trace.error_fix_reasoning_output, height=200, key="err_reason_out")
+                            st.text_area("Error Fix Reasoning Output", result.llm_trace.error_fix_reasoning_output, height=200, key=f"err_reason_out_{_qc}")
                             if result.error_recovery_method == "reasoning_llm":
                                 st.success("✅ Reasoning LLM resolved the error")
                             else:
@@ -2602,15 +2716,15 @@ with tab3:
                     with llm_tabs[7]:  # Error Fix - Opus
                         if result.llm_trace.error_fix_opus_input:
                             st.write("**📥 INPUT PROMPT (Attempt 2 — Opus):**")
-                            st.text_area("Error Fix Opus Input", result.llm_trace.error_fix_opus_input, height=400, key="err_opus_in")
+                            st.text_area("Error Fix Opus Input", result.llm_trace.error_fix_opus_input, height=400, key=f"err_opus_in_{_qc}")
                             st.write("**📤 OUTPUT:**")
-                            st.text_area("Error Fix Opus Output", result.llm_trace.error_fix_opus_output, height=200, key="err_opus_out")
+                            st.text_area("Error Fix Opus Output", result.llm_trace.error_fix_opus_output, height=200, key=f"err_opus_out_{_qc}")
                             if result.error_recovery_method == "opus":
                                 st.success("✅ Opus fixed the error after Reasoning LLM could not")
                             else:
                                 st.error("❌ Opus also could not fix the error")
                         else:
-                            st.info("Opus error fix not needed for this query")                
+                            st.info("Opus error fix not needed for this query")
                 # ───────────────────────────────────────────────────────────
                 # LOG QUERY - COMPREHENSIVE TRACKING
                 # ───────────────────────────────────────────────────────────
@@ -2625,23 +2739,42 @@ with tab3:
                     "Classifier Input Tokens": result.tokens.classifier["input"],
                     "Classifier Output Tokens": result.tokens.classifier["output"],
                     
-                    # Reasoning LLM (Sonnet)
+                    # Reasoning LLM (Sonnet) — legacy single-pass field
                     "Reasoning Input Tokens": result.tokens.reasoning["input"],
                     "Reasoning Output Tokens": result.tokens.reasoning["output"],
+                    # Two-pass reasoning breakdown
+                    "Reasoning Pass1 Input Tokens": result.tokens.reasoning_pass1["input"],
+                    "Reasoning Pass1 Output Tokens": result.tokens.reasoning_pass1["output"],
+                    "Reasoning Pass2 Input Tokens": result.tokens.reasoning_pass2["input"],
+                    "Reasoning Pass2 Output Tokens": result.tokens.reasoning_pass2["output"],
                     
                     # SQL Coder (Llama/Groq)
                     "SQL Coder Input Tokens": result.tokens.sql_gen["input"],
                     "SQL Coder Output Tokens": result.tokens.sql_gen["output"],
-                    
+
+                    # Tiered Error Handling
+                    "Tier1 Fix Input Tokens": result.tokens.tier1_fix["input"],
+                    "Tier1 Fix Output Tokens": result.tokens.tier1_fix["output"],
+                    "Tier2 Fix Input Tokens": result.tokens.tier2_fix["input"],
+                    "Tier2 Fix Output Tokens": result.tokens.tier2_fix["output"],
+                    "Tier3 Reasoning Fix Input Tokens": result.tokens.error_fix_reasoning["input"],
+                    "Tier3 Reasoning Fix Output Tokens": result.tokens.error_fix_reasoning["output"],
+                    "Tier3 Opus Fix Input Tokens": result.tokens.error_fix_opus["input"],
+                    "Tier3 Opus Fix Output Tokens": result.tokens.error_fix_opus["output"],
+
                     # Opus Reviewer
-                    "Opus Input Tokens": result.tokens.opus["input"],
-                    "Opus Output Tokens": result.tokens.opus["output"],
+                    "Opus Review Input Tokens": result.tokens.opus["input"],
+                    "Opus Review Output Tokens": result.tokens.opus["output"],
                     "Opus Verdict": result.final_verdict or "Not Used",
-                    
+
                     # Refinement (if Opus found error)
                     "Refinement Input Tokens": result.tokens.refinement["input"],
                     "Refinement Output Tokens": result.tokens.refinement["output"],
-                    
+
+                    # Prompt Cache (Anthropic only)
+                    "Cache Creation Tokens": result.tokens.cache_creation_total(),
+                    "Cache Read Tokens": result.tokens.cache_read_total(),
+
                     # Total Tokens
                     "Total Input Tokens": result.tokens.classifier["input"] + result.tokens.reasoning["input"] + result.tokens.sql_gen["input"] + result.tokens.opus["input"] + result.tokens.refinement["input"],
                     "Total Output Tokens": result.tokens.classifier["output"] + result.tokens.reasoning["output"] + result.tokens.sql_gen["output"] + result.tokens.opus["output"] + result.tokens.refinement["output"],
@@ -2737,14 +2870,18 @@ with st.sidebar:
             # Reasoning LLM
             "Reasoning Input Tokens",
             "Reasoning Output Tokens",
+            "Reasoning Pass1 Input Tokens",
+            "Reasoning Pass1 Output Tokens",
+            "Reasoning Pass2 Input Tokens",
+            "Reasoning Pass2 Output Tokens",
             
             # SQL Coder
             "SQL Coder Input Tokens",
             "SQL Coder Output Tokens",
             
             # Opus Reviewer
-            "Opus Input Tokens",
-            "Opus Output Tokens",
+            "Opus Review Input Tokens",
+            "Opus Review Output Tokens",
             "Opus Verdict",
             
             # Refinement
@@ -2839,7 +2976,7 @@ with st.sidebar:
                     df_export["Classifier Input Tokens"].sum() + df_export["Classifier Output Tokens"].sum() if "Classifier Input Tokens" in df_export.columns else 0,
                     df_export["Reasoning Input Tokens"].sum() + df_export["Reasoning Output Tokens"].sum() if "Reasoning Input Tokens" in df_export.columns else 0,
                     df_export["SQL Coder Input Tokens"].sum() + df_export["SQL Coder Output Tokens"].sum() if "SQL Coder Input Tokens" in df_export.columns else 0,
-                    df_export["Opus Input Tokens"].sum() + df_export["Opus Output Tokens"].sum() if "Opus Input Tokens" in df_export.columns else 0,
+                    df_export["Opus Review Input Tokens"].sum() + df_export["Opus Review Output Tokens"].sum() if "Opus Review Input Tokens" in df_export.columns else 0,
                     df_export["Refinement Input Tokens"].sum() + df_export["Refinement Output Tokens"].sum() if "Refinement Input Tokens" in df_export.columns else 0,
                     df_export["Total Tokens"].sum() if "Total Tokens" in df_export.columns else 0,
                     "",
