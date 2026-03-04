@@ -267,7 +267,7 @@ class FlowConfig:
     """Configuration for query processing."""
     # Classification
     enable_classification: bool = True
-    classification_provider: str = "groq"
+    classification_provider: str = "claude_haiku"
     
     # RAG - Only Rule RAG now (Schema RAG removed - poor accuracy)
     enable_rule_rag: bool = True
@@ -310,6 +310,9 @@ class FlowConfig:
     
     # Analyzer Agent (multi-step decomposition for analysis-complexity queries)
     enable_analyzer: bool = True
+
+    # Pre-computed classification — when set, process_query skips the second LLM call
+    initial_classification: Optional[Dict] = None
 
     # Dialect
     dialect: str = "postgresql"
@@ -660,10 +663,11 @@ def process_query(
         stage_start = time.time()
         
         if config.enable_classification:
-            classification = classify_query(
+            # Use pre-computed result from the UI (avoids a second LLM call)
+            classification = config.initial_classification or classify_query(
                 question,
                 use_llm=True,
-                llm_provider=config.classification_provider
+                llm_provider=config.classification_provider,
             )
             result.complexity = classification["complexity"]
             result.classification_reason = classification["reason"]

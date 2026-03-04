@@ -2213,7 +2213,6 @@ with tab3:
                 config = FlowConfig(
                     enable_classification=enable_classification,
                     enable_analyzer=enable_analyzer,
-                    classification_provider="groq",
                     enable_rule_rag=enable_rule_rag,
                     enable_opus_descriptions=enable_opus_descriptions,
                     enable_cache=enable_cache,
@@ -2242,8 +2241,9 @@ with tab3:
                 # ───────────────────────────────────────────────────────────
                 if enable_classification:
                     with st.spinner("🏷️ Classifying query..."):
-                        classification = classify_query(question, use_llm=False)
-                    
+                        classification = classify_query(question, use_llm=True, llm_provider="claude_haiku")
+                    config.initial_classification = classification  # reuse — no second LLM call
+
                     complexity = classification["complexity"]
                     complexity_emoji = {"easy": "🟢", "medium": "🟡", "hard": "🔴", "analysis": "🟣"}.get(complexity, "⚪")
                     flow_cfg = get_flow_config(complexity)
