@@ -2245,7 +2245,7 @@ with tab3:
                         classification = classify_query(question, use_llm=False)
                     
                     complexity = classification["complexity"]
-                    complexity_emoji = {"easy": "🟢", "medium": "🟡", "hard": "🔴"}[complexity]
+                    complexity_emoji = {"easy": "🟢", "medium": "🟡", "hard": "🔴", "analysis": "🟣"}.get(complexity, "⚪")
                     flow_cfg = get_flow_config(complexity)
                     
                     col_c1, col_c2, col_c3 = st.columns([1, 2, 1])
@@ -2325,6 +2325,31 @@ with tab3:
                         token_data.append({"Stage": "🔧 Refinement", "Input": tokens.refinement["input"], "Output": tokens.refinement["output"]})
                     if tokens.chart["input"] + tokens.chart["output"] > 0:
                         token_data.append({"Stage": "📊 Chart Builder", "Input": tokens.chart["input"], "Output": tokens.chart["output"]})
+
+                    # Analyzer Agent — per-stage rows (analysis-complexity queries only)
+                    if hasattr(result, 'analyzer_data') and result.analyzer_data:
+                        ar = result.analyzer_data
+                        ar_tok = ar.total_tokens
+                        decompose_i = ar_tok.get("decompose", {}).get("input", 0)
+                        decompose_o = ar_tok.get("decompose", {}).get("output", 0)
+                        if decompose_i + decompose_o > 0:
+                            token_data.append({"Stage": "🔬 Analyzer Plan", "Input": decompose_i, "Output": decompose_o})
+                        for idx_sq, sq in enumerate(ar.sub_queries, 1):
+                            sq_tok = sq.get("tokens", {})
+                            sq_i = sq_tok.get("input", 0)
+                            sq_o = sq_tok.get("output", 0)
+                            if sq_i + sq_o > 0:
+                                token_data.append({"Stage": f"🔬 Sub-query {idx_sq}", "Input": sq_i, "Output": sq_o})
+                        synth_i = (ar_tok.get("synthesis_plan", {}).get("input", 0)
+                                   + ar_tok.get("synthesis_execution", {}).get("input", 0))
+                        synth_o = (ar_tok.get("synthesis_plan", {}).get("output", 0)
+                                   + ar_tok.get("synthesis_execution", {}).get("output", 0))
+                        if synth_i + synth_o > 0:
+                            token_data.append({"Stage": "🔬 Synthesis", "Input": synth_i, "Output": synth_o})
+                        opus_i = ar_tok.get("opus_review", {}).get("input", 0)
+                        opus_o = ar_tok.get("opus_review", {}).get("output", 0)
+                        if opus_i + opus_o > 0:
+                            token_data.append({"Stage": "🎯 Opus Review (Analyzer)", "Input": opus_i, "Output": opus_o})
 
                     # Show resolver stats (no LLM tokens — DB query time)
                     if hasattr(result, 'resolver_result') and result.resolver_result:
@@ -2612,7 +2637,7 @@ with tab3:
                 with st.expander("🔍 LLM Input/Output (Debug)", expanded=False):
                     st.caption("💡 Full prompts and responses - no truncation")
 
-                    llm_tabs = st.tabs(["📊 Classifier", "🧠 Reasoning", "🔍 Resolver", "⚙️ SQL Coder", "🎯 Opus Review", "🔄 Refinement", "⚡ SQL Error Fix (Reasoning)", "🔧 SQL Error Fix (Opus)"])
+                    llm_tabs = st.tabs(["📊 Classifier", "🧠 Reasoning", "🔍 Resolver", "⚙️ SQL Coder", "🎯 Opus Review", "🔄 Refinement", "⚡ SQL Error Fix (Reasoning)", "🔧 SQL Error Fix (Opus)", "🔬 Analyzer"])
 
                     # Use query counter as key suffix so each new query gets fresh
                     # widgets — prevents Streamlit from showing stale session state
@@ -2731,6 +2756,69 @@ with tab3:
                                 st.error("❌ Opus also could not fix the error")
                         else:
                             st.info("Opus error fix not needed for this query")
+
+                    with llm_tabs[8]:  # Analyzer Agent
+                        if hasattr(result, 'analyzer_data') and result.analyzer_data:
+                            ar = result.analyzer_data
+                            st.write(f"**Analysis type:** {ar.plan.get('analysis_type', 'unknown')} | "
+                                     f"**Opus verdict:** {ar.opus_verdict} | "
+                                     f"**Sub-queries:** {len(ar.sub_queries)}")
+                            st.caption(f"*Reasoning: {ar.plan.get('reasoning', '')}*")
+                            st.divider()
+
+                            # Decomposition plan
+                            st.write("### 🗂️ Decomposition Plan")
+                            for step in ar.plan.get("steps", []):
+                                st.write(f"**Step {step['step_id']}:** {step.get('description', '')}")
+                                st.write(f"  *Sub-question:* {step.get('sub_question', '')}")
+                                if step.get("depends_on"):
+                                    st.write(f"  *Depends on:* {step['depends_on']}")
+                                st.write(f"  *Result usage:* {step.get('result_usage', '')}")
+                            st.write(f"**Synthesis approach:** {ar.plan.get('synthesis_approach', '')}")
+                            st.divider()
+
+                            # Each sub-query
+                            st.write("### 🔍 Sub-queries")
+                            for sq in ar.sub_queries:
+                                success_icon = "✅" if sq.get("success") else "❌"
+                                st.write(f"**{success_icon} Step {sq['step_id']}:** {sq['sub_question']}")
+                                if sq.get("sql"):
+                                    st.code(sq["sql"], language="sql")
+                                st.caption(f"Results: {sq.get('results_summary', 'N/A')}")
+                                tok = sq.get("tokens", {})
+                                if tok.get("input", 0) + tok.get("output", 0) > 0:
+                                    st.caption(f"Tokens — input: {tok.get('input', 0):,}  output: {tok.get('output', 0):,}")
+                                st.divider()
+
+                            # Inspect decisions
+                            inspect_entries = [e for e in ar.trace if e.get("stage") in ("inspect_input", "inspect_output", "modify_plan", "early_synthesize", "abort")]
+                            if inspect_entries:
+                                st.write("### 🧠 Analyzer Decisions")
+                                for entry in inspect_entries:
+                                    stage = entry["stage"]
+                                    if stage == "inspect_output":
+                                        st.write(f"**Decision:** {entry.get('response', '')[:500]}")
+                                    elif stage == "modify_plan":
+                                        st.write(f"**Plan modified:** {entry.get('updated_steps', '')}")
+                                    elif stage == "early_synthesize":
+                                        st.success(f"Early synthesis triggered: {entry.get('reason', '')}")
+                                    elif stage == "abort":
+                                        st.error(f"Aborted: {entry.get('reason', '')}")
+                                st.divider()
+
+                            # Synthesis step
+                            st.write("### 🔗 Synthesis")
+                            synth_entry = next((e for e in ar.trace if e.get("stage") == "synthesis_plan_output"), None)
+                            if synth_entry:
+                                st.write(f"Synthesis plan: {synth_entry.get('response', '')[:500]}")
+                            final_entry = next((e for e in ar.trace if e.get("stage") == "synthesis_result"), None)
+                            if final_entry:
+                                status_icon = "✅" if final_entry.get("success") else "❌"
+                                st.write(f"{status_icon} Final SQL generated")
+                                if ar.synthesis_sql:
+                                    st.code(ar.synthesis_sql, language="sql")
+                        else:
+                            st.info("Analyzer Agent not used for this query (non-analysis complexity)")
                 # ───────────────────────────────────────────────────────────
                 # LOG QUERY - COMPREHENSIVE TRACKING
                 # ───────────────────────────────────────────────────────────
@@ -2798,6 +2886,11 @@ with tab3:
                     "Resolver Queries": result.resolver_result.queries_run if hasattr(result, 'resolver_result') and result.resolver_result else 0,
                     "All Entities Resolved": "Yes" if (hasattr(result, 'resolver_result') and result.resolver_result and result.resolver_result.all_resolved) else "N/A",
                     
+                    # Analyzer Agent (analysis-complexity queries)
+                    "Analyzer Sub-queries": len(result.analyzer_data.sub_queries) if (hasattr(result, 'analyzer_data') and result.analyzer_data) else 0,
+                    "Analyzer Total Tokens": result.tokens.analyzer["input"] + result.tokens.analyzer["output"],
+                    "Analysis Type": result.analyzer_data.plan.get("analysis_type", "") if (hasattr(result, 'analyzer_data') and result.analyzer_data) else "",
+
                     # SQL & Results
                     "Generated SQL": result.sql,
                     "SQL Valid": "Yes" if result.validation_result and result.validation_result.get("is_valid", True) else "No",
@@ -2911,6 +3004,11 @@ with st.sidebar:
             "Resolver Queries",
             "All Entities Resolved",
             
+            # Analyzer Agent
+            "Analyzer Sub-queries",
+            "Analyzer Total Tokens",
+            "Analysis Type",
+
             # SQL & Results
             "Generated SQL",
             "SQL Valid",

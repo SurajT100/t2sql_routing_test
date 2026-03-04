@@ -344,6 +344,8 @@ class TokenUsage:
     error_fix_reasoning: Dict[str, int] = field(default_factory=_zero_tok)
     error_fix_opus: Dict[str, int] = field(default_factory=_zero_tok)
     chart: Dict[str, int] = field(default_factory=_zero_tok)
+    # Analyzer Agent — multi-step decomposition (analysis-complexity queries)
+    analyzer: Dict[str, int] = field(default_factory=_zero_tok)
 
     def total(self) -> Dict[str, int]:
         all_stages = [
@@ -352,6 +354,7 @@ class TokenUsage:
             self.sql_gen, self.opus, self.refinement,
             self.tier1_fix, self.tier2_fix,
             self.error_fix_reasoning, self.error_fix_opus,
+            self.analyzer,
         ]
         return {
             "input":  sum(s["input"]  for s in all_stages),
@@ -370,6 +373,7 @@ class TokenUsage:
             self.sql_gen, self.opus, self.refinement,
             self.tier1_fix, self.tier2_fix,
             self.error_fix_reasoning, self.error_fix_opus,
+            self.analyzer,
         ]
         return sum(s.get("cache_creation_input_tokens", 0) for s in all_stages)
 
@@ -381,6 +385,7 @@ class TokenUsage:
             self.sql_gen, self.opus, self.refinement,
             self.tier1_fix, self.tier2_fix,
             self.error_fix_reasoning, self.error_fix_opus,
+            self.analyzer,
         ]
         return sum(s.get("cache_read_input_tokens", 0) for s in all_stages)
 
@@ -479,6 +484,9 @@ class QueryResult:
     entities_resolved: int = 0
     resolver_time_ms: int = 0
     
+    # Analyzer Agent result (populated for analysis-complexity queries)
+    analyzer_data: Any = None
+
     # Timing
     total_time_ms: int = 0
     stage_times: Dict[str, int] = field(default_factory=dict)
@@ -1173,12 +1181,12 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
             result.results = analyzer_result.final_results
             result.success = bool(analyzer_result.synthesis_sql and analyzer_result.final_results is not None)
             result.opus_verdict = analyzer_result.opus_verdict
-            # Accumulate sub-query tokens into reasoning bucket for token display
-            sq_tok = analyzer_result.total_tokens.get("sub_queries", {})
-            result.tokens.reasoning["input"] += sq_tok.get("input", 0)
-            result.tokens.reasoning["output"] += sq_tok.get("output", 0)
-            # Store analyzer trace for debugging
-            result.llm_trace.reasoning = str(analyzer_result.trace)
+            # Store full analyzer result for per-stage token display and debug tab
+            result.analyzer_data = analyzer_result
+            # Accumulate all analyzer stage tokens into the dedicated analyzer bucket
+            for stage_tok in analyzer_result.total_tokens.values():
+                result.tokens.analyzer["input"] += stage_tok.get("input", 0)
+                result.tokens.analyzer["output"] += stage_tok.get("output", 0)
 
         else:
             # Fallback — treat as analytical
