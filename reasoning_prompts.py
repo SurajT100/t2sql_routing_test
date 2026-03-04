@@ -161,7 +161,7 @@ def fetch_column_metadata(
                     # Query schema_columns table (already populated during DB profiling)
                     result = vector_engine.table("schema_columns").select(
                         "column_name, data_type, sample_values, opus_description"
-                    ).eq("table_name", table_name).eq("column_name", col).execute()
+                    ).eq("object_name", table_name).eq("column_name", col).execute()
 
                     if result.data:
                         row = result.data[0]

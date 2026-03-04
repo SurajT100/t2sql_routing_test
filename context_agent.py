@@ -484,7 +484,7 @@ class ContextAgent:
                                     "SELECT column_name, data_type, sample_values, "
                                     "opus_description, user_description, friendly_name "
                                     "FROM schema_columns "
-                                    "WHERE table_name = :tname AND column_name = :cname "
+                                    "WHERE object_name = :tname AND column_name = :cname "
                                     "LIMIT 1"
                                 ),
                                 {"tname": table_name, "cname": col}
