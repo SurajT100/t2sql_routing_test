@@ -2005,6 +2005,10 @@ def _run_opus_review(
                 "final_review": review,
                 "attempts": attempt,
                 "tokens": total_tokens,
+                # Propagate refined SQL when it changed (reviewed & approved on attempt 2+)
+                "corrected_sql": current_sql if current_sql != sql else None,
+                "corrected_results": current_results if current_sql != sql else None,
+                "refinement_tokens": refinement_tokens,
                 "trace_opus_input": trace_opus_input,
                 "trace_opus_output": trace_opus_output,
                 "trace_refinement_input": trace_refinement_input,

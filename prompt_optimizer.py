@@ -654,16 +654,44 @@ not just plausible. Be critical. Wrong column = wrong answer even if the query r
 ## RESULTS PREVIEW
 {results_preview}
 
+## INTENT VERIFICATION — Answer these THREE questions first:
+
+**Question 1 — WHAT is the user actually asking for?**
+Restate the user's question as a precise analytical requirement.
+What computation, comparison, or insight does the user expect?
+What would a correct result set look like — what columns, what relationships between rows,
+what would make the user say 'yes this answers my question'?
+
+**Question 2 — DOES this SQL produce that?**
+Trace the SQL logic step by step. What does each CTE/subquery compute?
+What does the final SELECT actually return?
+Describe the result set this SQL would produce in plain English.
+Would a business user looking at these results get the answer, or would they say
+'this isn't what I asked for'?
+
+**Question 3 — Is there a GAP between Question 1 and Question 2?**
+- If the SQL produces exactly what the user asked for → intent_match = PASS
+- If the SQL produces something related but simpler or different → intent_match = FAIL.
+  Note: 'User asked for [X]. SQL produces [Y]. Missing: [specific gap].'
+- If the SQL produces the right thing but with a logical flaw in how it computes it → intent_match = FAIL.
+  Note the specific flaw.
+
+---
+
 ## AUDIT CHECKLIST — verify each point against schema and rules above:
+
+0. INTENT MATCH ← MOST IMPORTANT CHECK
+   Answer Question 3 above.
+   If intent does not match, mark INCORRECT immediately — nothing else matters.
 
 1. COLUMN VERIFICATION
    - Do all column names exist exactly in the schema? (check spelling, casing, quoting)
-   - Is the correct column used for each metric? 
+   - Is the correct column used for each metric?
      Example: if rules say "sales = SUM(Margin)" but SQL uses SUM(Revenue), that is INCORRECT
    - Are data types compatible with the operations applied?
      Example: comparing a TEXT column to a DATE using >= will fail or give wrong results
 
-2. FILTER VERIFICATION  
+2. FILTER VERIFICATION
    - Are all mandatory filters from business rules present?
      Example: if a rule says "always exclude Rebate" but WHERE clause is missing this, it is INCORRECT
    - Are filter values exactly correct? (case-sensitive string matching matters)
@@ -683,12 +711,14 @@ not just plausible. Be critical. Wrong column = wrong answer even if the query r
    - Are there unexpected NULLs, zeros, or extreme values?
 
 ## VERDICT CRITERIA
-- CORRECT: All 5 checks pass. Column names exact, filters complete, aggregations right.
-- INCORRECT: Any check fails. Specify exactly which check and what is wrong.
-- UNCERTAIN: Results look plausible but you cannot verify without data samples.
+- CORRECT: Intent matches AND all other checks pass.
+- INCORRECT: Intent does NOT match → always INCORRECT regardless of other checks.
+  OR: Intent matches but another check fails.
+  In either case, state: 'User asked for [X]. SQL produces [Y]. Missing/wrong: [gap].'
+- UNCERTAIN: Intent plausibly matches but you cannot fully verify without data samples.
 
 ## OUTPUT (JSON only, no markdown)
-{{"verdict": "CORRECT|INCORRECT|UNCERTAIN", "confidence": 0.0-1.0, "checks": {{"columns": "pass|fail|unknown", "filters": "pass|fail|unknown", "aggregations": "pass|fail|unknown", "joins": "pass|fail|unknown|na", "results": "pass|fail|unknown"}}, "issues": ["specific problem if any"], "reasoning": "brief explanation citing specific column names and rule names"}}"""
+{{"verdict": "CORRECT|INCORRECT|UNCERTAIN", "confidence": 0.0-1.0, "checks": {{"intent_match": "pass|fail|unknown", "columns": "pass|fail|unknown", "filters": "pass|fail|unknown", "aggregations": "pass|fail|unknown", "joins": "pass|fail|unknown|na", "results": "pass|fail|unknown"}}, "issues": ["specific problem if any — lead with intent gap if present"], "reasoning": "Start with intent verification result (Q1→Q2→Q3), then column/filter details. If intent fails, stop here."}}"""
     
     return prompt
 
