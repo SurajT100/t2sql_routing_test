@@ -231,11 +231,11 @@ def classify_query(
             "response": str  # For debugging
         }
     """
-    # Quick keyword-based classification
+    # Quick keyword-based classification (used as fallback only — not as a bypass)
     quick_result, confidence = _quick_classify(question)
-    
-    # If high confidence or LLM disabled, return keyword result
-    if not use_llm or confidence >= 0.85:
+
+    # When LLM is disabled, use keyword result directly (regardless of confidence)
+    if not use_llm:
         return {
             "complexity": quick_result.value,
             "reason": f"Keyword-based classification (confidence: {confidence:.0%})",
@@ -245,8 +245,8 @@ def classify_query(
             "prompt": "",
             "response": ""
         }
-    
-    # Use LLM for uncertain cases
+
+    # LLM is the primary classifier when enabled — always call it
     try:
         from llm_v2 import call_llm
         
@@ -282,25 +282,32 @@ def classify_query(
         }
         
     except json.JSONDecodeError as e:
-        # If JSON parsing fails, fall back to keyword result but keep trace
+        # LLM response couldn't be parsed — use keyword result only if confidence is
+        # high enough (≥ 70%) to trust it; otherwise fall back to the safe default.
+        _KEYWORD_MIN_CONFIDENCE = 0.70
+        fallback_complexity = quick_result.value if confidence >= _KEYWORD_MIN_CONFIDENCE else "medium"
+        fallback_method = "keyword_fallback" if confidence >= _KEYWORD_MIN_CONFIDENCE else "safe_default"
         return {
-            "complexity": quick_result.value,
-            "reason": f"LLM response parsing failed, using keyword fallback",
+            "complexity": fallback_complexity,
+            "reason": f"LLM response parsing failed — {'keyword fallback' if confidence >= _KEYWORD_MIN_CONFIDENCE else 'safe default (medium)'} used",
             "confidence": confidence,
-            "method": "keyword_fallback",
+            "method": fallback_method,
             "tokens": tokens if 'tokens' in locals() else {"input": 0, "output": 0},
             "error": str(e),
             "prompt": prompt if 'prompt' in locals() else "",
             "response": raw_response if 'raw_response' in locals() else (response if 'response' in locals() else "")
         }
-        
+
     except Exception as e:
-        # If LLM call fails, fall back to keyword result
+        # LLM call failed entirely — same rule: keyword only at ≥ 70% confidence
+        _KEYWORD_MIN_CONFIDENCE = 0.70
+        fallback_complexity = quick_result.value if confidence >= _KEYWORD_MIN_CONFIDENCE else "medium"
+        fallback_method = "keyword_fallback" if confidence >= _KEYWORD_MIN_CONFIDENCE else "safe_default"
         return {
-            "complexity": quick_result.value,
-            "reason": f"LLM call failed, using keyword fallback",
+            "complexity": fallback_complexity,
+            "reason": f"LLM call failed — {'keyword fallback' if confidence >= _KEYWORD_MIN_CONFIDENCE else 'safe default (medium)'} used",
             "confidence": confidence,
-            "method": "keyword_fallback",
+            "method": fallback_method,
             "tokens": {"input": 0, "output": 0},
             "error": str(e),
             "prompt": "",
