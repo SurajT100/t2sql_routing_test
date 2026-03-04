@@ -2868,6 +2868,10 @@ with st.sidebar:
             # Reasoning LLM
             "Reasoning Input Tokens",
             "Reasoning Output Tokens",
+            "Reasoning Pass1 Input Tokens",
+            "Reasoning Pass1 Output Tokens",
+            "Reasoning Pass2 Input Tokens",
+            "Reasoning Pass2 Output Tokens",
             
             # SQL Coder
             "SQL Coder Input Tokens",
