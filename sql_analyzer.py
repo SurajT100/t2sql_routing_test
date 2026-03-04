@@ -45,9 +45,9 @@ _DECOMPOSE_SYSTEM = """You are an expert SQL analyst. Your job is to break down 
 Rules for decomposition:
 1. Each sub_question must be answerable with a single, non-nested SQL query.
 2. Do NOT combine multiple aggregations or multi-hop logic into one sub-question.
-3. Reference specific column names from the schema provided.
-4. Apply the business rules provided when deciding what data to retrieve.
-5. Do not hardcode table names, column names, or specific values in your plan — describe them generically using the schema.
+3. Each sub_question MUST use the exact table name(s) with their schema prefix exactly as they appear in the schema (e.g. if the schema shows "public"."CRM", write "public.CRM" in the sub_question — never just "CRM" or "opportunities").
+4. Each sub_question MUST reference exact column names from the schema — use the column names as shown, never paraphrase them.
+5. Apply the business rules provided when deciding what data to retrieve.
 6. Specify exactly what columns/aggregates each step returns so downstream steps can use them.
 7. Limit to at most 5 steps.
 
@@ -60,19 +60,46 @@ def _build_decompose_prompt(
     rules_compressed: str,
     dialect_info: Dict,
 ) -> str:
+    from flow_router import get_dialect_syntax_rules
     dialect = dialect_info.get("dialect", "postgresql") if dialect_info else "postgresql"
+    quote_char = dialect_info.get("quote_char", '"') if dialect_info else '"'
+    dialect_rules = get_dialect_syntax_rules(dialect)
     rules_text = rules_compressed if rules_compressed and rules_compressed != "[]" else "None"
+
+    # Build a concrete example of good vs bad sub_question using the actual quoting style
+    if dialect == "postgresql":
+        good_example = 'What is the total "sales_amount" from "public"."CRM" grouped by "region"?'
+        bad_example = "What is the total sales from CRM by region?"
+    elif dialect == "mysql":
+        good_example = "What is the total `sales_amount` from `mydb`.`CRM` grouped by `region`?"
+        bad_example = "What is the total sales from CRM by region?"
+    elif dialect in ("mssql", "sqlserver"):
+        good_example = "What is the total [sales_amount] from [dbo].[CRM] grouped by [region]?"
+        bad_example = "What is the total sales from CRM by region?"
+    else:
+        good_example = 'What is the total "sales_amount" from "public"."CRM" grouped by "region"?'
+        bad_example = "What is the total sales from CRM by region?"
+
     return f"""Question: {question}
 
-Database dialect: {dialect}
+{dialect_rules}
 
-Schema (column names and types):
+IMPORTANT — table and column naming in sub_questions:
+- Use EXACT schema-qualified table names as shown in the schema below (e.g. if schema shows "public"."CRM", the sub_question must say "public"."CRM" — never bare "CRM").
+- Use EXACT column names as shown in the schema — never paraphrase or abbreviate them.
+- Good sub_question: "{good_example}"
+- Bad sub_question:  "{bad_example}"  ← missing schema prefix and exact column names
+
+Schema (exact table and column names to use):
 {bare_schema}
 
 Business rules:
 {rules_text}
 
-Break this question into simple sub-questions. Each sub-question must be answerable with a single SQL query.
+Break the question into simple sub-questions. Each sub-question must:
+• Be answerable with a single SQL query (no CTEs needed)
+• Name the exact schema-qualified table(s) involved
+• Name the exact column(s) involved
 
 Return this exact JSON structure:
 {{
@@ -82,7 +109,7 @@ Return this exact JSON structure:
     {{
       "step_id": 1,
       "description": "What this step computes",
-      "sub_question": "A simple question that a SQL generator can handle in one query",
+      "sub_question": "A specific question naming exact tables and columns from the schema above",
       "depends_on": [],
       "result_usage": "How this result will be used in later steps"
     }}
@@ -145,7 +172,9 @@ def _build_synthesis_prompt(
     synthesis_approach: str,
     dialect_info: Dict,
 ) -> str:
+    from flow_router import get_dialect_syntax_rules
     dialect = dialect_info.get("dialect", "postgresql") if dialect_info else "postgresql"
+    dialect_rules = get_dialect_syntax_rules(dialect)
     steps_text = ""
     for item in completed:
         steps_text += f"\nStep {item['step_id']}: {item['sub_question']}\n"
@@ -154,24 +183,22 @@ def _build_synthesis_prompt(
 
     return f"""Original question: {question}
 
-Database dialect: {dialect}
+{dialect_rules}
 
 Synthesis approach: {synthesis_approach}
 
 Sub-queries already validated and executed:
 {steps_text}
 
-Write a final SQL query that answers the original question by combining the above sub-queries.
-Options:
-  A) A single query incorporating knowledge from the results (e.g. using IN lists, hard-coded values from results, or derived logic).
-  B) A CTE-based query where each CTE corresponds to one of the sub-queries above.
-
-Choose whichever approach produces a correct, readable query.
+Write a final sub_question that asks for the combined answer. The sub_question will be passed through a SQL generation pipeline, so it must:
+- Use exact schema-qualified table names as shown in the SQL above (e.g. "public"."CRM", not just "CRM")
+- Reference exact column names as they appear in the SQL above
+- Be specific enough that a SQL generator can produce the correct query from it
 
 Return ONLY a JSON object:
 {{
   "synthesis_type": "single_query | cte",
-  "sub_question": "A clear question that describes what the final SQL should answer",
+  "sub_question": "A specific question naming exact tables and columns, readable by a SQL generator",
   "reasoning": "Why this synthesis approach works"
 }}"""
 
