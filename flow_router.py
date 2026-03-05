@@ -1317,28 +1317,49 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
         # STAGE 5: EXECUTE SQL
         # ═══════════════════════════════════════════════════════════════════
         stage_start = time.time()
-        
-        is_safe, safety_reason = is_safe_query(result.sql)
-        
-        if not is_safe:
-            result.success = False
-            result.error = f"Query blocked: {safety_reason}"
-            result.stages_completed.append("execution_blocked")
+
+        # The analysis flow executes the synthesis SQL inside the Analyzer
+        # (via _synthesize → process_query_fn).  Skipping re-execution here
+        # prevents double DB round-trips and avoids overwriting results that
+        # Opus already reviewed inside the Analyzer.  We still run is_safe_query
+        # as a safety gate in case Tier 1 produced a non-SELECT rewrite.
+        _analysis_already_executed = (
+            result.complexity == "analysis"
+            and result.success
+            and result.results is not None
+        )
+
+        if _analysis_already_executed:
+            is_safe, safety_reason = is_safe_query(result.sql)
+            if not is_safe:
+                result.success = False
+                result.error = f"Query blocked: {safety_reason}"
+                result.stages_completed.append("execution_blocked")
+            else:
+                result.stages_completed.append("execution")
             result.stage_times["execution"] = int((time.time() - stage_start) * 1000)
         else:
-            try:
-                result.results = run_sql(engine, result.sql)
-                result.success = True
-                result.stages_completed.append("execution")
-            except Exception as e:
+            is_safe, safety_reason = is_safe_query(result.sql)
+
+            if not is_safe:
                 result.success = False
-                result.error = str(e)
-                result.original_error = str(e)
-                result.stages_completed.append("execution_failed")
-                print(f"[ERROR RECOVERY] SQL execution failed: {str(e)[:100]}")
-                print(f"[ERROR RECOVERY] Starting recovery: Attempt 1 → Reasoning LLM")
-        
-        result.stage_times["execution"] = int((time.time() - stage_start) * 1000)
+                result.error = f"Query blocked: {safety_reason}"
+                result.stages_completed.append("execution_blocked")
+                result.stage_times["execution"] = int((time.time() - stage_start) * 1000)
+            else:
+                try:
+                    result.results = run_sql(engine, result.sql)
+                    result.success = True
+                    result.stages_completed.append("execution")
+                except Exception as e:
+                    result.success = False
+                    result.error = str(e)
+                    result.original_error = str(e)
+                    result.stages_completed.append("execution_failed")
+                    print(f"[ERROR RECOVERY] SQL execution failed: {str(e)[:100]}")
+                    print(f"[ERROR RECOVERY] Starting recovery: Attempt 1 → Reasoning LLM")
+
+            result.stage_times["execution"] = int((time.time() - stage_start) * 1000)
         
         # ═══════════════════════════════════════════════════════════════════
         # STAGE 6: ERROR RECOVERY (only if execution failed)
@@ -1922,13 +1943,20 @@ def _build_user_friendly_error(
 def _should_run_opus(enable_opus, complexity: str, execution_success: bool) -> bool:
     """Determine if Opus review should run."""
     print(f"[DEBUG OPUS] enable_opus={enable_opus} (type={type(enable_opus).__name__}), complexity={complexity}, success={execution_success}")
-    
+
+    # The analysis flow runs its own Opus review inside the Analyzer (sql_analyzer.py).
+    # Stage 7 must not fire a second time — that would double the token spend and
+    # produce a conflicting verdict via a different code path.
+    if complexity == "analysis":
+        print(f"[DEBUG OPUS] → Skipping: analysis flow owns its own Opus review")
+        return False
+
     if isinstance(enable_opus, str):
         if enable_opus.lower() == "true":
             enable_opus = True
         elif enable_opus.lower() == "false":
             enable_opus = False
-    
+
     if enable_opus == True or enable_opus is True:
         print(f"[DEBUG OPUS] → Running: Always mode (success={execution_success})")
         return execution_success  # Only review if execution succeeded
@@ -1942,7 +1970,7 @@ def _should_run_opus(enable_opus, complexity: str, execution_success: bool) -> b
         should_run = complexity == "hard"
         print(f"[DEBUG OPUS] → Auto mode: {'Running' if should_run else 'Skipping'} (complexity={complexity})")
         return should_run
-    
+
     print(f"[DEBUG OPUS] → Skipping: Unknown value")
     return False
 

@@ -418,6 +418,23 @@ class SQLAnalyzer:
         synthesis_sql = ""
         final_results = None
 
+        # If every completed sub-query failed, synthesizing is pointless —
+        # the LLM would only see "FAILED: ..." summaries and produce garbage.
+        # This covers single-step plans (where _inspect is never called because
+        # remaining_steps is empty after the only step runs) and multi-step plans
+        # where the last step was the final one and all happened to fail.
+        if completed and all(not c.get("success") for c in completed) and not abort_message:
+            first_err = completed[0].get("results_summary", "All sub-queries failed.")
+            return AnalyzerResult(
+                plan=plan,
+                sub_queries=sub_queries,
+                synthesis_sql="",
+                final_results=None,
+                opus_verdict="NOT_REVIEWED",
+                total_tokens=total_tokens,
+                trace=trace + [{"stage": "aborted_all_failed", "message": first_err}],
+            )
+
         if abort_message:
             # Nothing to synthesize
             return AnalyzerResult(
@@ -442,7 +459,8 @@ class SQLAnalyzer:
 
         # ── Step 5: Opus Review ────────────────────────────────────────────
         opus_verdict = "NOT_REVIEWED"
-        if synthesis_sql and final_results is not None:
+        _opus_enabled = getattr(self.config, "enable_opus", False)
+        if synthesis_sql and final_results is not None and _opus_enabled:
             try:
                 opus_out = _run_opus_review(
                     question=question,
