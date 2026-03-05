@@ -459,7 +459,14 @@ class SQLAnalyzer:
 
         # ── Step 5: Opus Review ────────────────────────────────────────────
         opus_verdict = "NOT_REVIEWED"
-        _opus_enabled = getattr(self.config, "enable_opus", False)
+        _opus_raw = getattr(self.config, "enable_opus", False)
+        # Explicitly normalize all valid values — do NOT rely on bool("auto") == True.
+        # "auto" means run Opus for analysis queries (they are inherently complex and
+        # the Analyzer is their designated reviewer; the outer Stage 7 skips them).
+        if isinstance(_opus_raw, str):
+            _opus_enabled = _opus_raw.lower() in ("auto", "true")
+        else:
+            _opus_enabled = bool(_opus_raw)
         if synthesis_sql and final_results is not None and _opus_enabled:
             try:
                 opus_out = _run_opus_review(
