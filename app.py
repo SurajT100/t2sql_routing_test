@@ -63,6 +63,51 @@ except Exception as e:
 
 
 # ======================
+# HELPERS
+# ======================
+
+def _generate_result_summary(question: str, results_df, provider: str = "claude_sonnet") -> tuple:
+    """Generate a short business-friendly summary of query results using an LLM.
+
+    Returns (summary_text, tokens_dict).
+    """
+    if results_df is None:
+        return "", {"input": 0, "output": 0}
+    if hasattr(results_df, "empty") and results_df.empty:
+        return "", {"input": 0, "output": 0}
+
+    try:
+        cols = list(results_df.columns) if hasattr(results_df, "columns") else []
+        total_rows = len(results_df) if hasattr(results_df, "__len__") else "unknown"
+        sample = (
+            results_df.head(10).to_dict(orient="records")
+            if hasattr(results_df, "head")
+            else str(results_df)[:500]
+        )
+
+        prompt = f"""Question asked: {question}
+
+Query returned {total_rows} rows. Column names: {cols}
+First 10 rows of data: {sample}
+
+Write a concise, business-friendly summary of what these results show.
+Rules:
+- Do NOT use technical jargon, SQL terms, or raw column names verbatim
+- Write for a business stakeholder (manager, executive) — plain English only
+- Be specific: reference actual numbers, names, or findings visible in the data
+- For simple/direct results: one sentence is enough (e.g. "There are 47 active deals currently in the pipeline.")
+- For ranked or comparative results: 2-3 sentences highlighting the top finding and what it implies
+- Example style: "The results show the top 10 customers by total purchase value. Customer X leads with ₹Y in spending, significantly ahead of others in the list. This suggests a small group of customers drives the majority of revenue."
+
+Return ONLY the summary text with no preamble, labels, or markdown."""
+
+        summary, tok = call_llm(prompt=prompt, provider=provider)
+        return summary.strip(), tok
+    except Exception:
+        return "", {"input": 0, "output": 0}
+
+
+# ======================
 # PAGE CONFIG
 # ======================
 st.set_page_config("Text-to-SQL RAG Platform", layout="wide", page_icon="🧠")
@@ -2266,7 +2311,18 @@ with tab3:
                         selected_tables=st.session_state.selected_objects,
                         config=config
                     )
-                
+
+                # Generate business-friendly summary for ALL query types
+                _summary_text = ""
+                _summary_tokens = {"input": 0, "output": 0}
+                if result.success and result.results is not None and hasattr(result.results, "columns"):
+                    with st.spinner("📊 Generating analysis summary..."):
+                        _summary_text, _summary_tokens = _generate_result_summary(
+                            question=question,
+                            results_df=result.results,
+                            provider=st.session_state.get("reasoning_provider", "claude_sonnet"),
+                        )
+
                 # ───────────────────────────────────────────────────────────
                 # DISPLAY RESULTS
                 # ───────────────────────────────────────────────────────────
@@ -2486,13 +2542,30 @@ with tab3:
                 if result.success:
                     if result.results is not None and hasattr(result.results, 'shape'):
 
+                        # ── Analysis Summary (Issue 5) ─────────────────────
+                        if _summary_text:
+                            st.markdown("### 📊 Analysis Summary")
+                            st.info(_summary_text)
+
+                        total_rows = len(result.results)
                         st.markdown(
                             f'<div class="row-count-badge">'
-                            f'✅ {len(result.results)} rows &nbsp;·&nbsp; '
+                            f'✅ {total_rows} rows &nbsp;·&nbsp; '
                             f'{len(result.results.columns)} columns'
                             f'</div>',
                             unsafe_allow_html=True
                         )
+
+                        # ── Row-limit display (Issue 1) ────────────────────
+                        # Limit UI display to 100 rows; CSV always contains all rows.
+                        _DISPLAY_LIMIT = 100
+                        if total_rows > _DISPLAY_LIMIT:
+                            st.info(
+                                f"⚠️ Showing {_DISPLAY_LIMIT} of {total_rows} rows. "
+                                f"Download full results below."
+                            )
+                        display_df = result.results.head(_DISPLAY_LIMIT)
+
                         if getattr(result, 'opus_blocked_soft', False):
                             st.warning(
                                 "⚠️ **Review recommended** — Opus flagged a potential logic issue. "
@@ -2521,7 +2594,7 @@ with tab3:
 
                                     if not chart_rendered:
                                         st.info("📋 No suitable chart for this result — showing table")
-                                        st.dataframe(result.results, use_container_width=True)
+                                        st.dataframe(display_df, use_container_width=True)
 
                                     # Show chart token usage directly below chart
                                     if chart_tokens and chart_tokens.get("input", 0) + chart_tokens.get("output", 0) > 0:
@@ -2534,10 +2607,10 @@ with tab3:
 
                                 except ImportError:
                                     st.warning("⚠️ chart_builder.py not found in project directory.")
-                                    st.dataframe(result.results, use_container_width=True)
+                                    st.dataframe(display_df, use_container_width=True)
                                 except Exception as e:
                                     print(f"[CHART] Unexpected error: {e}")
-                                    st.dataframe(result.results, use_container_width=True)
+                                    st.dataframe(display_df, use_container_width=True)
 
                                 st.markdown('</div>', unsafe_allow_html=True)
 
@@ -2555,7 +2628,7 @@ with tab3:
                                     pass
 
                             with data_tab:
-                                st.dataframe(result.results, use_container_width=True)
+                                st.dataframe(display_df, use_container_width=True)
                                 try:
                                     import io
                                     csv_buf = io.StringIO()
@@ -2571,7 +2644,7 @@ with tab3:
                                     pass
 
                         else:
-                            st.dataframe(result.results, use_container_width=True)
+                            st.dataframe(display_df, use_container_width=True)
                             try:
                                 import io
                                 csv_buf = io.StringIO()
@@ -2891,6 +2964,10 @@ with tab3:
                     "Analyzer Total Tokens": result.tokens.analyzer["input"] + result.tokens.analyzer["output"],
                     "Analysis Type": result.analyzer_data.plan.get("analysis_type", "") if (hasattr(result, 'analyzer_data') and result.analyzer_data) else "",
 
+                    # Summary (Issue 5)
+                    "Summary Input Tokens": _summary_tokens.get("input", 0),
+                    "Summary Output Tokens": _summary_tokens.get("output", 0),
+
                     # SQL & Results
                     "Generated SQL": result.sql,
                     "SQL Valid": "Yes" if result.validation_result and result.validation_result.get("is_valid", True) else "No",
@@ -3008,6 +3085,10 @@ with st.sidebar:
             "Analyzer Sub-queries",
             "Analyzer Total Tokens",
             "Analysis Type",
+
+            # Summary (Issue 5)
+            "Summary Input Tokens",
+            "Summary Output Tokens",
 
             # SQL & Results
             "Generated SQL",

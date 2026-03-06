@@ -50,6 +50,7 @@ Rules for decomposition:
 5. Apply the business rules provided when deciding what data to retrieve.
 6. Specify exactly what columns/aggregates each step returns so downstream steps can use them.
 7. Limit to at most 5 steps.
+8. Sub-questions must NEVER hardcode specific filter values like exact entity names, stage names, status values, or category names (e.g. do NOT write "Stage not equal to 'Closed Won'" or "status = 'Active'"). Instead, describe the INTENT of the filter in plain language (e.g. "exclude companies with a closed or lost status"). The pipeline's Entity Resolver will match the intent to the actual stored values in the database. Different databases store different values — hardcoded literals will fail on any database that uses different casing or naming conventions.
 
 Return a JSON object ONLY (no markdown, no explanation outside the JSON)."""
 
@@ -160,10 +161,17 @@ Return a JSON object ONLY:
   "abort_message": "Message to user if aborting (e.g. no data found)"
 }}
 
-Use "synthesize" if you have enough data to answer the original question.
-Use "abort" if the data shows the question cannot be answered (e.g. Step returned 0 rows).
-Use "modify" if remaining steps need to change based on what you learned.
-Use "proceed" to continue with remaining steps as-is."""
+CRITICAL: You must NOT use "synthesize" just because you think you have enough data.
+The decomposition plan was carefully designed — ALL planned steps are needed for a complete and analytically sound answer.
+
+Use "synthesize" ONLY in these specific cases:
+  (a) All planned steps are already complete (the remaining_steps list above is empty), OR
+  (b) A completed step returned 0 rows, making all remaining steps logically impossible (nothing to join/filter against), OR
+  (c) A completed step FAILED with an error AND the remaining steps explicitly depend on its output.
+
+Use "abort" if the data shows the question cannot be answered at all (e.g. the primary dataset returned 0 rows).
+Use "modify" if remaining steps need to change based on what you learned (e.g. a column name or value differs from expectation).
+Use "proceed" to continue with remaining steps as-is. This is the DEFAULT — use it unless one of the synthesize/abort/modify conditions above strictly applies. Do NOT skip steps just because you feel the data collected so far is sufficient."""
 
 
 def _build_synthesis_prompt(
@@ -694,6 +702,9 @@ class SQLAnalyzer:
         cfg.enable_analyzer = False        # prevent Analyzer re-entry
         cfg.enable_classification = False  # skip re-classification; use medium flow
         cfg.initial_classification = None  # clear any pre-computed result from the UI
+        # enable_opus_descriptions is intentionally inherited from the parent config
+        # (via copy.copy above) so sub-queries benefit from column descriptions if
+        # the parent config had them enabled.
         return cfg
 
     def _pick_next_step(
