@@ -91,6 +91,16 @@ IMPORTANT — table and column naming in sub_questions:
 - Good sub_question: "{good_example}"
 - Bad sub_question:  "{bad_example}"  ← missing schema prefix and exact column names
 
+IMPORTANT — filter values in sub_questions (applies to ALL steps equally):
+- NEVER hardcode specific filter values such as status names, stage names, entity names, category values, or any string literal that represents data stored in the database.
+- Instead, describe the INTENT of the filter in plain English. The pipeline's Entity Resolver will automatically match your intent to the actual values stored in this specific database.
+- The principle: if a filter value is a quoted string you invented or guessed, replace it with a plain-English description of what that value means.
+- Generic examples of the principle (apply the same logic to whatever tables/columns are in your schema):
+    ✗ Bad (hardcodes literals): "Get records where the status is 'Active' and the priority is 'High'"
+    ✓ Good (describes intent): "Get records that are currently active and flagged as high priority"
+    ✗ Bad (hardcodes literals): "Count rows where category is not 'Trial' and region equals 'West'"
+    ✓ Good (describes intent): "Count non-trial rows in the western region"
+
 Schema (exact table and column names to use):
 {bare_schema}
 
@@ -101,6 +111,7 @@ Break the question into simple sub-questions. Each sub-question must:
 • Be answerable with a single SQL query (no CTEs needed)
 • Name the exact schema-qualified table(s) involved
 • Name the exact column(s) involved
+• Describe any filters by INTENT in plain English — never by hardcoded string values
 
 Return this exact JSON structure:
 {{
@@ -110,7 +121,7 @@ Return this exact JSON structure:
     {{
       "step_id": 1,
       "description": "What this step computes",
-      "sub_question": "A specific question naming exact tables and columns from the schema above",
+      "sub_question": "A question naming exact tables/columns with filters described by intent, not by hardcoded values",
       "depends_on": [],
       "result_usage": "How this result will be used in later steps"
     }}
@@ -160,6 +171,11 @@ Return a JSON object ONLY:
   ],
   "abort_message": "Message to user if aborting (e.g. no data found)"
 }}
+
+IMPORTANT — if you use "modify" and rewrite any sub_questions:
+- Modified sub_questions MUST NOT hardcode filter values (status names, stage names, entity names, category values, or any string literal).
+- Describe filter INTENT in plain English only (e.g. "excluding closed or lost deals" not "Stage != 'Closed Won'").
+- The pipeline's Entity Resolver automatically matches intent to the actual values stored in the database.
 
 CRITICAL: You must NOT use "synthesize" just because you think you have enough data.
 The decomposition plan was carefully designed — ALL planned steps are needed for a complete and analytically sound answer.
