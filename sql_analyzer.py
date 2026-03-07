@@ -43,14 +43,14 @@ class AnalyzerResult:
 _DECOMPOSE_SYSTEM = """You are an expert SQL analyst. Your job is to break down complex analytical questions into simple sub-questions, where each sub-question can be answered by a single SQL query with no CTEs.
 
 Rules for decomposition:
-1. Each sub_question must be answerable with a single, non-nested SQL query.
-2. Do NOT combine multiple aggregations or multi-hop logic into one sub-question.
-3. Each sub_question MUST use the exact table name(s) with their schema prefix exactly as they appear in the schema (e.g. if the schema shows "public"."CRM", write "public.CRM" in the sub_question — never just "CRM" or "opportunities").
-4. Each sub_question MUST reference exact column names from the schema — use the column names as shown, never paraphrase them.
-5. Apply the business rules provided when deciding what data to retrieve.
-6. Specify exactly what columns/aggregates each step returns so downstream steps can use them.
-7. Limit to at most 5 steps.
-8. Sub-questions must NEVER hardcode specific filter values like exact entity names, stage names, status values, or category names (e.g. do NOT write "Stage not equal to 'Closed Won'" or "status = 'Active'"). Instead, describe the INTENT of the filter in plain language (e.g. "exclude companies with a closed or lost status"). The pipeline's Entity Resolver will match the intent to the actual stored values in the database. Different databases store different values — hardcoded literals will fail on any database that uses different casing or naming conventions.
+1. PRESERVE INTENT — If the user asks for "highest/top/best," the sub-question must include "ordered by [metric] descending, returning the top result." If "lowest/worst," order ascending. If "why/explain," include a dimensional breakdown step. Never neutralize a ranking question into a plain GROUP BY.
+2. MINIMIZE STEPS — Target 2–3 steps, max 5. Combine multiple breakdowns of the same entity from the same table into one step. Only separate steps when different tables are needed or a step's result is required as a filter for the next step.
+3. ANTICIPATE DATA — Open/pending records have future dates; closed/completed have past dates. Do not apply past-date filters to open records. If comparing actuals vs pipeline/forecast, plan for different source tables.
+4. EXACT REFERENCES — Use exact schema-prefixed table names and exact column names from the schema. Never paraphrase.
+5. NO HARDCODED VALUES — Describe filter intent in plain language, never hardcode literals. Exception: values returned by a previous step CAN be used literally since they came from the actual database.
+6. APPLY BUSINESS RULES — Provided business rules are mandatory constraints.
+7. SPECIFY RESULTS — State exact columns, aggregates, and sort order each step returns. If identifying a top/bottom entity, results must be sorted and limited so the entity is unambiguous.
+8. PLAN SYNTHESIS — If sub-query results directly answer the question, note that synthesis should narrate results (no new SQL needed). If a combining query is needed, plan steps to gather its inputs. Synthesis must never contradict sub-query findings.
 
 Return a JSON object ONLY (no markdown, no explanation outside the JSON)."""
 
@@ -141,6 +141,8 @@ def _build_inspect_prompt(
         completed_text += f"\nStep {item['step_id']}: {item['sub_question']}\n"
         completed_text += f"  SQL: {item.get('sql', 'N/A')}\n"
         completed_text += f"  Results: {item.get('results_summary', 'N/A')}\n"
+        if item.get('identified_entity'):
+            completed_text += f"  Identified entity: {item['identified_entity']}\n"
 
     remaining_text = json.dumps(remaining_steps, indent=2)
 
@@ -172,10 +174,15 @@ Return a JSON object ONLY:
   "abort_message": "Message to user if aborting (e.g. no data found)"
 }}
 
-IMPORTANT — if you use "modify" and rewrite any sub_questions:
-- Modified sub_questions MUST NOT hardcode filter values (status names, stage names, entity names, category values, or any string literal).
-- Describe filter INTENT in plain English only (e.g. "excluding closed or lost deals" not "Stage != 'Closed Won'").
-- The pipeline's Entity Resolver automatically matches intent to the actual values stored in the database.
+RULES FOR MODIFYING SUB-QUESTIONS (applies when decision = "modify"):
+- If a completed step has an "Identified entity" shown above, UPDATE remaining sub-questions
+  to use that exact value as a filter — it came from the database and is safe to use literally.
+- Modified sub-questions must NOT hardcode values that were NOT discovered by a prior step —
+  describe intent in plain language instead.
+- If a completed step returned 0 rows and its filters involved dates, check whether
+  the date filter was compatible with the record type (e.g., open/pipeline records have
+  future dates — don't filter them with < CURRENT_DATE). Modify the step to fix the filter
+  rather than aborting.
 
 CRITICAL: You must NOT use "synthesize" just because you think you have enough data.
 The decomposition plan was carefully designed — ALL planned steps are needed for a complete and analytically sound answer.
@@ -186,7 +193,7 @@ Use "synthesize" ONLY in these specific cases:
   (c) A completed step FAILED with an error AND the remaining steps explicitly depend on its output.
 
 Use "abort" if the data shows the question cannot be answered at all (e.g. the primary dataset returned 0 rows).
-Use "modify" if remaining steps need to change based on what you learned (e.g. a column name or value differs from expectation).
+Use "modify" if remaining steps need to change based on what you learned (e.g. a column name or value differs from expectation, or an identified entity should be substituted in).
 Use "proceed" to continue with remaining steps as-is. This is the DEFAULT — use it unless one of the synthesize/abort/modify conditions above strictly applies. Do NOT skip steps just because you feel the data collected so far is sufficient."""
 
 
@@ -204,6 +211,8 @@ def _build_synthesis_prompt(
         steps_text += f"\nStep {item['step_id']}: {item['sub_question']}\n"
         steps_text += f"  SQL used: {item.get('sql', 'N/A')}\n"
         steps_text += f"  Results summary: {item.get('results_summary', 'N/A')}\n"
+        if item.get('identified_entity'):
+            steps_text += f"  Identified entity: {item['identified_entity']}\n"
 
     return f"""Original question: {question}
 
@@ -214,15 +223,41 @@ Synthesis approach: {synthesis_approach}
 Sub-queries already validated and executed:
 {steps_text}
 
-Write a final sub_question that asks for the combined answer. The sub_question will be passed through a SQL generation pipeline, so it must:
-- Use exact schema-qualified table names as shown in the SQL above (e.g. "public"."CRM", not just "CRM")
-- Reference exact column names as they appear in the SQL above
-- Be specific enough that a SQL generator can produce the correct query from it
+STEP 1 — Choose synthesis type:
+- "narrate": Sub-query results already completely answer the question. No new SQL needed.
+  Choose when all steps hit the same table and the data returned is complete and unambiguous.
+- "cte": A new SQL query is needed to combine data from multiple tables or perform
+  cross-step calculations that the sub-queries alone cannot express.
+
+STEP 2 — Produce the result based on synthesis type:
+
+For "narrate":
+  Write a structured summary of the sub-query results that answers the original question.
+  Reference specific numbers and entities from the results shown above.
+  Do NOT write any SQL.
+
+For "cte":
+  Write the COMPLETE final SQL query directly — NOT a sub-question for another pipeline.
+  Rules for the SQL:
+  - Use exact table names and column names from the sub-query SQL shown above (copy them exactly)
+  - Must be consistent with sub-query findings (if sub-queries found Entity X as top, this SQL must also produce Entity X)
+  - Exactly ONE SQL statement — never multiple SELECTs separated by semicolons or otherwise
+  - Copy working WHERE clauses from the sub-query SQL; do not rewrite date logic differently
+  - For simulation/what-if queries, use this exact CTE pattern:
+      BASELINE CTE: Current metric per group with RANK()
+      ITEMS CTE: Items being simulated
+      SIMULATION CTE: CROSS JOIN baseline groups with items.
+        For each item, recalculate EVERY group's metric using CASE
+        (only the matching group gets modified, others stay at baseline).
+        Re-rank ALL groups per item: RANK() OVER (PARTITION BY item_id ORDER BY simulated_metric DESC)
+      COMPARISON: Filter to rows where the item's OWN group changed rank.
+        Use WHERE item.group_key = baseline.group_key AND simulated_rank <> baseline_rank
+        to avoid returning side-effect rows for other groups.
 
 Return ONLY a JSON object:
 {{
-  "synthesis_type": "single_query | cte",
-  "sub_question": "A specific question naming exact tables and columns, readable by a SQL generator",
+  "synthesis_type": "narrate | cte",
+  "result": "...narration text OR complete SQL depending on synthesis_type...",
   "reasoning": "Why this synthesis approach works"
 }}"""
 
@@ -247,18 +282,28 @@ def _summarise_results(query_result) -> str:
         if isinstance(results, pd.DataFrame):
             row_count = len(results)
             cols = list(results.columns)
-            sample_rows = results.head(5).to_dict(orient="records")
-            return (
-                f"Returned {row_count} row(s). Columns: {cols}. "
-                f"First {min(5, row_count)} rows: {sample_rows}"
-            )
+            if row_count <= 50:
+                all_rows = results.to_dict(orient="records")
+                return (
+                    f"Returned {row_count} row(s). Columns: {cols}. "
+                    f"All rows: {all_rows}"
+                )
+            else:
+                sample_rows = results.head(5).to_dict(orient="records")
+                return (
+                    f"Returned {row_count} row(s). Columns: {cols}. "
+                    f"First 5 of {row_count} rows: {sample_rows}"
+                )
     except ImportError:
         pass
 
     if isinstance(results, list):
         row_count = len(results)
-        sample = results[:5]
-        return f"Returned {row_count} row(s). Sample: {sample}"
+        if row_count <= 50:
+            return f"Returned {row_count} row(s). All rows: {results}"
+        else:
+            sample = results[:5]
+            return f"Returned {row_count} row(s). First 5 of {row_count}: {sample}"
 
     return f"Returned: {str(results)[:500]}"
 
@@ -403,6 +448,12 @@ class SQLAnalyzer:
                 "success": qr.success if qr else False,
                 "tokens": step_tokens,
             }
+
+            # Detect ranking queries and extract the identified entity for inspect context
+            identified_entity = self._identify_entity(sub_question, qr)
+            if identified_entity:
+                completed_item["identified_entity"] = identified_entity
+
             completed.append(completed_item)
             sub_queries.append(completed_item)
 
@@ -491,8 +542,11 @@ class SQLAnalyzer:
             _opus_enabled = _opus_raw.lower() in ("auto", "true")
         else:
             _opus_enabled = bool(_opus_raw)
-        if synthesis_sql and final_results is not None and _opus_enabled:
+        _has_narration = isinstance(final_results, str) and bool(final_results)
+        if (synthesis_sql or _has_narration) and _opus_enabled:
             try:
+                # For narrate synthesis: pass narration text as the content to verify.
+                # _run_opus_review accepts sql="" with results=narration_text for this case.
                 opus_out = _run_opus_review(
                     question=question,
                     sql=synthesis_sql,
@@ -641,7 +695,7 @@ class SQLAnalyzer:
             total_tokens["synthesis_execution"]["output"] += tok["output"]
             return qr.sql if qr else "", qr.results if qr else None
 
-        # Ask Analyzer to produce a synthesis sub-question
+        # Ask Analyzer to produce synthesis output (narrate or cte SQL)
         prompt = _build_synthesis_prompt(
             question=question,
             completed=completed,
@@ -651,7 +705,7 @@ class SQLAnalyzer:
 
         trace.append({"stage": "synthesis_plan_input", "prompt": prompt})
 
-        response, tok = call_llm(
+        raw_synthesis, tok = call_llm(
             prompt=prompt,
             provider=self._analyzer_provider,
         )
@@ -659,37 +713,95 @@ class SQLAnalyzer:
         total_tokens["synthesis_plan"]["input"] += tok.get("input", 0)
         total_tokens["synthesis_plan"]["output"] += tok.get("output", 0)
 
-        trace.append({"stage": "synthesis_plan_output", "response": response})
+        trace.append({"stage": "synthesis_plan_output", "response": raw_synthesis})
 
-        synthesis_obj = self._parse_json_response(
-            response,
-            default={"synthesis_type": "single_query", "sub_question": question},
-        )
+        synthesis_obj = self._parse_json_response(raw_synthesis, default=None)
+        synthesis_type = (synthesis_obj or {}).get("synthesis_type", "cte")
 
-        final_question = synthesis_obj.get("sub_question", question)
-        trace.append({"stage": "synthesis_execute", "final_question": final_question})
+        # ── Narrate path: sub-query results already answer the question ──────
+        if synthesis_type == "narrate":
+            narration = (synthesis_obj or {}).get("result", "")
+            trace.append({"stage": "synthesis_narrate", "narration": narration})
+            return "", narration
 
-        # Execute the synthesis question through the pipeline
-        sub_config = self._make_sub_config()
-        qr = process_query_fn(
-            question=final_question,
-            engine=self.engine,
-            vector_engine=self.vector_engine,
-            selected_tables=self.selected_tables,
-            config=sub_config,
-        )
+        # ── CTE path: synthesis LLM wrote a complete SQL query ────────────────
+        from sql_static_validator import validate_sql_static, build_tier1_mini_retry_prompt
+        from db import run_sql
 
-        tok = _extract_tokens(qr)
-        total_tokens["synthesis_execution"]["input"] += tok["input"]
-        total_tokens["synthesis_execution"]["output"] += tok["output"]
+        dialect = self.dialect_info.get("dialect", "postgresql") if self.dialect_info else "postgresql"
+        quote_char = self.dialect_info.get("quote_char", '"') if self.dialect_info else '"'
 
-        trace.append({
-            "stage": "synthesis_result",
-            "sql": qr.sql if qr else "",
-            "success": qr.success if qr else False,
-        })
+        synthesis_sql = self._extract_sql_from_response(raw_synthesis, synthesis_obj)
 
-        return (qr.sql if qr else ""), (qr.results if qr else None)
+        if not synthesis_sql:
+            # Fallback: nothing usable from synthesis LLM — return empty
+            trace.append({"stage": "synthesis_cte_no_sql"})
+            return "", None
+
+        trace.append({"stage": "synthesis_cte_sql", "sql": synthesis_sql})
+
+        # Tier 1 static validation + mini-retry
+        tier1_issues = validate_sql_static(sql=synthesis_sql, column_metadata={}, dialect=dialect)
+        if tier1_issues:
+            retry_prompt = build_tier1_mini_retry_prompt(synthesis_sql, tier1_issues, dialect, quote_char)
+            fixed_text, fix_tok = call_llm(prompt=retry_prompt, provider=self._analyzer_provider)
+            total_tokens["synthesis_plan"]["input"] += fix_tok.get("input", 0)
+            total_tokens["synthesis_plan"]["output"] += fix_tok.get("output", 0)
+            fixed_candidate = self._extract_sql_from_response(fixed_text, None)
+            if fixed_candidate:
+                synthesis_sql = fixed_candidate
+            trace.append({"stage": "synthesis_cte_tier1_fix", "sql": synthesis_sql})
+
+        # Execute directly — no medium pipeline re-routing
+        def _try_execute(sql: str):
+            return run_sql(self.engine, sql)
+
+        try:
+            df = _try_execute(synthesis_sql)
+            trace.append({"stage": "synthesis_result", "sql": synthesis_sql, "success": True})
+            return synthesis_sql, df
+        except Exception as exec_err:
+            trace.append({
+                "stage": "synthesis_cte_exec_error",
+                "error": str(exec_err),
+                "sql": synthesis_sql,
+            })
+
+            # ONE LLM retry on execution failure
+            retry_fix_prompt = (
+                f"The following {dialect.upper()} SQL failed with error:\n{exec_err}\n\n"
+                f"SQL:\n{synthesis_sql}\n\n"
+                "Fix the SQL to resolve the error. Return ONLY the corrected SQL. No explanation."
+            )
+            fixed_text, retry_tok = call_llm(prompt=retry_fix_prompt, provider=self._analyzer_provider)
+            total_tokens["synthesis_plan"]["input"] += retry_tok.get("input", 0)
+            total_tokens["synthesis_plan"]["output"] += retry_tok.get("output", 0)
+
+            fixed_sql = self._extract_sql_from_response(fixed_text, None) or synthesis_sql
+
+            # Re-validate before retry execute
+            tier1_retry = validate_sql_static(sql=fixed_sql, column_metadata={}, dialect=dialect)
+            if tier1_retry:
+                mini = build_tier1_mini_retry_prompt(fixed_sql, tier1_retry, dialect, quote_char)
+                fixed_text2, mini_tok = call_llm(prompt=mini, provider=self._analyzer_provider)
+                total_tokens["synthesis_plan"]["input"] += mini_tok.get("input", 0)
+                total_tokens["synthesis_plan"]["output"] += mini_tok.get("output", 0)
+                candidate2 = self._extract_sql_from_response(fixed_text2, None)
+                if candidate2:
+                    fixed_sql = candidate2
+
+            try:
+                df = _try_execute(fixed_sql)
+                synthesis_sql = fixed_sql
+                trace.append({"stage": "synthesis_cte_retry_success", "sql": synthesis_sql})
+                return synthesis_sql, df
+            except Exception as retry_err:
+                trace.append({
+                    "stage": "synthesis_cte_retry_failed",
+                    "error": str(retry_err),
+                    "sql": fixed_sql,
+                })
+                return synthesis_sql, None
 
     # ------------------------------------------------------------------
     # Utilities
@@ -759,6 +871,102 @@ class SQLAnalyzer:
 
         context_block = " ".join(dep_summaries)
         return f"{step['sub_question']} (Additional context: {context_block})"
+
+    @staticmethod
+    def _extract_sql_from_response(raw_response: str, parsed_obj: Optional[Dict]) -> str:
+        """
+        Extract complete SQL from a synthesis LLM response.
+
+        Clean path: parsed_obj["result"] if available.
+        Dirty path (broken JSON from unescaped double-quotes in SQL):
+          Scan raw_response for the first WITH or SELECT keyword at word boundary
+          and extract from that point to end, stripping trailing JSON artifacts.
+        Also strips markdown fences in both paths.
+        """
+        import re as _re
+
+        def _strip_fences(text: str) -> str:
+            text = text.strip()
+            if text.startswith("```"):
+                lines = text.splitlines()
+                # Drop opening fence line
+                inner = lines[1:] if lines[0].startswith("```") else lines
+                # Drop closing fence line
+                if inner and inner[-1].strip() == "```":
+                    inner = inner[:-1]
+                text = "\n".join(inner).strip()
+            return text
+
+        # Clean path
+        if parsed_obj and isinstance(parsed_obj.get("result"), str):
+            candidate = parsed_obj["result"].strip()
+            if candidate:
+                return _strip_fences(candidate)
+
+        # Dirty path — scan raw response for SQL start
+        m = _re.search(r'\b(WITH|SELECT)\b', raw_response, _re.IGNORECASE)
+        if m:
+            sql_candidate = raw_response[m.start():]
+            # Strip trailing JSON artifacts: "}", "})", '"', newlines
+            sql_candidate = _re.sub(r'[\s"}\)]+$', '', sql_candidate).strip()
+            if sql_candidate:
+                return _strip_fences(sql_candidate)
+
+        return ""
+
+    @staticmethod
+    def _identify_entity(sub_question: str, query_result) -> Optional[str]:
+        """
+        If a sub-question is a ranking/top/bottom query and results are non-empty,
+        extract the identified entity from the first result row.
+
+        Returns a string like "KAM Name = Arjun Vt" or None if not applicable.
+        """
+        if not query_result or not query_result.success:
+            return None
+
+        import re as _re
+        ranking_pattern = _re.compile(
+            r'\b(highest|top|best|lowest|worst|ordered by.*descending|returning the top)\b',
+            _re.IGNORECASE,
+        )
+        if not ranking_pattern.search(sub_question):
+            return None
+
+        results = query_result.results
+        if results is None:
+            return None
+
+        # Get first row as a dict
+        first_row: Optional[Dict] = None
+        try:
+            import pandas as pd
+            if isinstance(results, pd.DataFrame) and not results.empty:
+                first_row = results.iloc[0].to_dict()
+        except ImportError:
+            pass
+
+        if first_row is None and isinstance(results, list) and results:
+            row = results[0]
+            if isinstance(row, dict):
+                first_row = row
+            elif hasattr(row, '_asdict'):
+                first_row = row._asdict()
+
+        if not first_row:
+            return None
+
+        # Find the first column whose value is a non-numeric, non-None string
+        for col, val in first_row.items():
+            if val is None:
+                continue
+            if isinstance(val, str) and val.strip():
+                return f"{col} = {val}"
+            # Skip numeric types
+            if isinstance(val, (int, float)):
+                continue
+
+        return None
 
     @staticmethod
     def _parse_json_response(response: str, default: Any = None) -> Any:

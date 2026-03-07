@@ -12,6 +12,7 @@ Issue types:
   group_by_incomplete   - Non-aggregated SELECT column missing from GROUP BY
   missing_mandatory_filter - Required filter column absent from WHERE/HAVING
   quote_style           - Identifier quoting doesn't match the dialect
+  multiple_statements   - SQL contains more than one statement
 """
 
 import re
@@ -124,6 +125,9 @@ def validate_sql_static(
     if mandatory_columns:
         issues.extend(_check_mandatory_filters(sql, mandatory_columns))
 
+    # 6. Multiple statements check (always run)
+    issues.extend(_check_multiple_statements(sql))
+
     return issues
 
 
@@ -159,6 +163,55 @@ def build_tier1_mini_retry_prompt(
 def _strip_string_literals(sql: str) -> str:
     """Replace single-quoted string literals with '' to avoid false matches."""
     return re.sub(r"'(?:[^'\\]|\\.)*'", "''", sql)
+
+
+def _remove_paren_content(text: str) -> str:
+    """Iteratively replace (...) with () to expose top-level structure."""
+    result = text
+    prev = None
+    while prev != result:
+        prev = result
+        result = re.sub(r'\([^()]*\)', '()', result)
+    return result
+
+
+def _check_multiple_statements(sql: str) -> List[StaticIssue]:
+    """Flag SQL that contains more than one complete statement."""
+    sql_no_strings = _strip_string_literals(sql)
+    stmt_re = re.compile(r'^\s*(SELECT|WITH|INSERT|UPDATE|DELETE)\b', re.IGNORECASE)
+
+    # Case 1: multiple statements separated by semicolons
+    parts = [p.strip() for p in sql_no_strings.split(';') if p.strip()]
+    statements = [p for p in parts if stmt_re.match(p)]
+    if len(statements) > 1:
+        return [StaticIssue(
+            issue_type="multiple_statements",
+            location="full query",
+            column="",
+            column_type="",
+            detail=(
+                "SQL contains multiple statements separated by semicolons. "
+                "Only a single SELECT/WITH...SELECT statement is allowed."
+            ),
+        )]
+
+    # Case 2: two top-level SELECT clauses without a semicolon separator
+    # (e.g. a CTE followed by an orphan SELECT)
+    cleaned = _remove_paren_content(sql_no_strings)
+    top_level_selects = len(re.findall(r'\bSELECT\b', cleaned, re.IGNORECASE))
+    if top_level_selects > 1:
+        return [StaticIssue(
+            issue_type="multiple_statements",
+            location="full query",
+            column="",
+            column_type="",
+            detail=(
+                "SQL contains multiple top-level SELECT statements. "
+                "Only one SELECT statement is allowed (WITH...AS(...) SELECT counts as one)."
+            ),
+        )]
+
+    return []
 
 
 def _check_quote_style(sql: str, dialect: str) -> List[StaticIssue]:
