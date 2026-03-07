@@ -1183,7 +1183,12 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
             analyzer_result = analyzer.analyze(question)
             result.sql = analyzer_result.synthesis_sql
             result.results = analyzer_result.final_results
-            result.success = bool(analyzer_result.synthesis_sql and analyzer_result.final_results is not None)
+            # Narrate synthesis returns empty SQL + narration string — treat as success
+            _narrate = isinstance(analyzer_result.final_results, str) and bool(analyzer_result.final_results)
+            result.success = bool(
+                (analyzer_result.synthesis_sql and analyzer_result.final_results is not None)
+                or _narrate
+            )
             result.opus_verdict = analyzer_result.opus_verdict
             # Store full analyzer result for per-stage token display and debug tab
             result.analyzer_data = analyzer_result
@@ -1330,13 +1335,19 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
         )
 
         if _analysis_already_executed:
-            is_safe, safety_reason = is_safe_query(result.sql)
-            if not is_safe:
-                result.success = False
-                result.error = f"Query blocked: {safety_reason}"
-                result.stages_completed.append("execution_blocked")
+            # Narrate synthesis: no SQL was generated — the narration IS the answer.
+            # Skip the SQL safety gate entirely; there is nothing to execute.
+            _is_narrate = not result.sql and isinstance(result.results, str)
+            if _is_narrate:
+                result.stages_completed.append("execution_narrated")
             else:
-                result.stages_completed.append("execution")
+                is_safe, safety_reason = is_safe_query(result.sql)
+                if not is_safe:
+                    result.success = False
+                    result.error = f"Query blocked: {safety_reason}"
+                    result.stages_completed.append("execution_blocked")
+                else:
+                    result.stages_completed.append("execution")
             result.stage_times["execution"] = int((time.time() - stage_start) * 1000)
         else:
             is_safe, safety_reason = is_safe_query(result.sql)

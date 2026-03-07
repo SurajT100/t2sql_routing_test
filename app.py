@@ -2500,7 +2500,11 @@ with tab3:
                 # ───────────────────────────────────────────────────────────
                 st.divider()
                 st.subheader("💻 Generated SQL")
-                st.code(result.sql, language="sql")
+                _is_narrate_result = not result.sql and isinstance(result.results, str)
+                if _is_narrate_result:
+                    st.info("No SQL generated — answer narrated directly from sub-query results.")
+                else:
+                    st.code(result.sql, language="sql")
                 
                 
                 # ───────────────────────────────────────────────────────────
@@ -2530,8 +2534,11 @@ with tab3:
                     # Show the SQL Opus reviewed — guaranteed to match result.sql
                     # because flow_router now runs Opus AFTER all validation and
                     # auto-fix stages complete. No more stale-draft problem.
-                    st.write("**📋 SQL reviewed by Opus:**")
-                    st.code(result.sql, language="sql")
+                    if result.sql:
+                        st.write("**📋 SQL reviewed by Opus:**")
+                        st.code(result.sql, language="sql")
+                    else:
+                        st.write("**📋 Opus reviewed the narrated answer (no SQL).**")
                 
                 # ───────────────────────────────────────────────────────────
                 # QUERY RESULTS
@@ -2540,7 +2547,14 @@ with tab3:
                 st.subheader("📈 Query Results")
 
                 if result.success:
-                    if result.results is not None and hasattr(result.results, 'shape'):
+                    if result.results is not None and isinstance(result.results, str):
+                        # Narrate synthesis — display as formatted analysis text
+                        if _summary_text:
+                            st.markdown("### 📊 Analysis Summary")
+                            st.info(_summary_text)
+                        st.markdown("### 📝 Analysis")
+                        st.markdown(result.results)
+                    elif result.results is not None and hasattr(result.results, 'shape'):
 
                         # ── Analysis Summary (Issue 5) ─────────────────────
                         if _summary_text:
