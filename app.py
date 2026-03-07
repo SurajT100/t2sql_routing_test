@@ -2845,67 +2845,147 @@ with tab3:
                             st.info("Opus error fix not needed for this query")
 
                     with llm_tabs[8]:  # Analyzer Agent
-                        if hasattr(result, 'analyzer_data') and result.analyzer_data:
-                            ar = result.analyzer_data
-                            st.write(f"**Analysis type:** {ar.plan.get('analysis_type', 'unknown')} | "
-                                     f"**Opus verdict:** {ar.opus_verdict} | "
-                                     f"**Sub-queries:** {len(ar.sub_queries)}")
-                            st.caption(f"*Reasoning: {ar.plan.get('reasoning', '')}*")
-                            st.divider()
-
-                            # Decomposition plan
-                            st.write("### 🗂️ Decomposition Plan")
-                            for step in ar.plan.get("steps", []):
-                                st.write(f"**Step {step['step_id']}:** {step.get('description', '')}")
-                                st.write(f"  *Sub-question:* {step.get('sub_question', '')}")
-                                if step.get("depends_on"):
-                                    st.write(f"  *Depends on:* {step['depends_on']}")
-                                st.write(f"  *Result usage:* {step.get('result_usage', '')}")
-                            st.write(f"**Synthesis approach:** {ar.plan.get('synthesis_approach', '')}")
-                            st.divider()
-
-                            # Each sub-query
-                            st.write("### 🔍 Sub-queries")
-                            for sq in ar.sub_queries:
-                                success_icon = "✅" if sq.get("success") else "❌"
-                                st.write(f"**{success_icon} Step {sq['step_id']}:** {sq['sub_question']}")
-                                if sq.get("sql"):
-                                    st.code(sq["sql"], language="sql")
-                                st.caption(f"Results: {sq.get('results_summary', 'N/A')}")
-                                tok = sq.get("tokens", {})
-                                if tok.get("input", 0) + tok.get("output", 0) > 0:
-                                    st.caption(f"Tokens — input: {tok.get('input', 0):,}  output: {tok.get('output', 0):,}")
-                                st.divider()
-
-                            # Inspect decisions
-                            inspect_entries = [e for e in ar.trace if e.get("stage") in ("inspect_input", "inspect_output", "modify_plan", "early_synthesize", "abort")]
-                            if inspect_entries:
-                                st.write("### 🧠 Analyzer Decisions")
-                                for entry in inspect_entries:
-                                    stage = entry["stage"]
-                                    if stage == "inspect_output":
-                                        st.write(f"**Decision:** {entry.get('response', '')[:500]}")
-                                    elif stage == "modify_plan":
-                                        st.write(f"**Plan modified:** {entry.get('updated_steps', '')}")
-                                    elif stage == "early_synthesize":
-                                        st.success(f"Early synthesis triggered: {entry.get('reason', '')}")
-                                    elif stage == "abort":
-                                        st.error(f"Aborted: {entry.get('reason', '')}")
-                                st.divider()
-
-                            # Synthesis step
-                            st.write("### 🔗 Synthesis")
-                            synth_entry = next((e for e in ar.trace if e.get("stage") == "synthesis_plan_output"), None)
-                            if synth_entry:
-                                st.write(f"Synthesis plan: {synth_entry.get('response', '')[:500]}")
-                            final_entry = next((e for e in ar.trace if e.get("stage") == "synthesis_result"), None)
-                            if final_entry:
-                                status_icon = "✅" if final_entry.get("success") else "❌"
-                                st.write(f"{status_icon} Final SQL generated")
-                                if ar.synthesis_sql:
-                                    st.code(ar.synthesis_sql, language="sql")
-                        else:
+                        if not (hasattr(result, 'analyzer_data') and result.analyzer_data):
                             st.info("Analyzer Agent not used for this query (non-analysis complexity)")
+                        else:
+                            ar = result.analyzer_data
+                            _ar_trace = ar.trace
+                            _sub_qs = ar.sub_queries
+
+                            # Collect ordered inspect I/O entries for positional pairing
+                            _inspect_inputs  = [e for e in _ar_trace if e.get("stage") == "inspect_input"]
+                            _inspect_outputs = [e for e in _ar_trace if e.get("stage") == "inspect_output"]
+
+                            # Build dynamic tab name list
+                            _tab_names = ["🗂️ Decompose"]
+                            for _i, _sq in enumerate(_sub_qs):
+                                _tab_names.append(f"🔍 Step {_sq['step_id']}")
+                                if _i < len(_inspect_inputs):
+                                    _tab_names.append(f"🧠 Inspect {_sq['step_id']}")
+
+                            _has_synthesis = any(
+                                e.get("stage") in ("synthesis_plan_input", "synthesis_narrate", "synthesis", "synthesis_cte_sql")
+                                for e in _ar_trace
+                            )
+                            if _has_synthesis:
+                                _tab_names.append("🔗 Synthesis")
+
+                            _has_opus_an = any(e.get("stage") == "opus_review" for e in _ar_trace)
+                            if _has_opus_an:
+                                _tab_names.append("🎯 Opus Review")
+
+                            _sub_tabs = st.tabs(_tab_names)
+                            _tab_i = 0
+
+                            # ── Decompose ────────────────────────────────────
+                            with _sub_tabs[_tab_i]:
+                                _tab_i += 1
+                                _dec_in  = next((e for e in _ar_trace if e.get("stage") == "decompose_input"),  None)
+                                _dec_out = next((e for e in _ar_trace if e.get("stage") == "decompose_output"), None)
+                                if _dec_in and _dec_in.get("system_prompt"):
+                                    st.write("**📥 SYSTEM PROMPT:**")
+                                    st.text_area("Decompose System", _dec_in["system_prompt"], height=300, key=f"an_dec_sys_{_qc}")
+                                if _dec_in:
+                                    st.write("**📥 USER PROMPT (schema + rules + question):**")
+                                    st.text_area("Decompose User", _dec_in.get("prompt", ""), height=400, key=f"an_dec_in_{_qc}")
+                                if _dec_out:
+                                    st.write("**📤 OUTPUT (plan JSON):**")
+                                    st.text_area("Decompose Output", _dec_out.get("response", ""), height=200, key=f"an_dec_out_{_qc}")
+
+                            # ── Step + Inspect tab pairs ──────────────────────
+                            for _i, _sq in enumerate(_sub_qs):
+                                with _sub_tabs[_tab_i]:
+                                    _tab_i += 1
+                                    _lt = _sq.get("llm_trace")
+
+                                    with st.expander("📥 Pass 1 — Column Identification", expanded=True):
+                                        if _lt and getattr(_lt, "reasoning_pass1_input", ""):
+                                            st.text_area("Pass 1 Input", _lt.reasoning_pass1_input, height=300, key=f"an_p1_in_{_i}_{_qc}")
+                                            st.write("**📤 Pass 1 Output:**")
+                                            st.text_area("Pass 1 Output", _lt.reasoning_pass1_output, height=150, key=f"an_p1_out_{_i}_{_qc}")
+                                        else:
+                                            st.info("Pass 1 data not available")
+
+                                    with st.expander("🔍 Context Agent — Resolver + Column Metadata", expanded=False):
+                                        if _lt and getattr(_lt, "resolver_summary", ""):
+                                            st.text_area("Resolver Summary", _lt.resolver_summary, height=200, key=f"an_res_{_i}_{_qc}")
+                                        else:
+                                            st.info("Context Agent data not available")
+
+                                    with st.expander("📥 Pass 2 — Full Query Plan", expanded=True):
+                                        if _lt and getattr(_lt, "reasoning_pass2_input", ""):
+                                            st.text_area("Pass 2 Input", _lt.reasoning_pass2_input, height=300, key=f"an_p2_in_{_i}_{_qc}")
+                                            st.write("**📤 Pass 2 Output:**")
+                                            st.text_area("Pass 2 Output", _lt.reasoning_pass2_output, height=150, key=f"an_p2_out_{_i}_{_qc}")
+                                        else:
+                                            st.info("Pass 2 data not available")
+
+                                    with st.expander("⚙️ SQL Coder", expanded=True):
+                                        if _lt and getattr(_lt, "sql_gen_input", ""):
+                                            st.text_area("SQL Coder Input", _lt.sql_gen_input, height=300, key=f"an_sql_in_{_i}_{_qc}")
+                                            st.write("**📤 SQL Coder Output:**")
+                                            st.text_area("SQL Coder Output", _lt.sql_gen_output, height=150, key=f"an_sql_out_{_i}_{_qc}")
+                                        else:
+                                            st.info("SQL Coder data not available")
+
+                                    with st.expander("🗄️ Execution Result", expanded=False):
+                                        if _sq.get("sql"):
+                                            st.write("**SQL executed:**")
+                                            st.code(_sq["sql"], language="sql")
+                                        st.write(f"**Results:** {_sq.get('results_summary', 'N/A')}")
+                                        if _sq.get("identified_entity"):
+                                            st.success(f"**Identified entity:** {_sq['identified_entity']}")
+                                        _tok = _sq.get("tokens", {})
+                                        if _tok.get("input", 0) + _tok.get("output", 0) > 0:
+                                            st.caption(f"Tokens — input: {_tok.get('input', 0):,}  output: {_tok.get('output', 0):,}")
+
+                                # Inspect tab paired with this step (if one exists)
+                                if _i < len(_inspect_inputs):
+                                    with _sub_tabs[_tab_i]:
+                                        _tab_i += 1
+                                        st.write("**📥 INPUT PROMPT:**")
+                                        st.text_area("Inspect Input", _inspect_inputs[_i].get("prompt", ""), height=400, key=f"an_ins_in_{_i}_{_qc}")
+                                        if _i < len(_inspect_outputs):
+                                            st.write("**📤 OUTPUT (decision JSON):**")
+                                            st.text_area("Inspect Output", _inspect_outputs[_i].get("response", ""), height=200, key=f"an_ins_out_{_i}_{_qc}")
+
+                            # ── Synthesis ─────────────────────────────────────
+                            if _has_synthesis:
+                                with _sub_tabs[_tab_i]:
+                                    _tab_i += 1
+                                    _syn_in      = next((e for e in _ar_trace if e.get("stage") == "synthesis_plan_input"),  None)
+                                    _syn_out     = next((e for e in _ar_trace if e.get("stage") == "synthesis_plan_output"), None)
+                                    _syn_narrate = next((e for e in _ar_trace if e.get("stage") == "synthesis_narrate"),     None)
+                                    _syn_direct  = next((e for e in _ar_trace if e.get("stage") == "synthesis"),             None)
+                                    if _syn_direct:
+                                        st.info(f"Single-step synthesis — sub-query result used directly ({_syn_direct.get('type', '')})")
+                                    if _syn_in:
+                                        st.write("**📥 INPUT PROMPT:**")
+                                        st.text_area("Synthesis Input", _syn_in.get("prompt", ""), height=400, key=f"an_syn_in_{_qc}")
+                                    if _syn_out:
+                                        st.write("**📤 OUTPUT (narrate text or CTE SQL JSON):**")
+                                        st.text_area("Synthesis Output", _syn_out.get("response", ""), height=200, key=f"an_syn_out_{_qc}")
+                                    if _syn_narrate:
+                                        st.write("**📝 Narration produced:**")
+                                        st.text_area("Narration", _syn_narrate.get("narration", ""), height=200, key=f"an_syn_narrate_{_qc}")
+                                    if ar.synthesis_sql:
+                                        st.write("**Final SQL:**")
+                                        st.code(ar.synthesis_sql, language="sql")
+
+                            # ── Opus Review ───────────────────────────────────
+                            if _has_opus_an:
+                                with _sub_tabs[_tab_i]:
+                                    _opus_entry = next((e for e in _ar_trace if e.get("stage") == "opus_review"), None)
+                                    if _opus_entry:
+                                        if _opus_entry.get("input_prompt"):
+                                            st.write("**📥 INPUT PROMPT:**")
+                                            st.text_area("Opus Input", _opus_entry["input_prompt"], height=400, key=f"an_opus_in_{_qc}")
+                                        if _opus_entry.get("raw_response"):
+                                            st.write("**📤 OUTPUT:**")
+                                            st.text_area("Opus Output", _opus_entry["raw_response"], height=200, key=f"an_opus_out_{_qc}")
+                                        st.write(f"**Verdict:** {_opus_entry.get('verdict', 'N/A')}")
+                                        if _opus_entry.get("reasoning"):
+                                            st.write(f"**Reasoning:** {_opus_entry['reasoning']}")
                 # ───────────────────────────────────────────────────────────
                 # LOG QUERY - COMPREHENSIVE TRACKING
                 # ───────────────────────────────────────────────────────────

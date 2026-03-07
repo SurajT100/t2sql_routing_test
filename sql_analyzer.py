@@ -454,6 +454,10 @@ class SQLAnalyzer:
             if identified_entity:
                 completed_item["identified_entity"] = identified_entity
 
+            # Store sub-query LLM trace for the Analyzer debug tab
+            if qr and hasattr(qr, 'llm_trace'):
+                completed_item["llm_trace"] = qr.llm_trace
+
             completed.append(completed_item)
             sub_queries.append(completed_item)
 
@@ -565,6 +569,8 @@ class SQLAnalyzer:
                     "stage": "opus_review",
                     "verdict": opus_verdict,
                     "reasoning": opus_out.get("final_review", {}).get("reasoning", ""),
+                    "input_prompt": opus_out.get("trace_opus_input", ""),
+                    "raw_response": opus_out.get("trace_opus_output", ""),
                 })
             except Exception as e:
                 trace.append({"stage": "opus_review_error", "error": str(e)})
@@ -598,7 +604,7 @@ class SQLAnalyzer:
             dialect_info=self.dialect_info,
         )
 
-        trace.append({"stage": "decompose_input", "prompt": prompt})
+        trace.append({"stage": "decompose_input", "prompt": prompt, "system_prompt": _DECOMPOSE_SYSTEM})
 
         response, tok = call_llm(
             prompt=prompt,
