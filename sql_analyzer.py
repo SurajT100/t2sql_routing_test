@@ -47,7 +47,7 @@ Rules for decomposition:
 2. MINIMIZE STEPS — Target 2–3 steps, max 5. Combine multiple breakdowns of the same entity from the same table into one step. Only separate steps when different tables are needed or a step's result is required as a filter for the next step.
 3. ANTICIPATE DATA — Open/pending records have future dates; closed/completed have past dates. Do not apply past-date filters to open records. If comparing actuals vs pipeline/forecast, plan for different source tables.
 4. EXACT REFERENCES — Use exact schema-prefixed table names and exact column names from the schema. Never paraphrase.
-5. NO HARDCODED VALUES — Describe filter intent in plain language, never hardcode literals. Exception: values returned by a previous step CAN be used literally since they came from the actual database.
+5. PRESERVE FILTER VALUES — Always include entity names, codes, or values the user typed in the question verbatim in the sub_question (e.g. "Dell", "John Smith", "HR dept"). These values must appear as-is so the entity resolver can look them up in the live database. Never hardcode date literals, numeric thresholds, or SQL-style expressions. Values returned by a previous step can also be used literally.
 6. APPLY BUSINESS RULES — Provided business rules are mandatory constraints.
 7. SPECIFY RESULTS — State exact columns, aggregates, and sort order each step returns. If identifying a top/bottom entity, results must be sorted and limited so the entity is unambiguous.
 8. PLAN SYNTHESIS — If sub-query results directly answer the question, note that synthesis should narrate results (no new SQL needed). If a combining query is needed, plan steps to gather its inputs. Synthesis must never contradict sub-query findings.

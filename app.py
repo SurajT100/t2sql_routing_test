@@ -2877,7 +2877,7 @@ with tab3:
                             _sub_tabs = st.tabs(_tab_names)
                             _tab_i = 0
 
-                            # ── Plan Overview (original structured summary) ───
+                            # ── Plan Overview (full original summary) ────────
                             with _sub_tabs[_tab_i]:
                                 _tab_i += 1
                                 st.write(
@@ -2887,14 +2887,58 @@ with tab3:
                                 )
                                 st.caption(f"*Reasoning: {ar.plan.get('reasoning', '')}*")
                                 st.divider()
-                                st.write("### 🗂️ Decomposition Steps")
-                                for _step in ar.plan.get("steps", []):
-                                    st.write(f"**Step {_step['step_id']}:** {_step.get('description', '')}")
-                                    st.write(f"  *Sub-question:* {_step.get('sub_question', '')}")
-                                    if _step.get("depends_on"):
-                                        st.write(f"  *Depends on:* {_step['depends_on']}")
-                                    st.write(f"  *Result usage:* {_step.get('result_usage', '')}")
+
+                                # Decomposition plan
+                                st.write("### 🗂️ Decomposition Plan")
+                                for _plan_step in ar.plan.get("steps", []):
+                                    st.write(f"**Step {_plan_step['step_id']}:** {_plan_step.get('description', '')}")
+                                    st.write(f"  *Sub-question:* {_plan_step.get('sub_question', '')}")
+                                    if _plan_step.get("depends_on"):
+                                        st.write(f"  *Depends on:* {_plan_step['depends_on']}")
+                                    st.write(f"  *Result usage:* {_plan_step.get('result_usage', '')}")
                                 st.write(f"**Synthesis approach:** {ar.plan.get('synthesis_approach', '')}")
+                                st.divider()
+
+                                # Each sub-query result
+                                st.write("### 🔍 Sub-queries")
+                                for _plan_sq in ar.sub_queries:
+                                    _plan_icon = "✅" if _plan_sq.get("success") else "❌"
+                                    st.write(f"**{_plan_icon} Step {_plan_sq['step_id']}:** {_plan_sq['sub_question']}")
+                                    if _plan_sq.get("sql"):
+                                        st.code(_plan_sq["sql"], language="sql")
+                                    st.caption(f"Results: {_plan_sq.get('results_summary', 'N/A')}")
+                                    _plan_tok = _plan_sq.get("tokens", {})
+                                    if _plan_tok.get("input", 0) + _plan_tok.get("output", 0) > 0:
+                                        st.caption(f"Tokens — input: {_plan_tok.get('input', 0):,}  output: {_plan_tok.get('output', 0):,}")
+                                    st.divider()
+
+                                # Inspect decisions
+                                _plan_decisions = [e for e in _ar_trace if e.get("stage") in ("inspect_output", "modify_plan", "early_synthesize", "abort")]
+                                if _plan_decisions:
+                                    st.write("### 🧠 Analyzer Decisions")
+                                    for _plan_entry in _plan_decisions:
+                                        _plan_stage = _plan_entry["stage"]
+                                        if _plan_stage == "inspect_output":
+                                            st.write(f"**Decision:** {_plan_entry.get('response', '')[:500]}")
+                                        elif _plan_stage == "modify_plan":
+                                            st.write(f"**Plan modified:** {_plan_entry.get('updated_steps', '')}")
+                                        elif _plan_stage == "early_synthesize":
+                                            st.success(f"Early synthesis triggered: {_plan_entry.get('reason', '')}")
+                                        elif _plan_stage == "abort":
+                                            st.error(f"Aborted: {_plan_entry.get('reason', '')}")
+                                    st.divider()
+
+                                # Synthesis
+                                st.write("### 🔗 Synthesis")
+                                _plan_synth = next((e for e in _ar_trace if e.get("stage") == "synthesis_plan_output"), None)
+                                if _plan_synth:
+                                    st.write(f"Synthesis plan: {_plan_synth.get('response', '')[:500]}")
+                                _plan_final = next((e for e in _ar_trace if e.get("stage") == "synthesis_result"), None)
+                                if _plan_final:
+                                    _plan_status = "✅" if _plan_final.get("success") else "❌"
+                                    st.write(f"{_plan_status} Final SQL generated")
+                                    if ar.synthesis_sql:
+                                        st.code(ar.synthesis_sql, language="sql")
 
                             # ── Decompose ────────────────────────────────────
                             with _sub_tabs[_tab_i]:
@@ -2928,6 +2972,8 @@ with tab3:
                                     with st.expander("🔍 Context Agent — Resolver + Column Metadata", expanded=False):
                                         if _lt and getattr(_lt, "resolver_summary", ""):
                                             st.text_area("Resolver Summary", _lt.resolver_summary, height=200, key=f"an_res_{_i}_{_qc}")
+                                        elif _lt and getattr(_lt, "reasoning_pass1_output", ""):
+                                            st.info("Resolver: no string filter columns identified by Pass 1 — entity resolution skipped for this sub-query")
                                         else:
                                             st.info("Context Agent data not available")
 
