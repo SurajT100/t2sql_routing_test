@@ -2857,7 +2857,7 @@ with tab3:
                             _inspect_outputs = [e for e in _ar_trace if e.get("stage") == "inspect_output"]
 
                             # Build dynamic tab name list
-                            _tab_names = ["🗂️ Decompose"]
+                            _tab_names = ["📋 Plan", "🗂️ Decompose"]
                             for _i, _sq in enumerate(_sub_qs):
                                 _tab_names.append(f"🔍 Step {_sq['step_id']}")
                                 if _i < len(_inspect_inputs):
@@ -2876,6 +2876,25 @@ with tab3:
 
                             _sub_tabs = st.tabs(_tab_names)
                             _tab_i = 0
+
+                            # ── Plan Overview (original structured summary) ───
+                            with _sub_tabs[_tab_i]:
+                                _tab_i += 1
+                                st.write(
+                                    f"**Analysis type:** {ar.plan.get('analysis_type', 'unknown')} | "
+                                    f"**Opus verdict:** {ar.opus_verdict} | "
+                                    f"**Sub-queries:** {len(ar.sub_queries)}"
+                                )
+                                st.caption(f"*Reasoning: {ar.plan.get('reasoning', '')}*")
+                                st.divider()
+                                st.write("### 🗂️ Decomposition Steps")
+                                for _step in ar.plan.get("steps", []):
+                                    st.write(f"**Step {_step['step_id']}:** {_step.get('description', '')}")
+                                    st.write(f"  *Sub-question:* {_step.get('sub_question', '')}")
+                                    if _step.get("depends_on"):
+                                        st.write(f"  *Depends on:* {_step['depends_on']}")
+                                    st.write(f"  *Result usage:* {_step.get('result_usage', '')}")
+                                st.write(f"**Synthesis approach:** {ar.plan.get('synthesis_approach', '')}")
 
                             # ── Decompose ────────────────────────────────────
                             with _sub_tabs[_tab_i]:
