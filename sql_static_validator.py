@@ -195,21 +195,31 @@ def _check_multiple_statements(sql: str) -> List[StaticIssue]:
             ),
         )]
 
-    # Case 2: two top-level SELECT clauses without a semicolon separator
-    # (e.g. a CTE followed by an orphan SELECT)
+    # Case 2: multiple top-level SELECT clauses are only valid when linked
+    # by set operators (UNION / INTERSECT / EXCEPT).
     cleaned = _remove_paren_content(sql_no_strings)
-    top_level_selects = len(re.findall(r'\bSELECT\b', cleaned, re.IGNORECASE))
-    if top_level_selects > 1:
-        return [StaticIssue(
-            issue_type="multiple_statements",
-            location="full query",
-            column="",
-            column_type="",
-            detail=(
-                "SQL contains multiple top-level SELECT statements. "
-                "Only one SELECT statement is allowed (WITH...AS(...) SELECT counts as one)."
-            ),
-        )]
+    select_matches = list(re.finditer(r'\bSELECT\b', cleaned, re.IGNORECASE))
+    if len(select_matches) <= 1:
+        return []
+
+    set_op_re = re.compile(
+        r'\b(?:UNION(?:\s+ALL|\s+DISTINCT)?|INTERSECT|EXCEPT)\b',
+        re.IGNORECASE,
+    )
+
+    for prev, curr in zip(select_matches, select_matches[1:]):
+        between = cleaned[prev.end():curr.start()]
+        if not set_op_re.search(between):
+            return [StaticIssue(
+                issue_type="multiple_statements",
+                location="full query",
+                column="",
+                column_type="",
+                detail=(
+                    "SQL contains multiple top-level SELECT statements that are not "
+                    "connected by a valid set operator (UNION, INTERSECT, EXCEPT)."
+                ),
+            )]
 
     return []
 
