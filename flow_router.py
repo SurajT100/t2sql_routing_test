@@ -871,31 +871,163 @@ def process_query(
             complexity_norm = "comparative"
 
         if complexity_norm == "simple":
-            # ── SIMPLE: SQL Coder only (schema + rules already fetched in Stage 2) ──
-            result.flow_path = "SIMPLE: Question → Schema + RAG → SQL Coder → Execute"
-            print(f"[STAGE3] SIMPLE flow")
+            # ── SIMPLE: quick Pass 1 gate. If fuzzy string filters are detected,
+            #            upgrade to Context Agent + Pass 2 for safer filter handling. ──
+            print(f"[STAGE3] SIMPLE flow — running Pass 1 gate for resolver/context need")
 
-            # Prompt caching: schema + rules + dialect → system; question → user
-            _sql_system = _build_static_system_prompt(
+            _sp1_system = _build_static_system_prompt(
                 dialect_syntax=dialect_syntax,
-                schema=schema_text,
+                schema=bare_schema,
                 rules=rules_compressed,
-                extra_instructions=f"You are an expert {dialect_name_upper} SQL generator. "
-                                   f"Output only valid SQL — no explanation.",
+                extra_instructions=(
+                    f"You are a SQL query planner for {dialect_name_upper}. "
+                    f"Your task is to identify which tables and columns are needed.\n"
+                    f"COLUMN FORMAT: {quote_char}column_name{quote_char}"
+                ),
             )
-            _use_sql_sys = _is_claude_provider(config.sql_provider) and config.enable_prompt_caching
-            sql_prompt = f"QUESTION: {question}\n\nOUTPUT: Only the SQL query. Start with SELECT or WITH."
-            if _is_claude_provider(config.sql_provider) and not config.enable_prompt_caching:
-                sql_prompt = f"{_sql_system}\n\n{sql_prompt}"
-            sql_response, sql_tokens = call_llm(
-                sql_prompt, config.sql_provider,
-                system_prompt=_sql_system if _use_sql_sys else None,
+            _sp1_user = (
+                f"QUESTION: {question}\n\n"
+                f"Identify all tables and columns needed. Return JSON only:\n"
+                f'{{"tables": [...], "columns": {{"table": ["col1",...]}}, '
+                f'"string_filter_columns": [{{"table": "t", "column": "c", "user_value": "v", "filter_type": "include"}}], '
+                f'"joins_needed": true/false}}\n\n'
+                f"string_filter_columns: only columns where the user supplied a human-readable value "
+                f"that may not match exactly (names, categories, codes). "
+                f"Each entry MUST be a dict with keys: table, column, user_value, filter_type."
             )
-            result.tokens.sql_gen = sql_tokens
-            _accumulate_cache_tokens(result.tokens.sql_gen, sql_tokens)
-            result.sql = extract_sql_from_response(sql_response)
-            result.llm_trace.sql_gen_input = sql_prompt
-            result.llm_trace.sql_gen_output = sql_response
+            prefill = "{" if _is_claude_provider(config.reasoning_provider) else None
+            if _is_claude_provider(config.reasoning_provider) and config.enable_prompt_caching:
+                pass1_response, pass1_tokens = call_llm(
+                    _sp1_user, config.reasoning_provider,
+                    prefill=prefill, system_prompt=_sp1_system,
+                )
+                result.llm_trace.reasoning_pass1_input = _sp1_user
+            else:
+                pass1_prompt = create_pass1_prompt(
+                    question=question, schema=bare_schema,
+                    rules=rules_compressed, dialect_info=config.dialect_info,
+                )
+                pass1_response, pass1_tokens = call_llm(
+                    pass1_prompt, config.reasoning_provider, prefill=prefill,
+                )
+                result.llm_trace.reasoning_pass1_input = pass1_prompt
+            result.tokens.reasoning_pass1 = pass1_tokens
+            _accumulate_cache_tokens(result.tokens.reasoning_pass1, pass1_tokens)
+            result.llm_trace.reasoning_pass1_output = pass1_response
+
+            pass1_data = parse_pass1_output(pass1_response)
+            needs_context_agent = bool(pass1_data.get("string_filter_columns") or pass1_data.get("joins_needed", False))
+
+            if needs_context_agent:
+                result.flow_path = "SIMPLE (context-aware): Question → Bare Schema + Rules → Pass 1 → Context Agent [descs + samples + resolver] → Pass 2 → SQL Coder → Execute"
+                print("[STAGE3] SIMPLE upgraded to context-aware flow")
+
+                agent = ContextAgent(
+                    user_engine=engine,
+                    vector_engine=vector_engine,
+                    selected_tables=selected_tables,
+                    dialect_info=config.dialect_info,
+                    enable_resolver=config.enable_resolver,
+                )
+                bundle = agent.fetch_context(
+                    question=question,
+                    pass1_data=pass1_data,
+                    rules_compressed=rules_compressed
+                )
+
+                result.column_metadata = bundle.metadata
+                result.rules_compressed = bundle.rules_compressed
+                result.rules_retrieved = bundle.rules_retrieved
+                result.resolver_result = bundle.resolver_result
+                result.entities_resolved = bundle.entities_resolved
+                result.resolver_time_ms = bundle.resolver_result.total_time_ms if bundle.resolver_result else 0
+                result.llm_trace.resolver_summary = bundle.resolver_text
+                result.stages_completed.append("context_agent")
+                result.stage_times["context_agent"] = bundle.total_time_ms
+
+                _p2_system = _build_static_system_prompt(
+                    dialect_syntax=dialect_syntax,
+                    schema=bare_schema,
+                    rules=bundle.rules_compressed,
+                    extra_instructions=(
+                        f"You are a SQL query planner for {dialect_name_upper}. "
+                        f"Produce a detailed query plan — no SQL yet."
+                    ),
+                )
+                if _is_claude_provider(config.reasoning_provider) and config.enable_prompt_caching:
+                    pass2_prompt = create_pass2_prompt(
+                        question=question,
+                        pass1_output=pass1_response,
+                        metadata=bundle.metadata,
+                        dialect_info=config.dialect_info,
+                        resolver_text=bundle.resolver_text,
+                        rules="",
+                    )
+                    pass2_response, pass2_tokens = call_llm(
+                        pass2_prompt, config.reasoning_provider,
+                        prefill=prefill, system_prompt=_p2_system,
+                    )
+                else:
+                    pass2_prompt = create_pass2_prompt(
+                        question=question,
+                        pass1_output=pass1_response,
+                        metadata=bundle.metadata,
+                        dialect_info=config.dialect_info,
+                        resolver_text=bundle.resolver_text,
+                        rules=bundle.rules_compressed,
+                    )
+                    pass2_response, pass2_tokens = call_llm(
+                        pass2_prompt, config.reasoning_provider, prefill=prefill,
+                    )
+                result.tokens.reasoning_pass2 = pass2_tokens
+                _accumulate_cache_tokens(result.tokens.reasoning_pass2, pass2_tokens)
+                result.llm_trace.reasoning_pass2_input = pass2_prompt
+                result.llm_trace.reasoning_pass2_output = pass2_response
+                result.pass2_plan = pass2_response
+
+                sql_prompt = f"""Generate a {dialect_name_upper} SQL query from this plan.
+
+{dialect_syntax}
+
+SCHEMA:
+{bundle.focused_schema}
+
+QUERY PLAN (implement this exactly — filters are pre-decided, do not change them):
+{pass2_response}
+
+OUTPUT: SQL query only. No explanation, no markdown."""
+                sql_response, sql_tokens = call_llm(sql_prompt, config.sql_provider)
+                result.tokens.sql_gen = sql_tokens
+                _accumulate_cache_tokens(result.tokens.sql_gen, sql_tokens)
+                result.sql = extract_sql_from_response(sql_response)
+                result.llm_trace.sql_gen_input = sql_prompt
+                result.llm_trace.sql_gen_output = sql_response
+
+            else:
+                # ── SIMPLE fallback: SQL Coder only (schema + rules from Stage 2) ──
+                result.flow_path = "SIMPLE: Question → Schema + RAG → SQL Coder → Execute"
+                print("[STAGE3] SIMPLE direct SQL flow (no fuzzy filters detected)")
+
+                _sql_system = _build_static_system_prompt(
+                    dialect_syntax=dialect_syntax,
+                    schema=schema_text,
+                    rules=rules_compressed,
+                    extra_instructions=f"You are an expert {dialect_name_upper} SQL generator. "
+                                       f"Output only valid SQL — no explanation.",
+                )
+                _use_sql_sys = _is_claude_provider(config.sql_provider) and config.enable_prompt_caching
+                sql_prompt = f"QUESTION: {question}\n\nOUTPUT: Only the SQL query. Start with SELECT or WITH."
+                if _is_claude_provider(config.sql_provider) and not config.enable_prompt_caching:
+                    sql_prompt = f"{_sql_system}\n\n{sql_prompt}"
+                sql_response, sql_tokens = call_llm(
+                    sql_prompt, config.sql_provider,
+                    system_prompt=_sql_system if _use_sql_sys else None,
+                )
+                result.tokens.sql_gen = sql_tokens
+                _accumulate_cache_tokens(result.tokens.sql_gen, sql_tokens)
+                result.sql = extract_sql_from_response(sql_response)
+                result.llm_trace.sql_gen_input = sql_prompt
+                result.llm_trace.sql_gen_output = sql_response
 
         elif complexity_norm in ("analytical", "comparative"):
             # ── ANALYTICAL / COMPARATIVE: Pass 1 (bare + rules) → Context Agent → Pass 2 → SQL Coder ─
