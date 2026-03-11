@@ -150,8 +150,8 @@ with tab3:
                     validate_sql=enable_sql_validation,
                     auto_fix_sql=auto_fix_sql,
                     enable_opus=opus_config,
-                    reasoning_provider=st.session_state.get('reasoning_provider', 'claude_sonnet'),
-                    sql_provider=st.session_state.get('coding_provider', 'groq'),
+                    reasoning_provider=st.session_state.reasoning_provider,
+                    sql_provider=st.session_state.coding_provider,
                     dialect=dialect,
                     dialect_info={
                         "dialect": dialect,

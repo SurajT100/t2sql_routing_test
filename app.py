@@ -107,6 +107,45 @@ Return ONLY the summary text with no preamble, labels, or markdown."""
         return "", {"input": 0, "output": 0}
 
 
+def _build_failure_suggestions(question: str, result) -> list:
+    """Build lightweight, actionable suggestions when a query fails."""
+    suggestions = []
+
+    pass2_out = (getattr(result.llm_trace, "reasoning_pass2_output", "") or "").lower()
+    resolver_summary = (getattr(result.llm_trace, "resolver_summary", "") or "").lower()
+
+    # Common mismatch: Pass 1 normalizes a user term but resolver cannot find exact entity.
+    if (
+        "partial match" in pass2_out
+        or "no entity resolver" in pass2_out
+        or (resolver_summary and "no match" in resolver_summary)
+        or (hasattr(result, "entities_resolved") and result.entities_resolved == 0 and bool(resolver_summary))
+    ):
+        suggestions.append(
+            "Use exact raw filter values from source data (for example `Stage-Opn/Cls`) and add `use exact value, do not normalize` in your question."
+        )
+        suggestions.append(
+            "If possible, include one anchor (ID/code) with the label so resolver can map confidently."
+        )
+
+    if "tier2_unclassified" in getattr(result, "stages_completed", []):
+        suggestions.append(
+            "The database error could not be auto-classified. Open the debug tabs and rerun with a narrower question (single metric + single filter)."
+        )
+
+    if "tier2_fix_failed" in getattr(result, "stages_completed", []):
+        suggestions.append(
+            "Tier-2 SQL mini-fix failed. Try rephrasing with explicit table/column hints to reduce ambiguity before retrying."
+        )
+
+    if not suggestions:
+        suggestions.append(
+            "Try a narrower query first (single metric, single time window), then add conditions step-by-step."
+        )
+
+    return suggestions
+
+
 # ======================
 # PAGE CONFIG
 # ======================
@@ -2271,8 +2310,8 @@ with tab3:
                     auto_fix_sql=True,
                     enable_opus=opus_config,
                     opus_provider=selected_reviewer,
-                    reasoning_provider=st.session_state.get('reasoning_provider', 'claude_sonnet'),
-                    sql_provider=st.session_state.get('coding_provider', 'groq'),
+                    reasoning_provider=st.session_state.reasoning_provider,
+                    sql_provider=st.session_state.coding_provider,
                     dialect=dialect,
                     dialect_info={
                         "dialect": dialect,
@@ -2320,7 +2359,7 @@ with tab3:
                         _summary_text, _summary_tokens = _generate_result_summary(
                             question=question,
                             results_df=result.results,
-                            provider=st.session_state.get("reasoning_provider", "claude_sonnet"),
+                            provider=st.session_state.reasoning_provider,
                         )
 
                 # ───────────────────────────────────────────────────────────
@@ -2603,7 +2642,7 @@ with tab3:
                                     chart_rendered, chart_tokens = build_and_render_chart(
                                         df=result.results,
                                         question=question,
-                                        llm_provider=st.session_state.get('reasoning_provider', 'claude_sonnet')
+                                        llm_provider=st.session_state.reasoning_provider
                                     )
 
                                     if not chart_rendered:
@@ -2707,6 +2746,12 @@ with tab3:
                         st.info("💡 Try adding more specific time period details, or contact your data team if the required data relationship doesn't exist.")
                     else:
                         st.error(f"❌ Query failed: {error_msg}")
+                        suggestions = _build_failure_suggestions(question, result)
+                        if suggestions:
+                            st.info(
+                                "💡 **Suggestions to improve the next attempt:**\n\n"
+                                + "\n".join([f"- {s}" for s in suggestions])
+                            )
                 
                 # ───────────────────────────────────────────────────────────
                 # TIMING & DEBUG
@@ -2724,7 +2769,18 @@ with tab3:
                 with st.expander("🔍 LLM Input/Output (Debug)", expanded=False):
                     st.caption("💡 Full prompts and responses - no truncation")
 
-                    llm_tabs = st.tabs(["📊 Classifier", "🧠 Reasoning", "🔍 Resolver", "⚙️ SQL Coder", "🎯 Opus Review", "🔄 Refinement", "⚡ SQL Error Fix (Reasoning)", "🔧 SQL Error Fix (Opus)", "🔬 Analyzer"])
+                    llm_tabs = st.tabs([
+                        "📊 Classifier",
+                        "🧠 Reasoning",
+                        "🔍 Resolver",
+                        "⚙️ SQL Coder",
+                        "🎯 Opus Review",
+                        "🔄 Refinement",
+                        "🩺 Tier-2 Error Fix",
+                        "⚡ SQL Error Fix (Reasoning)",
+                        "🔧 SQL Error Fix (Opus)",
+                        "🔬 Analyzer",
+                    ])
 
                     # Use query counter as key suffix so each new query gets fresh
                     # widgets — prevents Streamlit from showing stale session state
@@ -2818,7 +2874,20 @@ with tab3:
                             st.text_area("Refinement Output", result.llm_trace.refinement_output, height=200, key=f"refine_out_{_qc}")
                         else:
                             st.info("Refinement not triggered (query was correct or Opus not enabled)")
-                    with llm_tabs[6]:  # Error Fix - Reasoning
+                    with llm_tabs[6]:  # Tier-2 Error Fix
+                        if result.llm_trace.tier2_fix_input:
+                            st.write("**📥 INPUT PROMPT (Tier-2 Error Classifier → SQL Coder):**")
+                            st.text_area("Tier-2 Input", result.llm_trace.tier2_fix_input, height=350, key=f"tier2_in_{_qc}")
+                            st.write("**📤 OUTPUT:**")
+                            st.text_area("Tier-2 Output", result.llm_trace.tier2_fix_output, height=180, key=f"tier2_out_{_qc}")
+                            if result.error_recovery_method == "tier2_classifier":
+                                st.success("✅ Tier-2 fixed the error")
+                            else:
+                                st.warning("⚠️ Tier-2 could not fix this query — escalated to Tier-3")
+                        else:
+                            st.info("Tier-2 not triggered (query succeeded first try or error was not classifiable)")
+
+                    with llm_tabs[7]:  # Error Fix - Reasoning
                         if result.llm_trace.error_fix_reasoning_input:
                             st.write("**📥 INPUT PROMPT (Attempt 1 — Reasoning LLM):**")
                             st.text_area("Error Fix Reasoning Input", result.llm_trace.error_fix_reasoning_input, height=400, key=f"err_reason_in_{_qc}")
@@ -2831,7 +2900,7 @@ with tab3:
                         else:
                             st.info("No error recovery needed for this query")
 
-                    with llm_tabs[7]:  # Error Fix - Opus
+                    with llm_tabs[8]:  # Error Fix - Opus
                         if result.llm_trace.error_fix_opus_input:
                             st.write("**📥 INPUT PROMPT (Attempt 2 — Opus):**")
                             st.text_area("Error Fix Opus Input", result.llm_trace.error_fix_opus_input, height=400, key=f"err_opus_in_{_qc}")
@@ -2844,7 +2913,7 @@ with tab3:
                         else:
                             st.info("Opus error fix not needed for this query")
 
-                    with llm_tabs[8]:  # Analyzer Agent
+                    with llm_tabs[9]:  # Analyzer Agent
                         if not (hasattr(result, 'analyzer_data') and result.analyzer_data):
                             st.info("Analyzer Agent not used for this query (non-analysis complexity)")
                         else:
