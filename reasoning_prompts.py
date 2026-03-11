@@ -33,6 +33,7 @@ Usage:
 
 import json
 from typing import Dict, List, Any, Optional
+from datetime import date
 
 
 # =============================================================================
@@ -275,6 +276,7 @@ def create_pass2_prompt(
     dialect_name = dialect_info.get("dialect", "postgresql").upper() if dialect_info else "POSTGRESQL"
     quote_char = dialect_info.get("quote_char", '"') if dialect_info else '"'
     string_quote = dialect_info.get("string_quote", "'") if dialect_info else "'"
+    today = date.today().isoformat()
 
     metadata_text = format_metadata_for_prompt(metadata)
 
@@ -300,6 +302,7 @@ and columns needed. Now use the actual stored values to finalize all filters cor
 DATABASE: {dialect_name}
 COLUMN FORMAT: {quote_char}column_name{quote_char}
 STRING FORMAT: {string_quote}value{string_quote}
+TODAY: {today}
 
 ORIGINAL QUESTION: {question}
 
