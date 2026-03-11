@@ -89,16 +89,22 @@ def build_tier2_mini_retry_prompt(
     diagnosis: "ErrorDiagnosis",
     dialect: str,
     quote_char: str,
+    context_hint: str = "",
 ) -> str:
     """
     Build the mini-retry prompt sent to SQL Coder when Tier 2 classifies an error.
-    Small prompt: SQL + diagnosis + dialect only.  No schema, rules, or plan.
+    Includes optional context_hint (schema/rules/resolver summaries) when available.
     """
+    context_block = ""
+    if context_hint and context_hint.strip():
+        context_block = "ADDITIONAL CONTEXT (use this to validate table/column/filter choices):\n" + context_hint.strip() + "\n\n"
+
     return (
         "Fix this failed " + dialect.upper() + " SQL query based on the error diagnosis below.\n"
-        "Only fix the diagnosed issue — do not change anything else.\n\n"
+        "Only fix the diagnosed issue — do not change anything else unless context proves a naming/table mismatch.\n\n"
         "DIALECT: " + dialect.upper() + " "
         "(use " + quote_char + " for identifiers, single quotes for strings)\n\n"
+        + context_block +
         "FAILED SQL:\n" + original_sql + "\n\n"
         "ERROR DIAGNOSIS:\n"
         "  Error type:   " + diagnosis.error_category + "\n"

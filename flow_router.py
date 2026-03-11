@@ -871,21 +871,110 @@ def process_query(
             complexity_norm = "comparative"
 
         if complexity_norm == "simple":
-            # ── SIMPLE: SQL Coder only (schema + rules already fetched in Stage 2) ──
-            result.flow_path = "SIMPLE: Question → Schema + RAG → SQL Coder → Execute"
+            # ── SIMPLE: SQL Coder first, with optional resolver enrichment ──
+            result.flow_path = "SIMPLE: Question → Schema + RAG (+optional Resolver) → SQL Coder → Execute"
             print(f"[STAGE3] SIMPLE flow")
 
-            # Prompt caching: schema + rules + dialect → system; question → user
+            # Optional lightweight Pass 1 + Context Agent for resolver support in SIMPLE flow.
+            # This keeps SIMPLE mostly direct while still enabling live entity resolution when needed.
+            simple_schema_for_sql = schema_text
+            simple_rules_for_sql = rules_compressed
+            simple_resolver_text = ""
+
+            if config.enable_resolver:
+                try:
+                    _sp1_system = _build_static_system_prompt(
+                        dialect_syntax=dialect_syntax,
+                        schema=bare_schema,
+                        rules=rules_compressed,
+                        extra_instructions=(
+                            f"You are a SQL query planner for {dialect_name_upper}. "
+                            f"Identify which tables and columns are needed.\n"
+                            f"COLUMN FORMAT: {quote_char}column_name{quote_char}"
+                        ),
+                    )
+                    _sp1_user = (
+                        f"QUESTION: {question}\n\n"
+                        f"Identify all tables and columns needed. Return JSON only:\n"
+                        f'{{"tables": [...], "columns": {{"table": ["col1",...]}}, '
+                        f'"string_filter_columns": [{{"table": "t", "column": "c", "user_value": "v", "filter_type": "include"}}], '
+                        f'"joins_needed": true/false}}\n\n'
+                        f"string_filter_columns: only columns where the user supplied a human-readable value "
+                        f"that may not match exactly (names, categories, codes). "
+                        f"Each entry MUST be a dict with keys: table, column, user_value, filter_type."
+                    )
+                    _sp1_prefill = "{" if _is_claude_provider(config.reasoning_provider) else None
+                    if _is_claude_provider(config.reasoning_provider) and config.enable_prompt_caching:
+                        _sp1_response, _sp1_tokens = call_llm(
+                            _sp1_user,
+                            config.reasoning_provider,
+                            prefill=_sp1_prefill,
+                            system_prompt=_sp1_system,
+                        )
+                        result.llm_trace.reasoning_pass1_input = _sp1_user
+                    else:
+                        _sp1_prompt = create_pass1_prompt(
+                            question=question,
+                            schema=bare_schema,
+                            rules=rules_compressed,
+                            dialect_info=config.dialect_info,
+                        )
+                        _sp1_response, _sp1_tokens = call_llm(
+                            _sp1_prompt,
+                            config.reasoning_provider,
+                            prefill=_sp1_prefill,
+                        )
+                        result.llm_trace.reasoning_pass1_input = _sp1_prompt
+
+                    result.tokens.reasoning_pass1 = _sp1_tokens
+                    _accumulate_cache_tokens(result.tokens.reasoning_pass1, _sp1_tokens)
+                    result.llm_trace.reasoning_pass1_output = _sp1_response
+
+                    _simple_pass1_data = parse_pass1_output(_sp1_response)
+                    _simple_agent = ContextAgent(
+                        user_engine=engine,
+                        vector_engine=vector_engine,
+                        selected_tables=selected_tables,
+                        dialect_info=config.dialect_info,
+                        enable_resolver=config.enable_resolver,
+                    )
+                    _simple_bundle = _simple_agent.fetch_context(
+                        question=question,
+                        pass1_data=_simple_pass1_data,
+                        rules_compressed=rules_compressed,
+                    )
+                    result.column_metadata = _simple_bundle.metadata
+                    result.rules_compressed = _simple_bundle.rules_compressed
+                    result.rules_retrieved = _simple_bundle.rules_retrieved
+                    result.resolver_result = _simple_bundle.resolver_result
+                    result.entities_resolved = _simple_bundle.entities_resolved
+                    result.resolver_time_ms = _simple_bundle.resolver_result.total_time_ms if _simple_bundle.resolver_result else 0
+                    result.llm_trace.resolver_summary = _simple_bundle.resolver_text
+                    result.stages_completed.append("context_agent")
+                    result.stage_times["context_agent"] = _simple_bundle.total_time_ms
+
+                    if _simple_bundle.focused_schema and _simple_bundle.focused_schema.strip():
+                        simple_schema_for_sql = _simple_bundle.focused_schema
+                    if _simple_bundle.rules_compressed and _simple_bundle.rules_compressed.strip():
+                        simple_rules_for_sql = _simple_bundle.rules_compressed
+                    simple_resolver_text = _simple_bundle.resolver_text or ""
+                except Exception as _simple_ctx_err:
+                    print(f"[STAGE3] SIMPLE resolver enrichment failed (non-fatal): {_simple_ctx_err}")
+
+            # Prompt caching: schema + rules + dialect → system; question (+resolver) → user
             _sql_system = _build_static_system_prompt(
                 dialect_syntax=dialect_syntax,
-                schema=schema_text,
-                rules=rules_compressed,
+                schema=simple_schema_for_sql,
+                rules=simple_rules_for_sql,
                 extra_instructions=f"You are an expert {dialect_name_upper} SQL generator. "
                                    f"Output only valid SQL — no explanation.",
             )
             _use_sql_sys = _is_claude_provider(config.sql_provider) and config.enable_prompt_caching
-            sql_prompt = f"QUESTION: {question}\n\nOUTPUT: Only the SQL query. Start with SELECT or WITH."
-            if _is_claude_provider(config.sql_provider) and not config.enable_prompt_caching:
+            sql_prompt = f"QUESTION: {question}"
+            if simple_resolver_text:
+                sql_prompt += f"\n\nENTITY RESOLVER RESULTS (use these exact values when filtering):\n{simple_resolver_text}"
+            sql_prompt += "\n\nOUTPUT: Only the SQL query. Start with SELECT or WITH."
+            if not _use_sql_sys:
                 sql_prompt = f"{_sql_system}\n\n{sql_prompt}"
             sql_response, sql_tokens = call_llm(
                 sql_prompt, config.sql_provider,
@@ -1023,6 +1112,16 @@ def process_query(
             result.pass2_plan = pass2_response
             print(f"[STAGE3] Pass 2 complete — {pass2_tokens.get('input',0)+pass2_tokens.get('output',0)} tokens")
 
+            # Keep SQL generation anchored to Pass 1 table/column selection so the
+            # final query cannot drift to unrelated tables.
+            pass1_tables = pass1_data.get("tables", []) if isinstance(pass1_data, dict) else []
+            pass1_columns = pass1_data.get("columns", {}) if isinstance(pass1_data, dict) else {}
+            pass1_constraints = json.dumps(
+                {"tables": pass1_tables, "columns": pass1_columns},
+                indent=2,
+                ensure_ascii=False,
+            )
+
             # SQL Coder: receives Pass 2 plan + FOCUSED schema (only relevant cols have descriptions)
             # Business rules are intentionally excluded — the Pass 2 plan already encodes every
             # filter condition explicitly, so repeating rules here wastes tokens with no benefit.
@@ -1036,11 +1135,15 @@ SCHEMA:
 QUERY PLAN (implement this exactly — filters are pre-decided, do not change them):
 {pass2_response}
 
+PASS 1 TABLE/COLUMN SELECTION (must remain consistent unless the plan explicitly adds a required join):
+{pass1_constraints}
+
 CRITICAL:
 1. Use {quote_char} for ALL identifiers
 2. Implement every filter from the plan EXACTLY as written
 3. Do not substitute exact match for ILIKE or vice versa
-4. Output SQL only — no explanation
+4. Keep table/column usage aligned with Pass 1 selection
+5. Output SQL only — no explanation
 
 OUTPUT: Only the SQL query. Start with SELECT or WITH."""
 
@@ -1408,11 +1511,21 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
                         f"(confidence={diagnosis.confidence})"
                     )
                     if diagnosis.confidence in ("high", "medium"):
+                        _t2_context_parts = []
+                        if schema_text:
+                            _t2_context_parts.append(f"SCHEMA:\n{schema_text}")
+                        if result.rules_compressed and result.rules_compressed.strip() not in ("", "[]"):
+                            _t2_context_parts.append(f"BUSINESS RULES:\n{result.rules_compressed}")
+                        if result.llm_trace.resolver_summary:
+                            _t2_context_parts.append(
+                                "ENTITY RESOLVER RESULTS:\n" + result.llm_trace.resolver_summary
+                            )
                         _t2_prompt = build_tier2_mini_retry_prompt(
                             original_sql=result.sql,
                             diagnosis=diagnosis,
                             dialect=config.dialect,
                             quote_char=_t2_quote_char,
+                            context_hint="\n\n".join(_t2_context_parts),
                         )
                         _t2_response, _t2_tokens = call_llm(_t2_prompt, config.sql_provider)
                         _t2_fixed_sql = extract_sql_from_response(_t2_response)
