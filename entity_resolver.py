@@ -44,6 +44,8 @@ class EntityResolution:
     column: str
     user_value: str                    # What the user typed (e.g., "Dell")
     filter_type: str = "include"       # "include" or "exclude"
+    user_value_raw: str = ""           # Original phrase before any normalization
+    canonical_candidates: List[str] = field(default_factory=list)  # Rule-derived coded values
     
     # Resolution results
     exact_match: Optional[str] = None  # Exact match found (e.g., "Dell")
@@ -127,7 +129,11 @@ def resolve_entities(
             table=table_name,
             column=column_name,
             user_value=user_value,
-            filter_type=filter_type
+            filter_type=filter_type,
+            user_value_raw=sf.get("user_value_raw", user_value),
+            canonical_candidates=[
+                str(v).strip() for v in (sf.get("canonical_candidates") or []) if str(v).strip()
+            ],
         )
         
         query_start = time.time()
@@ -145,6 +151,43 @@ def resolve_entities(
                 resolution.warning = "Numeric column — exact value used"
                 result.resolutions.append(resolution)
                 continue
+
+            # ── Step 0: If business-rule canonical candidates exist, try those first ──
+            if resolution.canonical_candidates:
+                canonical_hits: List[str] = []
+                for cand in resolution.canonical_candidates:
+                    exact_query = _build_exact_query(table_name, column_name, cand, dialect, quote_char)
+                    exact_matches = _run_resolve_query(user_engine, exact_query)
+                    result.queries_run += 1
+                    if exact_matches:
+                        canonical_hits.extend(exact_matches)
+                        continue
+
+                    ci_query = _build_case_insensitive_query(table_name, column_name, cand, dialect, quote_char)
+                    ci_matches = _run_resolve_query(user_engine, ci_query)
+                    result.queries_run += 1
+                    canonical_hits.extend(ci_matches)
+
+                canonical_hits = _dedupe_preserve_order(canonical_hits)
+                if canonical_hits:
+                    resolution.match_count = len(canonical_hits)
+                    resolution.query_used = f"CANONICAL_LOOKUP {resolution.canonical_candidates}"
+                    resolution.warning = "Mapped via business-rule value mapping"
+                    resolution.confidence = "high"
+                    if len(canonical_hits) == 1:
+                        resolution.strategy = "exact"
+                        resolution.exact_match = canonical_hits[0]
+                        resolution.filter_condition = f"= '{_escape_sql(canonical_hits[0])}'"
+                    else:
+                        resolution.strategy = "in_list"
+                        resolution.partial_matches = canonical_hits
+                        escaped = [f"'{_escape_sql(v)}'" for v in canonical_hits]
+                        resolution.filter_condition = f"IN ({', '.join(escaped)})"
+
+                    resolution.query_time_ms = int((time.time() - query_start) * 1000)
+                    result.resolutions.append(resolution)
+                    print(f"[RESOLVER] ✅ Canonical match: {user_value} → {canonical_hits}")
+                    continue
             
             # ── Step 1: Try exact match first (cheapest) ──
             exact_query = _build_exact_query(
@@ -480,6 +523,10 @@ def format_resolutions_for_prompt(resolver_result: ResolverResult) -> str:
         action = "EXCLUDE" if res.filter_type == "exclude" else "FILTER"
         lines.append(f"  {action}: {res.table}.{res.column}")
         lines.append(f"    User typed: \"{res.user_value}\"")
+        if res.user_value_raw and res.user_value_raw != res.user_value:
+            lines.append(f"    Raw phrase: \"{res.user_value_raw}\"")
+        if res.canonical_candidates:
+            lines.append(f"    Canonical candidates from rules: {res.canonical_candidates}")
         lines.append(f"    Strategy: {res.strategy.upper()} (confidence: {res.confidence})")
         # condition_is_full_expression=True  → the condition includes the column
         # reference (e.g. LOWER("col") LIKE LOWER('%val%')); use it verbatim in
@@ -556,6 +603,19 @@ def merge_resolutions_into_metadata(
 def _escape_sql(value: str) -> str:
     """Escape single quotes in SQL values."""
     return value.replace("'", "''")
+
+
+def _dedupe_preserve_order(values: List[str]) -> List[str]:
+    """Return values with case-insensitive dedupe, preserving first-seen order."""
+    seen = set()
+    out = []
+    for v in values:
+        norm = str(v).strip().lower()
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(str(v).strip())
+    return out
 
 
 # =============================================================================
