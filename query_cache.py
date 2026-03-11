@@ -175,6 +175,13 @@ class QueryCache:
         """Generate deterministic cache key."""
         key_input = f"{question_normalized}|{schema_version}|{rules_version}|{dialect}"
         return hashlib.sha256(key_input.encode()).hexdigest()[:32]
+
+    @staticmethod
+    def _to_pgvector_literal(embedding: List[float]) -> Optional[str]:
+        """Convert embedding array into pgvector text literal format."""
+        if not embedding:
+            return None
+        return "[" + ",".join(str(float(value)) for value in embedding) + "]"
     
     @staticmethod
     def compute_schema_version(schema_info: Dict) -> str:
@@ -318,8 +325,9 @@ class QueryCache:
             # Get embedding for question
             from vector_utils_v2 import get_embedding
             embedding = get_embedding(question_normalized)
-            
-            if embedding is None:
+
+            embedding_literal = self._to_pgvector_literal(embedding)
+            if embedding_literal is None:
                 return None
             
             with self.vector_engine.connect() as conn:
@@ -339,7 +347,7 @@ class QueryCache:
                         LIMIT 1
                     """),
                     {
-                        "embedding": embedding,
+                        "embedding": embedding_literal,
                         "schema_ver": schema_version,
                         "rules_ver": rules_version,
                         "dialect": dialect
@@ -450,9 +458,11 @@ class QueryCache:
                 embedding = get_embedding(question_normalized)
             except:
                 pass
+
+            embedding_literal = self._to_pgvector_literal(embedding)
             
             with self.vector_engine.connect() as conn:
-                if embedding:
+                if embedding_literal is not None:
                     conn.execute(
                         text("""
                             INSERT INTO query_cache (
@@ -475,7 +485,7 @@ class QueryCache:
                             "cache_key": cache_key,
                             "question_original": question_original,
                             "question_normalized": question_normalized,
-                            "embedding": embedding,
+                            "embedding": embedding_literal,
                             "sql": sql,
                             "schema_version": schema_version,
                             "rules_version": rules_version,
