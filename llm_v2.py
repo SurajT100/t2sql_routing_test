@@ -466,8 +466,8 @@ def call_qwen_vertex(prompt: str):
     LOCATION = "us-south1"
     MODEL_NAME = "qwen3-coder-480b-a35b-instruct"
     SERVICE_ACCOUNT_JSON = (
-        r"C:\Users\Dell\Desktop\Test\projectx\testing_app"
-        r"\robust-carver-481011-c9-326237439fb7.json"
+        r"D:\cDRIVE\Test\project_llm_decision_with_rag_v14_with_analyzer_need_to_test\google_json"
+        r"\llm-test-491910-88c51981e0b6.json"
     )
 
     credentials = service_account.Credentials.from_service_account_file(
