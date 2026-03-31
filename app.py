@@ -340,7 +340,8 @@ with st.sidebar:
             "Claude Haiku 4.5",
             "Groq Llama 3.3 70B",
             "xAI Grok Beta",
-            "Qwen 2.5 Coder 32B"
+            "Qwen 2.5 Coder 32B",
+            "Kimi K2 Thinking (Vertex)"
         ],
         key="reasoning_llm"
     )
@@ -353,7 +354,8 @@ with st.sidebar:
         "Claude Haiku 4.5": "claude_haiku",
         "Groq Llama 3.3 70B": "groq",
         "xAI Grok Beta": "grok",
-        "Qwen 2.5 Coder 32B": "vertex_qwen"
+        "Qwen 2.5 Coder 32B": "vertex_qwen",
+        "Kimi K2 Thinking (Vertex)": "vertex_kimi_k2_thinking"
     }
     
     coding_llm = st.selectbox(
@@ -2249,14 +2251,15 @@ with tab3:
                 with col_rev2:
                     reviewer_provider = st.selectbox(
                         "Reviewer LLM",
-                        ["Claude Opus", "Qwen Coder (Vertex)"],
+                        ["Claude Opus", "Qwen Coder (Vertex)", "Kimi K2 Thinking (Vertex)"],
                         index=0,
                         help="Choose which LLM reviews the SQL",
                         disabled=(opus_mode == "Disabled")
                     )
                     reviewer_provider_map = {
                         "Claude Opus": "claude_opus",
-                        "Qwen Coder (Vertex)": "vertex_qwen_thinking"
+                        "Qwen Coder (Vertex)": "vertex_qwen_thinking",
+                        "Kimi K2 Thinking (Vertex)": "vertex_kimi_k2_thinking"
                     }
                     selected_reviewer = reviewer_provider_map[reviewer_provider]
         
