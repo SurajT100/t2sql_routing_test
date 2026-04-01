@@ -48,6 +48,7 @@ Usage:
 
 import json
 import time
+import re
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, field
 
@@ -202,6 +203,10 @@ class ContextAgent:
         if self.enable_resolver and string_filter_columns:
             stage_start = time.time()
             try:
+                string_filter_columns = self._attach_canonical_candidates(
+                    string_filter_columns, bundle.rules_compressed
+                )
+
                 from entity_resolver import (
                     resolve_entities,
                     format_resolutions_for_prompt,
@@ -553,6 +558,151 @@ class ContextAgent:
             print(f"[CONTEXT AGENT] Metadata fetch failed: {e}")
         
         return metadata
+
+    @staticmethod
+    def _attach_canonical_candidates(
+        string_filter_columns: List[Dict],
+        rules_compressed: str,
+    ) -> List[Dict]:
+        """Attach rule-derived canonical candidates to resolver inputs.
+
+        This allows values like "closed" or "inprogress" to be mapped to
+        coded DB values such as "clsd" / "in_prgs" before fuzzy fallback.
+        """
+        if not string_filter_columns:
+            return string_filter_columns
+
+        if not rules_compressed or str(rules_compressed).strip() in ("", "[]", "null", "None"):
+            return string_filter_columns
+
+        value_maps = ContextAgent._extract_value_maps(rules_compressed)
+        if not value_maps:
+            return string_filter_columns
+
+        updated: List[Dict] = []
+        for sf in string_filter_columns:
+            if not isinstance(sf, dict):
+                continue
+            sf2 = dict(sf)
+            table = str(sf2.get("table", "")).split(".")[-1].lower()
+            column = str(sf2.get("column", "")).lower()
+            user_value = str(sf2.get("user_value", "")).strip()
+            if not user_value:
+                updated.append(sf2)
+                continue
+
+            user_value_norm = user_value.lower().strip()
+            # Supports patterns like "closed or inprogress" / "a, b and c".
+            tokens = [
+                t.strip() for t in re.split(r"\s*(?:,|/|\bor\b|\band\b)\s*", user_value_norm)
+                if t.strip()
+            ]
+            lookup_keys = [user_value_norm] + tokens
+
+            candidates: List[str] = []
+            seen = set()
+            maps_for_column = value_maps.get((table, column), {})
+            maps_global_col = value_maps.get(("", column), {})
+
+            for lk in lookup_keys:
+                for c in maps_for_column.get(lk, []) + maps_global_col.get(lk, []):
+                    cs = str(c).strip()
+                    if cs and cs.lower() not in seen:
+                        seen.add(cs.lower())
+                        candidates.append(cs)
+
+            if candidates:
+                sf2.setdefault("user_value_raw", user_value)
+                sf2["canonical_candidates"] = candidates
+                sf2["normalization_source"] = "business_rule"
+            updated.append(sf2)
+
+        return updated
+
+    @staticmethod
+    def _extract_value_maps(rules_compressed: str) -> Dict[Tuple[str, str], Dict[str, List[str]]]:
+        """Parse mapping rules into {(table,column): {alias: [canonical...]}}.
+
+        Supports both:
+        - Raw rules (`rule_data.mappings` / `rule_data.values`)
+        - Compressed rules from `compress_rules_for_llm` (`maps` at top level)
+        """
+        try:
+            rules_list = json.loads(rules_compressed or "[]")
+        except Exception:
+            return {}
+
+        if not isinstance(rules_list, list):
+            return {}
+
+        out: Dict[Tuple[str, str], Dict[str, List[str]]] = {}
+
+        for rule in rules_list:
+            if not isinstance(rule, dict):
+                continue
+            rule_type = str(rule.get("type", "")).strip().lower()
+            # Only use explicit user-defined mapping rules; ignore all other rule types.
+            if rule_type not in {"mapping", "value_mapping", "term_alias"}:
+                continue
+
+            rule_data = rule.get("rule_data") or {}
+            if isinstance(rule_data, str):
+                try:
+                    rule_data = json.loads(rule_data)
+                except Exception:
+                    rule_data = {}
+            if not isinstance(rule_data, dict):
+                rule_data = {}
+
+            # Compressed form uses "maps"; raw form keeps mappings inside rule_data.
+            mappings = (
+                rule.get("maps")
+                or rule_data.get("mappings")
+                or rule_data.get("values")
+                or {}
+            )
+
+            if not isinstance(mappings, dict) or not mappings:
+                continue
+
+            table = str(
+                rule.get("table")
+                or rule_data.get("table")
+                or rule_data.get("table_name")
+                or ""
+            ).split(".")[-1].lower()
+            column = str(
+                rule.get("column")
+                or rule_data.get("column")
+                or rule_data.get("target_column")
+                or rule_data.get("column_name")
+                or ""
+            ).lower()
+
+            # Don't create "global" synthetic mappings from unrelated rules.
+            # We only apply mappings scoped at least to a concrete column.
+            if not column:
+                continue
+
+            key = (table, column)
+            out.setdefault(key, {})
+
+            for alias, canonical_values in mappings.items():
+                alias_norm = str(alias).strip().lower()
+                if not alias_norm:
+                    continue
+                if isinstance(canonical_values, (list, tuple)):
+                    cvals = [str(v).strip() for v in canonical_values if str(v).strip()]
+                else:
+                    cvals = [str(canonical_values).strip()] if str(canonical_values).strip() else []
+                if not cvals:
+                    continue
+                out[key].setdefault(alias_norm, [])
+                for cv in cvals:
+                    if cv not in out[key][alias_norm]:
+                        out[key][alias_norm].append(cv)
+
+        return out
     
     # ═════════════════════════════════════════════════════════════════════
     # INTERNAL: Focused Schema Builder
