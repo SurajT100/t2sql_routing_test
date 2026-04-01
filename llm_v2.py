@@ -465,12 +465,12 @@ def call_qwen_vertex(prompt: str):
     import google.auth.transport.requests
     from google.oauth2 import service_account
     
-    PROJECT_ID = "robust-carver-481011-c9"
+    PROJECT_ID = "llm-test-491910"
     LOCATION = "us-south1"
     MODEL_NAME = "qwen3-coder-480b-a35b-instruct"
     SERVICE_ACCOUNT_JSON = (
-        r"C:\Users\Dell\Desktop\Test\projectx\testing_app"
-        r"\robust-carver-481011-c9-326237439fb7.json"
+        r"D:\cDRIVE\Test\project_llm_decision_with_rag_v14_with_analyzer_need_to_test\google_json"
+        r"llm-test-491910-88c51981e0b6.json"
     )
 
     credentials = service_account.Credentials.from_service_account_file(
@@ -589,22 +589,134 @@ def call_vertex_qwen_thinking(prompt: str, stop_sequences: list = None):
     
     return response_text, tokens
 
-
-def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None):
+def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None, debug: bool = True):
     """
     Call Kimi K2 Thinking via Vertex AI MaaS endpoint.
-
     Returns: (response_text, token_dict)
     """
+
+    import requests
+    import json
     import google.auth.transport.requests
     from google.oauth2 import service_account
 
-    PROJECT_ID = "robust-carver-481011-c9"
-    LOCATION = "us-south1"
+    PROJECT_ID = "llm-test-491910"
+    LOCATION = "global"
+    MODEL_NAME = "moonshotai/kimi-k2-thinking-maas"   # ✅ FIXED
+    SERVICE_ACCOUNT_JSON = (
+        r"D:\cDRIVE\Test\project_llm_decision_with_rag_v14_with_analyzer_need_to_test\google_json"
+        r"\llm-test-491910-88c51981e0b6.json"
+    )
+
+    try:
+        # ---------------- AUTH ----------------
+        credentials = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_JSON,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+
+        auth_req = google.auth.transport.requests.Request()
+        credentials.refresh(auth_req)
+
+        # ✅ FIXED ENDPOINT (NO publisher path here)
+        if LOCATION == "global":
+            base_url = "https://aiplatform.googleapis.com"
+        else:
+            base_url = f"https://{LOCATION}-aiplatform.googleapis.com"
+
+        url = (
+            f"{base_url}/v1/"
+            f"projects/{PROJECT_ID}/locations/{LOCATION}/"
+            f"endpoints/openapi/chat/completions"
+        )
+
+        headers = {
+            "Authorization": f"Bearer {credentials.token}",
+            "Content-Type": "application/json"
+        }
+
+        # ✅ FIXED PAYLOAD (OpenAI-style)
+        payload = {
+            "model": MODEL_NAME,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.6,
+            "max_tokens": 4096
+        }
+
+        if stop_sequences:
+            payload["stop"] = stop_sequences
+
+        if debug:
+            print("\n===== REQUEST DEBUG =====")
+            print("URL:", url)
+            print(json.dumps(payload, indent=2)[:1000])
+
+        # ---------------- API CALL ----------------
+        response = requests.post(url, headers=headers, json=payload, timeout=90)
+
+        if debug:
+            print("\n===== RESPONSE STATUS =====")
+            print("Status Code:", response.status_code)
+
+        if response.status_code != 200:
+            print("\n===== ERROR RESPONSE =====")
+            try:
+                print(json.dumps(response.json(), indent=2))
+            except Exception:
+                print(response.text)
+
+            return "", {"input": 0, "output": 0, "error_code": response.status_code}
+
+        data = response.json()
+
+        if debug:
+            print("\n===== FULL RESPONSE (trimmed) =====")
+            print(json.dumps(data, indent=2)[:2000])
+
+        # ✅ FIXED RESPONSE PARSING (OpenAI format)
+        response_text = ""
+        tokens = {"input": 0, "output": 0}
+
+        choices = data.get("choices", [])
+        if choices:
+            response_text = choices[0].get("message", {}).get("content", "")
+
+        usage = data.get("usage", {})
+        tokens = {
+            "input": usage.get("prompt_tokens", 0),
+            "output": usage.get("completion_tokens", 0)
+        }
+
+        return response_text, tokens
+
+    except Exception as e:
+        print("\n===== EXCEPTION =====")
+        print("Error Type:", type(e).__name__)
+        print("Error Message:", str(e))
+
+        return "", {"input": 0, "output": 0, "error": str(e)}
+
+"""
+def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None):
+
+    Call Kimi K2 Thinking via Vertex AI MaaS endpoint.
+
+    Returns: (response_text, token_dict)
+
+    import google.auth.transport.requests
+    from google.oauth2 import service_account
+
+    PROJECT_ID = "llm-test-491910"
+    LOCATION = "us-central1"
     MODEL_NAME = "kimi-k2-thinking"
     SERVICE_ACCOUNT_JSON = (
-        r"C:\Users\Dell\Desktop\Test\projectx\testing_app"
-        r"\robust-carver-481011-c9-326237439fb7.json"
+        r"D:\cDRIVE\Test\project_llm_decision_with_rag_v14_with_analyzer_need_to_test\google_json"
+        r"\llm-test-491910-88c51981e0b6.json"
     )
 
     credentials = service_account.Credentials.from_service_account_file(
@@ -653,7 +765,7 @@ def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None):
     response_text = data["candidates"][0]["content"]["parts"][0]["text"]
 
     return response_text, tokens
-
+"""
 
 # ============================================================================
 # LLM COST CALCULATOR (Optional utility)
