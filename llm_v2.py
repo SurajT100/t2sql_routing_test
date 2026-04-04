@@ -32,6 +32,7 @@ def call_llm(
     Supported providers:
     - nvidia_qwen3: NVIDIA Qwen 3 Next 80B (with thinking)
     - vertex_qwen_thinking: Vertex AI Qwen3-Next-80B Thinking (reviewer)
+    - vertex_kimi_k2_thinking: Vertex AI Kimi K2 Thinking
     - o1_mini: OpenAI o1-mini (best reasoning/price)
     - o1: OpenAI o1 (best reasoning, expensive)
     - claude_sonnet: Claude Sonnet 4.5
@@ -45,6 +46,8 @@ def call_llm(
         return call_nvidia_qwen3(prompt, stop_sequences)
     elif provider == "vertex_qwen_thinking":
         return call_vertex_qwen_thinking(prompt, stop_sequences)
+    elif provider == "vertex_kimi_k2_thinking":
+        return call_vertex_kimi_k2_thinking(prompt, stop_sequences)
     elif provider == "o1_mini":
         return call_o1_mini(prompt)
     elif provider == "o1":
@@ -462,12 +465,12 @@ def call_qwen_vertex(prompt: str):
     import google.auth.transport.requests
     from google.oauth2 import service_account
     
-    PROJECT_ID = "robust-carver-481011-c9"
+    PROJECT_ID = "llm-test-491910"
     LOCATION = "us-south1"
     MODEL_NAME = "qwen3-coder-480b-a35b-instruct"
     SERVICE_ACCOUNT_JSON = (
         r"D:\cDRIVE\Test\project_llm_decision_with_rag_v14_with_analyzer_need_to_test\google_json"
-        r"\llm-test-491910-88c51981e0b6.json"
+        r"llm-test-491910-88c51981e0b6.json"
     )
 
     credentials = service_account.Credentials.from_service_account_file(
@@ -586,6 +589,183 @@ def call_vertex_qwen_thinking(prompt: str, stop_sequences: list = None):
     
     return response_text, tokens
 
+def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None, debug: bool = True):
+    """
+    Call Kimi K2 Thinking via Vertex AI MaaS endpoint.
+    Returns: (response_text, token_dict)
+    """
+
+    import requests
+    import json
+    import google.auth.transport.requests
+    from google.oauth2 import service_account
+
+    PROJECT_ID = "llm-test-491910"
+    LOCATION = "global"
+    MODEL_NAME = "moonshotai/kimi-k2-thinking-maas"   # ✅ FIXED
+    SERVICE_ACCOUNT_JSON = (
+        r"D:\cDRIVE\Test\project_llm_decision_with_rag_v14_with_analyzer_need_to_test\google_json"
+        r"\llm-test-491910-88c51981e0b6.json"
+    )
+
+    try:
+        # ---------------- AUTH ----------------
+        credentials = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_JSON,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+
+        auth_req = google.auth.transport.requests.Request()
+        credentials.refresh(auth_req)
+
+        # ✅ FIXED ENDPOINT (NO publisher path here)
+        if LOCATION == "global":
+            base_url = "https://aiplatform.googleapis.com"
+        else:
+            base_url = f"https://{LOCATION}-aiplatform.googleapis.com"
+
+        url = (
+            f"{base_url}/v1/"
+            f"projects/{PROJECT_ID}/locations/{LOCATION}/"
+            f"endpoints/openapi/chat/completions"
+        )
+
+        headers = {
+            "Authorization": f"Bearer {credentials.token}",
+            "Content-Type": "application/json"
+        }
+
+        # ✅ FIXED PAYLOAD (OpenAI-style)
+        payload = {
+            "model": MODEL_NAME,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.6,
+            "max_tokens": 4096
+        }
+
+        if stop_sequences:
+            payload["stop"] = stop_sequences
+
+        if debug:
+            print("\n===== REQUEST DEBUG =====")
+            print("URL:", url)
+            print(json.dumps(payload, indent=2)[:1000])
+
+        # ---------------- API CALL ----------------
+        response = requests.post(url, headers=headers, json=payload, timeout=90)
+
+        if debug:
+            print("\n===== RESPONSE STATUS =====")
+            print("Status Code:", response.status_code)
+
+        if response.status_code != 200:
+            print("\n===== ERROR RESPONSE =====")
+            try:
+                print(json.dumps(response.json(), indent=2))
+            except Exception:
+                print(response.text)
+
+            return "", {"input": 0, "output": 0, "error_code": response.status_code}
+
+        data = response.json()
+
+        if debug:
+            print("\n===== FULL RESPONSE (trimmed) =====")
+            print(json.dumps(data, indent=2)[:2000])
+
+        # ✅ FIXED RESPONSE PARSING (OpenAI format)
+        response_text = ""
+        tokens = {"input": 0, "output": 0}
+
+        choices = data.get("choices", [])
+        if choices:
+            response_text = choices[0].get("message", {}).get("content", "")
+
+        usage = data.get("usage", {})
+        tokens = {
+            "input": usage.get("prompt_tokens", 0),
+            "output": usage.get("completion_tokens", 0)
+        }
+
+        return response_text, tokens
+
+    except Exception as e:
+        print("\n===== EXCEPTION =====")
+        print("Error Type:", type(e).__name__)
+        print("Error Message:", str(e))
+
+        return "", {"input": 0, "output": 0, "error": str(e)}
+
+"""
+def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None):
+
+    Call Kimi K2 Thinking via Vertex AI MaaS endpoint.
+
+    Returns: (response_text, token_dict)
+
+    import google.auth.transport.requests
+    from google.oauth2 import service_account
+
+    PROJECT_ID = "llm-test-491910"
+    LOCATION = "us-central1"
+    MODEL_NAME = "kimi-k2-thinking"
+    SERVICE_ACCOUNT_JSON = (
+        r"D:\cDRIVE\Test\project_llm_decision_with_rag_v14_with_analyzer_need_to_test\google_json"
+        r"\llm-test-491910-88c51981e0b6.json"
+    )
+
+    credentials = service_account.Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_JSON,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"]
+    )
+
+    auth_req = google.auth.transport.requests.Request()
+    credentials.refresh(auth_req)
+
+    url = (
+        f"https://{LOCATION}-aiplatform.googleapis.com/v1/"
+        f"projects/{PROJECT_ID}/locations/{LOCATION}/"
+        f"publishers/moonshotai/models/{MODEL_NAME}-maas:generateContent"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {credentials.token}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.6,
+            "maxOutputTokens": 4096
+        }
+    }
+
+    response = requests.post(url, headers=headers, json=payload, timeout=90)
+    response.raise_for_status()
+
+    data = response.json()
+
+    usage_metadata = data.get("usageMetadata", {})
+    tokens = {
+        "input": usage_metadata.get("promptTokenCount", 0),
+        "output": usage_metadata.get("candidatesTokenCount", 0)
+    }
+
+    response_text = data["candidates"][0]["content"]["parts"][0]["text"]
+
+    return response_text, tokens
+"""
 
 # ============================================================================
 # LLM COST CALCULATOR (Optional utility)
@@ -615,7 +795,9 @@ def calculate_cost(provider: str, input_tokens: int, output_tokens: int) -> floa
         "claude_haiku": {"input": 1.0, "output": 5.0},
         "groq": {"input": 0.59, "output": 0.79},
         "grok": {"input": 0.0, "output": 0.0},  # Beta pricing TBD
-        "vertex_qwen": {"input": 0.0, "output": 0.0}  # Variable
+        "vertex_qwen": {"input": 0.0, "output": 0.0},  # Variable
+        "vertex_qwen_thinking": {"input": 0.0, "output": 0.0},  # Variable
+        "vertex_kimi_k2_thinking": {"input": 0.0, "output": 0.0},  # Variable
     }
     
     if provider not in pricing:
@@ -637,6 +819,8 @@ if __name__ == "__main__":
     print("  • groq            - Llama 3.3 70B (fast inference)")
     print("  • grok            - xAI Grok Beta (NEW!)")
     print("  • vertex_qwen     - Qwen 480B (specialized coding)")
+    print("  • vertex_qwen_thinking - Qwen3 Next Thinking via Vertex")
+    print("  • vertex_kimi_k2_thinking - Kimi K2 Thinking via Vertex")
     print("\nUsage:")
     print('  response, tokens = call_llm(prompt, "grok")')
     print('  cost = calculate_cost("grok", tokens["input"], tokens["output"])')
