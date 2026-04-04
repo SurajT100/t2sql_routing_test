@@ -267,7 +267,7 @@ class FlowConfig:
     """Configuration for query processing."""
     # Classification
     enable_classification: bool = True
-    classification_provider: str = "groq"
+    classification_provider: str = "claude_haiku"
     
     # RAG - Only Rule RAG now (Schema RAG removed - poor accuracy)
     enable_rule_rag: bool = True
@@ -308,6 +308,12 @@ class FlowConfig:
     validate_sql: bool = True
     auto_fix_sql: bool = True
     
+    # Analyzer Agent (multi-step decomposition for analysis-complexity queries)
+    enable_analyzer: bool = True
+
+    # Pre-computed classification — when set, process_query skips the second LLM call
+    initial_classification: Optional[Dict] = None
+
     # Dialect
     dialect: str = "postgresql"
     dialect_info: Dict = field(default_factory=lambda: {
@@ -341,6 +347,8 @@ class TokenUsage:
     error_fix_reasoning: Dict[str, int] = field(default_factory=_zero_tok)
     error_fix_opus: Dict[str, int] = field(default_factory=_zero_tok)
     chart: Dict[str, int] = field(default_factory=_zero_tok)
+    # Analyzer Agent — multi-step decomposition (analysis-complexity queries)
+    analyzer: Dict[str, int] = field(default_factory=_zero_tok)
 
     def total(self) -> Dict[str, int]:
         all_stages = [
@@ -349,6 +357,7 @@ class TokenUsage:
             self.sql_gen, self.opus, self.refinement,
             self.tier1_fix, self.tier2_fix,
             self.error_fix_reasoning, self.error_fix_opus,
+            self.analyzer,
         ]
         return {
             "input":  sum(s["input"]  for s in all_stages),
@@ -367,6 +376,7 @@ class TokenUsage:
             self.sql_gen, self.opus, self.refinement,
             self.tier1_fix, self.tier2_fix,
             self.error_fix_reasoning, self.error_fix_opus,
+            self.analyzer,
         ]
         return sum(s.get("cache_creation_input_tokens", 0) for s in all_stages)
 
@@ -378,6 +388,7 @@ class TokenUsage:
             self.sql_gen, self.opus, self.refinement,
             self.tier1_fix, self.tier2_fix,
             self.error_fix_reasoning, self.error_fix_opus,
+            self.analyzer,
         ]
         return sum(s.get("cache_read_input_tokens", 0) for s in all_stages)
 
@@ -476,6 +487,9 @@ class QueryResult:
     entities_resolved: int = 0
     resolver_time_ms: int = 0
     
+    # Analyzer Agent result (populated for analysis-complexity queries)
+    analyzer_data: Any = None
+
     # Timing
     total_time_ms: int = 0
     stage_times: Dict[str, int] = field(default_factory=dict)
@@ -649,10 +663,11 @@ def process_query(
         stage_start = time.time()
         
         if config.enable_classification:
-            classification = classify_query(
+            # Use pre-computed result from the UI (avoids a second LLM call)
+            classification = config.initial_classification or classify_query(
                 question,
                 use_llm=True,
-                llm_provider=config.classification_provider
+                llm_provider=config.classification_provider,
             )
             result.complexity = classification["complexity"]
             result.classification_reason = classification["reason"]
@@ -847,25 +862,119 @@ def process_query(
 
         # Normalise legacy complexity values
         complexity_norm = result.complexity
-        legacy_map = {"easy": "simple", "medium": "analytical", "hard": "comparative"}
+        legacy_map = {"easy": "simple", "medium": "analytical", "hard": "comparative", "analysis": "analysis"}
         complexity_norm = legacy_map.get(complexity_norm, complexity_norm)
 
+        # If analysis complexity but Analyzer Agent is disabled, fall back to hard flow
+        if complexity_norm == "analysis" and not config.enable_analyzer:
+            print(f"[STAGE3] Analyzer Agent disabled — routing analysis query as comparative")
+            complexity_norm = "comparative"
+
         if complexity_norm == "simple":
-            # ── SIMPLE: SQL Coder only (schema + rules already fetched in Stage 2) ──
-            result.flow_path = "SIMPLE: Question → Schema + RAG → SQL Coder → Execute"
+            # ── SIMPLE: SQL Coder first, with optional resolver enrichment ──
+            result.flow_path = "SIMPLE: Question → Schema + RAG (+optional Resolver) → SQL Coder → Execute"
             print(f"[STAGE3] SIMPLE flow")
 
-            # Prompt caching: schema + rules + dialect → system; question → user
+            # Optional lightweight Pass 1 + Context Agent for resolver support in SIMPLE flow.
+            # This keeps SIMPLE mostly direct while still enabling live entity resolution when needed.
+            simple_schema_for_sql = schema_text
+            simple_rules_for_sql = rules_compressed
+            simple_resolver_text = ""
+
+            if config.enable_resolver:
+                try:
+                    _sp1_system = _build_static_system_prompt(
+                        dialect_syntax=dialect_syntax,
+                        schema=bare_schema,
+                        rules=rules_compressed,
+                        extra_instructions=(
+                            f"You are a SQL query planner for {dialect_name_upper}. "
+                            f"Identify which tables and columns are needed.\n"
+                            f"COLUMN FORMAT: {quote_char}column_name{quote_char}"
+                        ),
+                    )
+                    _sp1_user = (
+                        f"QUESTION: {question}\n\n"
+                        f"Identify all tables and columns needed. Return JSON only:\n"
+                        f'{{"tables": [...], "columns": {{"table": ["col1",...]}}, '
+                        f'"string_filter_columns": [{{"table": "t", "column": "c", "user_value": "v", "filter_type": "include"}}], '
+                        f'"joins_needed": true/false}}\n\n'
+                        f"string_filter_columns: only columns where the user supplied a human-readable value "
+                        f"that may not match exactly (names, categories, codes). "
+                        f"Each entry MUST be a dict with keys: table, column, user_value, filter_type."
+                    )
+                    _sp1_prefill = "{" if _is_claude_provider(config.reasoning_provider) else None
+                    if _is_claude_provider(config.reasoning_provider) and config.enable_prompt_caching:
+                        _sp1_response, _sp1_tokens = call_llm(
+                            _sp1_user,
+                            config.reasoning_provider,
+                            prefill=_sp1_prefill,
+                            system_prompt=_sp1_system,
+                        )
+                        result.llm_trace.reasoning_pass1_input = _sp1_user
+                    else:
+                        _sp1_prompt = create_pass1_prompt(
+                            question=question,
+                            schema=bare_schema,
+                            rules=rules_compressed,
+                            dialect_info=config.dialect_info,
+                        )
+                        _sp1_response, _sp1_tokens = call_llm(
+                            _sp1_prompt,
+                            config.reasoning_provider,
+                            prefill=_sp1_prefill,
+                        )
+                        result.llm_trace.reasoning_pass1_input = _sp1_prompt
+
+                    result.tokens.reasoning_pass1 = _sp1_tokens
+                    _accumulate_cache_tokens(result.tokens.reasoning_pass1, _sp1_tokens)
+                    result.llm_trace.reasoning_pass1_output = _sp1_response
+
+                    _simple_pass1_data = parse_pass1_output(_sp1_response)
+                    _simple_agent = ContextAgent(
+                        user_engine=engine,
+                        vector_engine=vector_engine,
+                        selected_tables=selected_tables,
+                        dialect_info=config.dialect_info,
+                        enable_resolver=config.enable_resolver,
+                    )
+                    _simple_bundle = _simple_agent.fetch_context(
+                        question=question,
+                        pass1_data=_simple_pass1_data,
+                        rules_compressed=rules_compressed,
+                    )
+                    result.column_metadata = _simple_bundle.metadata
+                    result.rules_compressed = _simple_bundle.rules_compressed
+                    result.rules_retrieved = _simple_bundle.rules_retrieved
+                    result.resolver_result = _simple_bundle.resolver_result
+                    result.entities_resolved = _simple_bundle.entities_resolved
+                    result.resolver_time_ms = _simple_bundle.resolver_result.total_time_ms if _simple_bundle.resolver_result else 0
+                    result.llm_trace.resolver_summary = _simple_bundle.resolver_text
+                    result.stages_completed.append("context_agent")
+                    result.stage_times["context_agent"] = _simple_bundle.total_time_ms
+
+                    if _simple_bundle.focused_schema and _simple_bundle.focused_schema.strip():
+                        simple_schema_for_sql = _simple_bundle.focused_schema
+                    if _simple_bundle.rules_compressed and _simple_bundle.rules_compressed.strip():
+                        simple_rules_for_sql = _simple_bundle.rules_compressed
+                    simple_resolver_text = _simple_bundle.resolver_text or ""
+                except Exception as _simple_ctx_err:
+                    print(f"[STAGE3] SIMPLE resolver enrichment failed (non-fatal): {_simple_ctx_err}")
+
+            # Prompt caching: schema + rules + dialect → system; question (+resolver) → user
             _sql_system = _build_static_system_prompt(
                 dialect_syntax=dialect_syntax,
-                schema=schema_text,
-                rules=rules_compressed,
+                schema=simple_schema_for_sql,
+                rules=simple_rules_for_sql,
                 extra_instructions=f"You are an expert {dialect_name_upper} SQL generator. "
                                    f"Output only valid SQL — no explanation.",
             )
             _use_sql_sys = _is_claude_provider(config.sql_provider) and config.enable_prompt_caching
-            sql_prompt = f"QUESTION: {question}\n\nOUTPUT: Only the SQL query. Start with SELECT or WITH."
-            if _is_claude_provider(config.sql_provider) and not config.enable_prompt_caching:
+            sql_prompt = f"QUESTION: {question}"
+            if simple_resolver_text:
+                sql_prompt += f"\n\nENTITY RESOLVER RESULTS (use these exact values when filtering):\n{simple_resolver_text}"
+            sql_prompt += "\n\nOUTPUT: Only the SQL query. Start with SELECT or WITH."
+            if not _use_sql_sys:
                 sql_prompt = f"{_sql_system}\n\n{sql_prompt}"
             sql_response, sql_tokens = call_llm(
                 sql_prompt, config.sql_provider,
@@ -1003,6 +1112,16 @@ def process_query(
             result.pass2_plan = pass2_response
             print(f"[STAGE3] Pass 2 complete — {pass2_tokens.get('input',0)+pass2_tokens.get('output',0)} tokens")
 
+            # Keep SQL generation anchored to Pass 1 table/column selection so the
+            # final query cannot drift to unrelated tables.
+            pass1_tables = pass1_data.get("tables", []) if isinstance(pass1_data, dict) else []
+            pass1_columns = pass1_data.get("columns", {}) if isinstance(pass1_data, dict) else {}
+            pass1_constraints = json.dumps(
+                {"tables": pass1_tables, "columns": pass1_columns},
+                indent=2,
+                ensure_ascii=False,
+            )
+
             # SQL Coder: receives Pass 2 plan + FOCUSED schema (only relevant cols have descriptions)
             # Business rules are intentionally excluded — the Pass 2 plan already encodes every
             # filter condition explicitly, so repeating rules here wastes tokens with no benefit.
@@ -1016,11 +1135,15 @@ SCHEMA:
 QUERY PLAN (implement this exactly — filters are pre-decided, do not change them):
 {pass2_response}
 
+PASS 1 TABLE/COLUMN SELECTION (must remain consistent unless the plan explicitly adds a required join):
+{pass1_constraints}
+
 CRITICAL:
 1. Use {quote_char} for ALL identifiers
 2. Implement every filter from the plan EXACTLY as written
 3. Do not substitute exact match for ILIKE or vice versa
-4. Output SQL only — no explanation
+4. Keep table/column usage aligned with Pass 1 selection
+5. Output SQL only — no explanation
 
 OUTPUT: Only the SQL query. Start with SELECT or WITH."""
 
@@ -1139,6 +1262,43 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
 
             # Legacy reasoning token compat
             result.tokens.reasoning = pass1_tokens
+
+        elif complexity_norm == "analysis":
+            # ── ANALYSIS: multi-step Analyzer Agent ──────────────────────────
+            # Decomposes the question into sub-queries, executes each through
+            # the existing pipeline, and synthesizes a final answer.
+            # If enable_analyzer is False the normalization block above already
+            # remapped complexity_norm to "comparative", so this branch only
+            # runs when the Analyzer Agent is enabled.
+            result.flow_path = "ANALYSIS: Analyzer Agent → Sub-query decomposition → Synthesis → Opus Review"
+            print(f"[STAGE3] ANALYSIS flow via SQLAnalyzer")
+            from sql_analyzer import SQLAnalyzer
+            analyzer = SQLAnalyzer(
+                engine=engine,
+                vector_engine=vector_engine,
+                selected_tables=selected_tables,
+                config=config,
+                schema_text=schema_text,
+                bare_schema=bare_schema,
+                rules_compressed=rules_compressed,
+                dialect_info=config.dialect_info,
+            )
+            analyzer_result = analyzer.analyze(question)
+            result.sql = analyzer_result.synthesis_sql
+            result.results = analyzer_result.final_results
+            # Narrate synthesis returns empty SQL + narration string — treat as success
+            _narrate = isinstance(analyzer_result.final_results, str) and bool(analyzer_result.final_results)
+            result.success = bool(
+                (analyzer_result.synthesis_sql and analyzer_result.final_results is not None)
+                or _narrate
+            )
+            result.opus_verdict = analyzer_result.opus_verdict
+            # Store full analyzer result for per-stage token display and debug tab
+            result.analyzer_data = analyzer_result
+            # Accumulate all analyzer stage tokens into the dedicated analyzer bucket
+            for stage_tok in analyzer_result.total_tokens.values():
+                result.tokens.analyzer["input"] += stage_tok.get("input", 0)
+                result.tokens.analyzer["output"] += stage_tok.get("output", 0)
 
         else:
             # Fallback — treat as analytical
@@ -1265,28 +1425,55 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
         # STAGE 5: EXECUTE SQL
         # ═══════════════════════════════════════════════════════════════════
         stage_start = time.time()
-        
-        is_safe, safety_reason = is_safe_query(result.sql)
-        
-        if not is_safe:
-            result.success = False
-            result.error = f"Query blocked: {safety_reason}"
-            result.stages_completed.append("execution_blocked")
+
+        # The analysis flow executes the synthesis SQL inside the Analyzer
+        # (via _synthesize → process_query_fn).  Skipping re-execution here
+        # prevents double DB round-trips and avoids overwriting results that
+        # Opus already reviewed inside the Analyzer.  We still run is_safe_query
+        # as a safety gate in case Tier 1 produced a non-SELECT rewrite.
+        _analysis_already_executed = (
+            result.complexity == "analysis"
+            and result.success
+            and result.results is not None
+        )
+
+        if _analysis_already_executed:
+            # Narrate synthesis: no SQL was generated — the narration IS the answer.
+            # Skip the SQL safety gate entirely; there is nothing to execute.
+            _is_narrate = not result.sql and isinstance(result.results, str)
+            if _is_narrate:
+                result.stages_completed.append("execution_narrated")
+            else:
+                is_safe, safety_reason = is_safe_query(result.sql)
+                if not is_safe:
+                    result.success = False
+                    result.error = f"Query blocked: {safety_reason}"
+                    result.stages_completed.append("execution_blocked")
+                else:
+                    result.stages_completed.append("execution")
             result.stage_times["execution"] = int((time.time() - stage_start) * 1000)
         else:
-            try:
-                result.results = run_sql(engine, result.sql)
-                result.success = True
-                result.stages_completed.append("execution")
-            except Exception as e:
+            is_safe, safety_reason = is_safe_query(result.sql)
+
+            if not is_safe:
                 result.success = False
-                result.error = str(e)
-                result.original_error = str(e)
-                result.stages_completed.append("execution_failed")
-                print(f"[ERROR RECOVERY] SQL execution failed: {str(e)[:100]}")
-                print(f"[ERROR RECOVERY] Starting recovery: Attempt 1 → Reasoning LLM")
-        
-        result.stage_times["execution"] = int((time.time() - stage_start) * 1000)
+                result.error = f"Query blocked: {safety_reason}"
+                result.stages_completed.append("execution_blocked")
+                result.stage_times["execution"] = int((time.time() - stage_start) * 1000)
+            else:
+                try:
+                    result.results = run_sql(engine, result.sql)
+                    result.success = True
+                    result.stages_completed.append("execution")
+                except Exception as e:
+                    result.success = False
+                    result.error = str(e)
+                    result.original_error = str(e)
+                    result.stages_completed.append("execution_failed")
+                    print(f"[ERROR RECOVERY] SQL execution failed: {str(e)[:100]}")
+                    print(f"[ERROR RECOVERY] Starting recovery: Attempt 1 → Reasoning LLM")
+
+            result.stage_times["execution"] = int((time.time() - stage_start) * 1000)
         
         # ═══════════════════════════════════════════════════════════════════
         # STAGE 6: ERROR RECOVERY (only if execution failed)
@@ -1324,11 +1511,21 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
                         f"(confidence={diagnosis.confidence})"
                     )
                     if diagnosis.confidence in ("high", "medium"):
+                        _t2_context_parts = []
+                        if schema_text:
+                            _t2_context_parts.append(f"SCHEMA:\n{schema_text}")
+                        if result.rules_compressed and result.rules_compressed.strip() not in ("", "[]"):
+                            _t2_context_parts.append(f"BUSINESS RULES:\n{result.rules_compressed}")
+                        if result.llm_trace.resolver_summary:
+                            _t2_context_parts.append(
+                                "ENTITY RESOLVER RESULTS:\n" + result.llm_trace.resolver_summary
+                            )
                         _t2_prompt = build_tier2_mini_retry_prompt(
                             original_sql=result.sql,
                             diagnosis=diagnosis,
                             dialect=config.dialect,
                             quote_char=_t2_quote_char,
+                            context_hint="\n\n".join(_t2_context_parts),
                         )
                         _t2_response, _t2_tokens = call_llm(_t2_prompt, config.sql_provider)
                         _t2_fixed_sql = extract_sql_from_response(_t2_response)
@@ -1870,13 +2067,20 @@ def _build_user_friendly_error(
 def _should_run_opus(enable_opus, complexity: str, execution_success: bool) -> bool:
     """Determine if Opus review should run."""
     print(f"[DEBUG OPUS] enable_opus={enable_opus} (type={type(enable_opus).__name__}), complexity={complexity}, success={execution_success}")
-    
+
+    # The analysis flow runs its own Opus review inside the Analyzer (sql_analyzer.py).
+    # Stage 7 must not fire a second time — that would double the token spend and
+    # produce a conflicting verdict via a different code path.
+    if complexity == "analysis":
+        print(f"[DEBUG OPUS] → Skipping: analysis flow owns its own Opus review")
+        return False
+
     if isinstance(enable_opus, str):
         if enable_opus.lower() == "true":
             enable_opus = True
         elif enable_opus.lower() == "false":
             enable_opus = False
-    
+
     if enable_opus == True or enable_opus is True:
         print(f"[DEBUG OPUS] → Running: Always mode (success={execution_success})")
         return execution_success  # Only review if execution succeeded
@@ -1890,7 +2094,7 @@ def _should_run_opus(enable_opus, complexity: str, execution_success: bool) -> b
         should_run = complexity == "hard"
         print(f"[DEBUG OPUS] → Auto mode: {'Running' if should_run else 'Skipping'} (complexity={complexity})")
         return should_run
-    
+
     print(f"[DEBUG OPUS] → Skipping: Unknown value")
     return False
 

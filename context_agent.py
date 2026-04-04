@@ -48,7 +48,8 @@ Usage:
 
 import json
 import time
-from typing import Dict, List, Any, Optional
+import re
+from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, field
 
 
@@ -139,6 +140,12 @@ class ContextAgent:
         identified_tables = pass1_data.get("tables", [])
         joins_needed = pass1_data.get("joins_needed", False)
 
+        # Normalise Pass 1 table naming (schema-qualified vs bare) so metadata
+        # lookup, resolver, and focused-schema building all refer to the same keys.
+        columns_by_table, string_filter_columns, identified_tables = self._normalize_pass1_tables(
+            columns_by_table, string_filter_columns, identified_tables
+        )
+
         if not columns_by_table:
             print("[CONTEXT AGENT] No columns identified by Pass 1 — returning empty bundle")
             bundle.rules_compressed = rules_compressed
@@ -196,6 +203,10 @@ class ContextAgent:
         if self.enable_resolver and string_filter_columns:
             stage_start = time.time()
             try:
+                string_filter_columns = self._attach_canonical_candidates(
+                    string_filter_columns, bundle.rules_compressed
+                )
+
                 from entity_resolver import (
                     resolve_entities,
                     format_resolutions_for_prompt,
@@ -462,13 +473,20 @@ class ContextAgent:
         """
         metadata = {}
         
-        # Build string filter set for quick lookup
+        # Build string filter set for quick lookup (full + bare table forms)
         string_filter_set = set()
         if string_filter_columns:
             for sf in string_filter_columns:
                 if not isinstance(sf, dict):
                     continue
-                string_filter_set.add((sf.get("table", ""), sf.get("column", "")))
+                sf_table = str(sf.get("table", "") or "")
+                sf_col = str(sf.get("column", "") or "")
+                if not sf_col:
+                    continue
+                sf_table_bare = sf_table.split(".")[-1] if sf_table else ""
+                string_filter_set.add((sf_table, sf_col))
+                if sf_table_bare:
+                    string_filter_set.add((sf_table_bare, sf_col))
         
         try:
             for table_name, columns in columns_by_table.items():
@@ -477,34 +495,44 @@ class ContextAgent:
                 for col in columns:
                     try:
                         # Single query per column: gets data_type + samples + opus_description + user_description
-                        result = self.vector_engine.table("schema_columns").select(
-                            "column_name, data_type, sample_values, "
-                            "opus_description, user_description, friendly_name"
-                        ).eq("table_name", table_name).eq("column_name", col).execute()
-                        
-                        if result.data:
-                            row = result.data[0]
-                            sample_values = row.get("sample_values") or []
-                            
+                        from sqlalchemy import text as _text
+                        with self.vector_engine.connect() as _conn:
+                            table_name_bare = table_name.split(".")[-1]
+                            _row = _conn.execute(
+                                _text(
+                                    "SELECT column_name, data_type, sample_values, "
+                                    "opus_description, user_description, friendly_name "
+                                    "FROM schema_columns "
+                                    "WHERE object_name IN (:tname, :tbare) AND column_name = :cname "
+                                    "ORDER BY CASE WHEN object_name = :tname THEN 0 ELSE 1 END "
+                                    "LIMIT 1"
+                                ),
+                                {"tname": table_name, "tbare": table_name_bare, "cname": col}
+                            ).mappings().fetchone()
+
+                        if _row:
+                            sample_values = _row.get("sample_values") or []
+
                             if isinstance(sample_values, str):
                                 try:
                                     sample_values = json.loads(sample_values)
                                 except Exception:
                                     sample_values = []
-                            
+
                             sample_values = sample_values[:10]
-                            
+
                             # Priority: user_description > opus_description > friendly_name
                             description = (
-                                row.get("user_description") or 
-                                row.get("opus_description") or 
-                                row.get("friendly_name") or ""
+                                _row.get("user_description") or
+                                _row.get("opus_description") or
+                                _row.get("friendly_name") or ""
                             )
-                            
-                            needs_partial = (table_name, col) in string_filter_set
-                            
+
+                            table_name_bare = table_name.split(".")[-1]
+                            needs_partial = ((table_name, col) in string_filter_set) or ((table_name_bare, col) in string_filter_set)
+
                             metadata[table_name][col] = {
-                                "data_type": row.get("data_type", "unknown"),
+                                "data_type": _row.get("data_type", "unknown"),
                                 "sample_values": sample_values,
                                 "description": description,
                                 "needs_partial_match": needs_partial
@@ -514,7 +542,7 @@ class ContextAgent:
                                 "data_type": "unknown",
                                 "sample_values": [],
                                 "description": "",
-                                "needs_partial_match": (table_name, col) in string_filter_set
+                                "needs_partial_match": ((table_name, col) in string_filter_set) or ((table_name.split(".")[-1], col) in string_filter_set)
                             }
                     
                     except Exception as col_err:
@@ -530,6 +558,151 @@ class ContextAgent:
             print(f"[CONTEXT AGENT] Metadata fetch failed: {e}")
         
         return metadata
+
+    @staticmethod
+    def _attach_canonical_candidates(
+        string_filter_columns: List[Dict],
+        rules_compressed: str,
+    ) -> List[Dict]:
+        """Attach rule-derived canonical candidates to resolver inputs.
+
+        This allows values like "closed" or "inprogress" to be mapped to
+        coded DB values such as "clsd" / "in_prgs" before fuzzy fallback.
+        """
+        if not string_filter_columns:
+            return string_filter_columns
+
+        if not rules_compressed or str(rules_compressed).strip() in ("", "[]", "null", "None"):
+            return string_filter_columns
+
+        value_maps = ContextAgent._extract_value_maps(rules_compressed)
+        if not value_maps:
+            return string_filter_columns
+
+        updated: List[Dict] = []
+        for sf in string_filter_columns:
+            if not isinstance(sf, dict):
+                continue
+            sf2 = dict(sf)
+            table = str(sf2.get("table", "")).split(".")[-1].lower()
+            column = str(sf2.get("column", "")).lower()
+            user_value = str(sf2.get("user_value", "")).strip()
+            if not user_value:
+                updated.append(sf2)
+                continue
+
+            user_value_norm = user_value.lower().strip()
+            # Supports patterns like "closed or inprogress" / "a, b and c".
+            tokens = [
+                t.strip() for t in re.split(r"\s*(?:,|/|\bor\b|\band\b)\s*", user_value_norm)
+                if t.strip()
+            ]
+            lookup_keys = [user_value_norm] + tokens
+
+            candidates: List[str] = []
+            seen = set()
+            maps_for_column = value_maps.get((table, column), {})
+            maps_global_col = value_maps.get(("", column), {})
+
+            for lk in lookup_keys:
+                for c in maps_for_column.get(lk, []) + maps_global_col.get(lk, []):
+                    cs = str(c).strip()
+                    if cs and cs.lower() not in seen:
+                        seen.add(cs.lower())
+                        candidates.append(cs)
+
+            if candidates:
+                sf2.setdefault("user_value_raw", user_value)
+                sf2["canonical_candidates"] = candidates
+                sf2["normalization_source"] = "business_rule"
+            updated.append(sf2)
+
+        return updated
+
+    @staticmethod
+    def _extract_value_maps(rules_compressed: str) -> Dict[Tuple[str, str], Dict[str, List[str]]]:
+        """Parse mapping rules into {(table,column): {alias: [canonical...]}}.
+
+        Supports both:
+        - Raw rules (`rule_data.mappings` / `rule_data.values`)
+        - Compressed rules from `compress_rules_for_llm` (`maps` at top level)
+        """
+        try:
+            rules_list = json.loads(rules_compressed or "[]")
+        except Exception:
+            return {}
+
+        if not isinstance(rules_list, list):
+            return {}
+
+        out: Dict[Tuple[str, str], Dict[str, List[str]]] = {}
+
+        for rule in rules_list:
+            if not isinstance(rule, dict):
+                continue
+            rule_type = str(rule.get("type", "")).strip().lower()
+            # Only use explicit user-defined mapping rules; ignore all other rule types.
+            if rule_type not in {"mapping", "value_mapping", "term_alias"}:
+                continue
+
+            rule_data = rule.get("rule_data") or {}
+            if isinstance(rule_data, str):
+                try:
+                    rule_data = json.loads(rule_data)
+                except Exception:
+                    rule_data = {}
+            if not isinstance(rule_data, dict):
+                rule_data = {}
+
+            # Compressed form uses "maps"; raw form keeps mappings inside rule_data.
+            mappings = (
+                rule.get("maps")
+                or rule_data.get("mappings")
+                or rule_data.get("values")
+                or {}
+            )
+
+            if not isinstance(mappings, dict) or not mappings:
+                continue
+
+            table = str(
+                rule.get("table")
+                or rule_data.get("table")
+                or rule_data.get("table_name")
+                or ""
+            ).split(".")[-1].lower()
+            column = str(
+                rule.get("column")
+                or rule_data.get("column")
+                or rule_data.get("target_column")
+                or rule_data.get("column_name")
+                or ""
+            ).lower()
+
+            # Don't create "global" synthetic mappings from unrelated rules.
+            # We only apply mappings scoped at least to a concrete column.
+            if not column:
+                continue
+
+            key = (table, column)
+            out.setdefault(key, {})
+
+            for alias, canonical_values in mappings.items():
+                alias_norm = str(alias).strip().lower()
+                if not alias_norm:
+                    continue
+                if isinstance(canonical_values, (list, tuple)):
+                    cvals = [str(v).strip() for v in canonical_values if str(v).strip()]
+                else:
+                    cvals = [str(canonical_values).strip()] if str(canonical_values).strip() else []
+                if not cvals:
+                    continue
+                out[key].setdefault(alias_norm, [])
+                for cv in cvals:
+                    if cv not in out[key][alias_norm]:
+                        out[key][alias_norm].append(cv)
+
+        return out
     
     # ═════════════════════════════════════════════════════════════════════
     # INTERNAL: Focused Schema Builder
@@ -650,6 +823,56 @@ class ContextAgent:
                 clean.append(t)
         return clean
     
+    def _normalize_pass1_tables(
+        self,
+        columns_by_table: Dict[str, List[str]],
+        string_filter_columns: List[Dict],
+        identified_tables: List[str]
+    ) -> Tuple[Dict[str, List[str]], List[Dict], List[str]]:
+        """Normalise Pass 1 table names to selected_tables canonical names."""
+        # Build aliases: full + bare lowercase -> canonical table name
+        alias_to_canonical: Dict[str, str] = {}
+        for t in self.selected_tables:
+            t_norm = str(t).strip()
+            if not t_norm:
+                continue
+            alias_to_canonical.setdefault(t_norm.lower(), t_norm)
+            alias_to_canonical.setdefault(t_norm.split(".")[-1].lower(), t_norm)
+
+        def _canon(name: str) -> str:
+            raw = str(name or "").strip()
+            if not raw:
+                return raw
+            return alias_to_canonical.get(raw.lower(), alias_to_canonical.get(raw.split(".")[-1].lower(), raw))
+
+        normalized_columns: Dict[str, List[str]] = {}
+        for t, cols in (columns_by_table or {}).items():
+            canon_t = _canon(t)
+            normalized_columns.setdefault(canon_t, [])
+            for c in (cols or []):
+                if c and c not in normalized_columns[canon_t]:
+                    normalized_columns[canon_t].append(c)
+
+        normalized_sfc: List[Dict] = []
+        for sf in (string_filter_columns or []):
+            if not isinstance(sf, dict):
+                continue
+            sf2 = dict(sf)
+            sf2["table"] = _canon(sf2.get("table", ""))
+            normalized_sfc.append(sf2)
+
+        normalized_tables: List[str] = []
+        for t in (identified_tables or []):
+            ct = _canon(t)
+            if ct and ct not in normalized_tables:
+                normalized_tables.append(ct)
+
+        # If Pass 1 omitted tables list, derive from normalized columns
+        if not normalized_tables:
+            normalized_tables = list(normalized_columns.keys())
+
+        return normalized_columns, normalized_sfc, normalized_tables
+
     @staticmethod
     def _count_descriptions(metadata: Dict[str, Any]) -> int:
         """Count how many columns have descriptions in metadata."""

@@ -63,6 +63,90 @@ except Exception as e:
 
 
 # ======================
+# HELPERS
+# ======================
+
+def _generate_result_summary(question: str, results_df, provider: str = "claude_sonnet") -> tuple:
+    """Generate a short business-friendly summary of query results using an LLM.
+
+    Returns (summary_text, tokens_dict).
+    """
+    if results_df is None:
+        return "", {"input": 0, "output": 0}
+    if hasattr(results_df, "empty") and results_df.empty:
+        return "", {"input": 0, "output": 0}
+
+    try:
+        cols = list(results_df.columns) if hasattr(results_df, "columns") else []
+        total_rows = len(results_df) if hasattr(results_df, "__len__") else "unknown"
+        sample = (
+            results_df.head(10).to_dict(orient="records")
+            if hasattr(results_df, "head")
+            else str(results_df)[:500]
+        )
+
+        prompt = f"""Question asked: {question}
+
+Query returned {total_rows} rows. Column names: {cols}
+First 10 rows of data: {sample}
+
+Write a concise, business-friendly summary of what these results show.
+Rules:
+- Do NOT use technical jargon, SQL terms, or raw column names verbatim
+- Write for a business stakeholder (manager, executive) — plain English only
+- Be specific: reference actual numbers, names, or findings visible in the data
+- For simple/direct results: one sentence is enough (e.g. "There are 47 active deals currently in the pipeline.")
+- For ranked or comparative results: 2-3 sentences highlighting the top finding and what it implies
+- Example style: "The results show the top 10 customers by total purchase value. Customer X leads with ₹Y in spending, significantly ahead of others in the list. This suggests a small group of customers drives the majority of revenue."
+
+Return ONLY the summary text with no preamble, labels, or markdown."""
+
+        summary, tok = call_llm(prompt=prompt, provider=provider)
+        return summary.strip(), tok
+    except Exception:
+        return "", {"input": 0, "output": 0}
+
+
+def _build_failure_suggestions(question: str, result) -> list:
+    """Build lightweight, actionable suggestions when a query fails."""
+    suggestions = []
+
+    pass2_out = (getattr(result.llm_trace, "reasoning_pass2_output", "") or "").lower()
+    resolver_summary = (getattr(result.llm_trace, "resolver_summary", "") or "").lower()
+
+    # Common mismatch: Pass 1 normalizes a user term but resolver cannot find exact entity.
+    if (
+        "partial match" in pass2_out
+        or "no entity resolver" in pass2_out
+        or (resolver_summary and "no match" in resolver_summary)
+        or (hasattr(result, "entities_resolved") and result.entities_resolved == 0 and bool(resolver_summary))
+    ):
+        suggestions.append(
+            "Use exact raw filter values from source data (for example `Stage-Opn/Cls`) and add `use exact value, do not normalize` in your question."
+        )
+        suggestions.append(
+            "If possible, include one anchor (ID/code) with the label so resolver can map confidently."
+        )
+
+    if "tier2_unclassified" in getattr(result, "stages_completed", []):
+        suggestions.append(
+            "The database error could not be auto-classified. Open the debug tabs and rerun with a narrower question (single metric + single filter)."
+        )
+
+    if "tier2_fix_failed" in getattr(result, "stages_completed", []):
+        suggestions.append(
+            "Tier-2 SQL mini-fix failed. Try rephrasing with explicit table/column hints to reduce ambiguity before retrying."
+        )
+
+    if not suggestions:
+        suggestions.append(
+            "Try a narrower query first (single metric, single time window), then add conditions step-by-step."
+        )
+
+    return suggestions
+
+
+# ======================
 # PAGE CONFIG
 # ======================
 st.set_page_config("Text-to-SQL RAG Platform", layout="wide", page_icon="🧠")
@@ -256,7 +340,8 @@ with st.sidebar:
             "Claude Haiku 4.5",
             "Groq Llama 3.3 70B",
             "xAI Grok Beta",
-            "Qwen 2.5 Coder 32B"
+            "Qwen 2.5 Coder 32B",
+            "Kimi K2 Thinking (Vertex)"
         ],
         key="reasoning_llm"
     )
@@ -269,7 +354,8 @@ with st.sidebar:
         "Claude Haiku 4.5": "claude_haiku",
         "Groq Llama 3.3 70B": "groq",
         "xAI Grok Beta": "grok",
-        "Qwen 2.5 Coder 32B": "vertex_qwen"
+        "Qwen 2.5 Coder 32B": "vertex_qwen",
+        "Kimi K2 Thinking (Vertex)": "vertex_kimi_k2_thinking"
     }
     
     coding_llm = st.selectbox(
@@ -2067,9 +2153,14 @@ with tab3:
             with col_opt1:
                 st.write("**Query Classification**")
                 enable_classification = st.checkbox(
-                    "Enable Llama Classification", 
+                    "Enable Llama Classification",
                     value=True,
-                    help="Classify queries as Easy/Medium/Hard to optimize tokens"
+                    help="Classify queries as Easy/Medium/Hard/Analysis to optimize tokens"
+                )
+                enable_analyzer = st.checkbox(
+                    "Enable Analyzer Agent",
+                    value=True,
+                    help="For Analysis-complexity queries: decompose into sub-questions, run each through the pipeline, then synthesize a final SQL answer. Disable to fall back to Hard flow."
                 )
             
             with col_opt2:
@@ -2160,14 +2251,15 @@ with tab3:
                 with col_rev2:
                     reviewer_provider = st.selectbox(
                         "Reviewer LLM",
-                        ["Claude Opus", "Qwen Coder (Vertex)"],
+                        ["Claude Opus", "Qwen Coder (Vertex)", "Kimi K2 Thinking (Vertex)"],
                         index=0,
                         help="Choose which LLM reviews the SQL",
                         disabled=(opus_mode == "Disabled")
                     )
                     reviewer_provider_map = {
                         "Claude Opus": "claude_opus",
-                        "Qwen Coder (Vertex)": "vertex_qwen_thinking"
+                        "Qwen Coder (Vertex)": "vertex_qwen_thinking",
+                        "Kimi K2 Thinking (Vertex)": "vertex_kimi_k2_thinking"
                     }
                     selected_reviewer = reviewer_provider_map[reviewer_provider]
         
@@ -2207,7 +2299,7 @@ with tab3:
                 # Create config
                 config = FlowConfig(
                     enable_classification=enable_classification,
-                    classification_provider="groq",
+                    enable_analyzer=enable_analyzer,
                     enable_rule_rag=enable_rule_rag,
                     enable_opus_descriptions=enable_opus_descriptions,
                     enable_cache=enable_cache,
@@ -2221,8 +2313,8 @@ with tab3:
                     auto_fix_sql=True,
                     enable_opus=opus_config,
                     opus_provider=selected_reviewer,
-                    reasoning_provider=st.session_state.get('reasoning_provider', 'claude_sonnet'),
-                    sql_provider=st.session_state.get('coding_provider', 'groq'),
+                    reasoning_provider=st.session_state.reasoning_provider,
+                    sql_provider=st.session_state.coding_provider,
                     dialect=dialect,
                     dialect_info={
                         "dialect": dialect,
@@ -2236,10 +2328,11 @@ with tab3:
                 # ───────────────────────────────────────────────────────────
                 if enable_classification:
                     with st.spinner("🏷️ Classifying query..."):
-                        classification = classify_query(question, use_llm=False)
-                    
+                        classification = classify_query(question, use_llm=True, llm_provider="claude_haiku")
+                    config.initial_classification = classification  # reuse — no second LLM call
+
                     complexity = classification["complexity"]
-                    complexity_emoji = {"easy": "🟢", "medium": "🟡", "hard": "🔴"}[complexity]
+                    complexity_emoji = {"easy": "🟢", "medium": "🟡", "hard": "🔴", "analysis": "🟣"}.get(complexity, "⚪")
                     flow_cfg = get_flow_config(complexity)
                     
                     col_c1, col_c2, col_c3 = st.columns([1, 2, 1])
@@ -2260,7 +2353,18 @@ with tab3:
                         selected_tables=st.session_state.selected_objects,
                         config=config
                     )
-                
+
+                # Generate business-friendly summary for ALL query types
+                _summary_text = ""
+                _summary_tokens = {"input": 0, "output": 0}
+                if result.success and result.results is not None and hasattr(result.results, "columns"):
+                    with st.spinner("📊 Generating analysis summary..."):
+                        _summary_text, _summary_tokens = _generate_result_summary(
+                            question=question,
+                            results_df=result.results,
+                            provider=st.session_state.reasoning_provider,
+                        )
+
                 # ───────────────────────────────────────────────────────────
                 # DISPLAY RESULTS
                 # ───────────────────────────────────────────────────────────
@@ -2319,6 +2423,31 @@ with tab3:
                         token_data.append({"Stage": "🔧 Refinement", "Input": tokens.refinement["input"], "Output": tokens.refinement["output"]})
                     if tokens.chart["input"] + tokens.chart["output"] > 0:
                         token_data.append({"Stage": "📊 Chart Builder", "Input": tokens.chart["input"], "Output": tokens.chart["output"]})
+
+                    # Analyzer Agent — per-stage rows (analysis-complexity queries only)
+                    if hasattr(result, 'analyzer_data') and result.analyzer_data:
+                        ar = result.analyzer_data
+                        ar_tok = ar.total_tokens
+                        decompose_i = ar_tok.get("decompose", {}).get("input", 0)
+                        decompose_o = ar_tok.get("decompose", {}).get("output", 0)
+                        if decompose_i + decompose_o > 0:
+                            token_data.append({"Stage": "🔬 Analyzer Plan", "Input": decompose_i, "Output": decompose_o})
+                        for idx_sq, sq in enumerate(ar.sub_queries, 1):
+                            sq_tok = sq.get("tokens", {})
+                            sq_i = sq_tok.get("input", 0)
+                            sq_o = sq_tok.get("output", 0)
+                            if sq_i + sq_o > 0:
+                                token_data.append({"Stage": f"🔬 Sub-query {idx_sq}", "Input": sq_i, "Output": sq_o})
+                        synth_i = (ar_tok.get("synthesis_plan", {}).get("input", 0)
+                                   + ar_tok.get("synthesis_execution", {}).get("input", 0))
+                        synth_o = (ar_tok.get("synthesis_plan", {}).get("output", 0)
+                                   + ar_tok.get("synthesis_execution", {}).get("output", 0))
+                        if synth_i + synth_o > 0:
+                            token_data.append({"Stage": "🔬 Synthesis", "Input": synth_i, "Output": synth_o})
+                        opus_i = ar_tok.get("opus_review", {}).get("input", 0)
+                        opus_o = ar_tok.get("opus_review", {}).get("output", 0)
+                        if opus_i + opus_o > 0:
+                            token_data.append({"Stage": "🎯 Opus Review (Analyzer)", "Input": opus_i, "Output": opus_o})
 
                     # Show resolver stats (no LLM tokens — DB query time)
                     if hasattr(result, 'resolver_result') and result.resolver_result:
@@ -2413,7 +2542,11 @@ with tab3:
                 # ───────────────────────────────────────────────────────────
                 st.divider()
                 st.subheader("💻 Generated SQL")
-                st.code(result.sql, language="sql")
+                _is_narrate_result = not result.sql and isinstance(result.results, str)
+                if _is_narrate_result:
+                    st.info("No SQL generated — answer narrated directly from sub-query results.")
+                else:
+                    st.code(result.sql, language="sql")
                 
                 
                 # ───────────────────────────────────────────────────────────
@@ -2443,8 +2576,11 @@ with tab3:
                     # Show the SQL Opus reviewed — guaranteed to match result.sql
                     # because flow_router now runs Opus AFTER all validation and
                     # auto-fix stages complete. No more stale-draft problem.
-                    st.write("**📋 SQL reviewed by Opus:**")
-                    st.code(result.sql, language="sql")
+                    if result.sql:
+                        st.write("**📋 SQL reviewed by Opus:**")
+                        st.code(result.sql, language="sql")
+                    else:
+                        st.write("**📋 Opus reviewed the narrated answer (no SQL).**")
                 
                 # ───────────────────────────────────────────────────────────
                 # QUERY RESULTS
@@ -2453,15 +2589,39 @@ with tab3:
                 st.subheader("📈 Query Results")
 
                 if result.success:
-                    if result.results is not None and hasattr(result.results, 'shape'):
+                    if result.results is not None and isinstance(result.results, str):
+                        # Narrate synthesis — display as formatted analysis text
+                        if _summary_text:
+                            st.markdown("### 📊 Analysis Summary")
+                            st.info(_summary_text)
+                        st.markdown("### 📝 Analysis")
+                        st.markdown(result.results)
+                    elif result.results is not None and hasattr(result.results, 'shape'):
 
+                        # ── Analysis Summary (Issue 5) ─────────────────────
+                        if _summary_text:
+                            st.markdown("### 📊 Analysis Summary")
+                            st.info(_summary_text)
+
+                        total_rows = len(result.results)
                         st.markdown(
                             f'<div class="row-count-badge">'
-                            f'✅ {len(result.results)} rows &nbsp;·&nbsp; '
+                            f'✅ {total_rows} rows &nbsp;·&nbsp; '
                             f'{len(result.results.columns)} columns'
                             f'</div>',
                             unsafe_allow_html=True
                         )
+
+                        # ── Row-limit display (Issue 1) ────────────────────
+                        # Limit UI display to 100 rows; CSV always contains all rows.
+                        _DISPLAY_LIMIT = 100
+                        if total_rows > _DISPLAY_LIMIT:
+                            st.info(
+                                f"⚠️ Showing {_DISPLAY_LIMIT} of {total_rows} rows. "
+                                f"Download full results below."
+                            )
+                        display_df = result.results.head(_DISPLAY_LIMIT)
+
                         if getattr(result, 'opus_blocked_soft', False):
                             st.warning(
                                 "⚠️ **Review recommended** — Opus flagged a potential logic issue. "
@@ -2485,12 +2645,12 @@ with tab3:
                                     chart_rendered, chart_tokens = build_and_render_chart(
                                         df=result.results,
                                         question=question,
-                                        llm_provider=st.session_state.get('reasoning_provider', 'claude_sonnet')
+                                        llm_provider=st.session_state.reasoning_provider
                                     )
 
                                     if not chart_rendered:
                                         st.info("📋 No suitable chart for this result — showing table")
-                                        st.dataframe(result.results, use_container_width=True)
+                                        st.dataframe(display_df, use_container_width=True)
 
                                     # Show chart token usage directly below chart
                                     if chart_tokens and chart_tokens.get("input", 0) + chart_tokens.get("output", 0) > 0:
@@ -2503,10 +2663,10 @@ with tab3:
 
                                 except ImportError:
                                     st.warning("⚠️ chart_builder.py not found in project directory.")
-                                    st.dataframe(result.results, use_container_width=True)
+                                    st.dataframe(display_df, use_container_width=True)
                                 except Exception as e:
                                     print(f"[CHART] Unexpected error: {e}")
-                                    st.dataframe(result.results, use_container_width=True)
+                                    st.dataframe(display_df, use_container_width=True)
 
                                 st.markdown('</div>', unsafe_allow_html=True)
 
@@ -2524,7 +2684,7 @@ with tab3:
                                     pass
 
                             with data_tab:
-                                st.dataframe(result.results, use_container_width=True)
+                                st.dataframe(display_df, use_container_width=True)
                                 try:
                                     import io
                                     csv_buf = io.StringIO()
@@ -2540,7 +2700,7 @@ with tab3:
                                     pass
 
                         else:
-                            st.dataframe(result.results, use_container_width=True)
+                            st.dataframe(display_df, use_container_width=True)
                             try:
                                 import io
                                 csv_buf = io.StringIO()
@@ -2589,6 +2749,12 @@ with tab3:
                         st.info("💡 Try adding more specific time period details, or contact your data team if the required data relationship doesn't exist.")
                     else:
                         st.error(f"❌ Query failed: {error_msg}")
+                        suggestions = _build_failure_suggestions(question, result)
+                        if suggestions:
+                            st.info(
+                                "💡 **Suggestions to improve the next attempt:**\n\n"
+                                + "\n".join([f"- {s}" for s in suggestions])
+                            )
                 
                 # ───────────────────────────────────────────────────────────
                 # TIMING & DEBUG
@@ -2606,7 +2772,18 @@ with tab3:
                 with st.expander("🔍 LLM Input/Output (Debug)", expanded=False):
                     st.caption("💡 Full prompts and responses - no truncation")
 
-                    llm_tabs = st.tabs(["📊 Classifier", "🧠 Reasoning", "🔍 Resolver", "⚙️ SQL Coder", "🎯 Opus Review", "🔄 Refinement", "⚡ SQL Error Fix (Reasoning)", "🔧 SQL Error Fix (Opus)"])
+                    llm_tabs = st.tabs([
+                        "📊 Classifier",
+                        "🧠 Reasoning",
+                        "🔍 Resolver",
+                        "⚙️ SQL Coder",
+                        "🎯 Opus Review",
+                        "🔄 Refinement",
+                        "🩺 Tier-2 Error Fix",
+                        "⚡ SQL Error Fix (Reasoning)",
+                        "🔧 SQL Error Fix (Opus)",
+                        "🔬 Analyzer",
+                    ])
 
                     # Use query counter as key suffix so each new query gets fresh
                     # widgets — prevents Streamlit from showing stale session state
@@ -2700,7 +2877,20 @@ with tab3:
                             st.text_area("Refinement Output", result.llm_trace.refinement_output, height=200, key=f"refine_out_{_qc}")
                         else:
                             st.info("Refinement not triggered (query was correct or Opus not enabled)")
-                    with llm_tabs[6]:  # Error Fix - Reasoning
+                    with llm_tabs[6]:  # Tier-2 Error Fix
+                        if result.llm_trace.tier2_fix_input:
+                            st.write("**📥 INPUT PROMPT (Tier-2 Error Classifier → SQL Coder):**")
+                            st.text_area("Tier-2 Input", result.llm_trace.tier2_fix_input, height=350, key=f"tier2_in_{_qc}")
+                            st.write("**📤 OUTPUT:**")
+                            st.text_area("Tier-2 Output", result.llm_trace.tier2_fix_output, height=180, key=f"tier2_out_{_qc}")
+                            if result.error_recovery_method == "tier2_classifier":
+                                st.success("✅ Tier-2 fixed the error")
+                            else:
+                                st.warning("⚠️ Tier-2 could not fix this query — escalated to Tier-3")
+                        else:
+                            st.info("Tier-2 not triggered (query succeeded first try or error was not classifiable)")
+
+                    with llm_tabs[7]:  # Error Fix - Reasoning
                         if result.llm_trace.error_fix_reasoning_input:
                             st.write("**📥 INPUT PROMPT (Attempt 1 — Reasoning LLM):**")
                             st.text_area("Error Fix Reasoning Input", result.llm_trace.error_fix_reasoning_input, height=400, key=f"err_reason_in_{_qc}")
@@ -2713,7 +2903,7 @@ with tab3:
                         else:
                             st.info("No error recovery needed for this query")
 
-                    with llm_tabs[7]:  # Error Fix - Opus
+                    with llm_tabs[8]:  # Error Fix - Opus
                         if result.llm_trace.error_fix_opus_input:
                             st.write("**📥 INPUT PROMPT (Attempt 2 — Opus):**")
                             st.text_area("Error Fix Opus Input", result.llm_trace.error_fix_opus_input, height=400, key=f"err_opus_in_{_qc}")
@@ -2725,6 +2915,214 @@ with tab3:
                                 st.error("❌ Opus also could not fix the error")
                         else:
                             st.info("Opus error fix not needed for this query")
+
+                    with llm_tabs[9]:  # Analyzer Agent
+                        if not (hasattr(result, 'analyzer_data') and result.analyzer_data):
+                            st.info("Analyzer Agent not used for this query (non-analysis complexity)")
+                        else:
+                            ar = result.analyzer_data
+                            _ar_trace = ar.trace
+                            _sub_qs = ar.sub_queries
+
+                            # Collect ordered inspect I/O entries for positional pairing
+                            _inspect_inputs  = [e for e in _ar_trace if e.get("stage") == "inspect_input"]
+                            _inspect_outputs = [e for e in _ar_trace if e.get("stage") == "inspect_output"]
+
+                            # Build dynamic tab name list
+                            _tab_names = ["📋 Plan", "🗂️ Decompose"]
+                            for _i, _sq in enumerate(_sub_qs):
+                                _tab_names.append(f"🔍 Step {_sq['step_id']}")
+                                if _i < len(_inspect_inputs):
+                                    _tab_names.append(f"🧠 Inspect {_sq['step_id']}")
+
+                            _has_synthesis = any(
+                                e.get("stage") in ("synthesis_plan_input", "synthesis_narrate", "synthesis", "synthesis_cte_sql")
+                                for e in _ar_trace
+                            )
+                            if _has_synthesis:
+                                _tab_names.append("🔗 Synthesis")
+
+                            _has_opus_an = any(e.get("stage") == "opus_review" for e in _ar_trace)
+                            if _has_opus_an:
+                                _tab_names.append("🎯 Opus Review")
+
+                            _sub_tabs = st.tabs(_tab_names)
+                            _tab_i = 0
+
+                            # ── Plan Overview (full original summary) ────────
+                            with _sub_tabs[_tab_i]:
+                                _tab_i += 1
+                                st.write(
+                                    f"**Analysis type:** {ar.plan.get('analysis_type', 'unknown')} | "
+                                    f"**Opus verdict:** {ar.opus_verdict} | "
+                                    f"**Sub-queries:** {len(ar.sub_queries)}"
+                                )
+                                st.caption(f"*Reasoning: {ar.plan.get('reasoning', '')}*")
+                                st.divider()
+
+                                # Decomposition plan
+                                st.write("### 🗂️ Decomposition Plan")
+                                for _plan_step in ar.plan.get("steps", []):
+                                    st.write(f"**Step {_plan_step['step_id']}:** {_plan_step.get('description', '')}")
+                                    st.write(f"  *Sub-question:* {_plan_step.get('sub_question', '')}")
+                                    if _plan_step.get("depends_on"):
+                                        st.write(f"  *Depends on:* {_plan_step['depends_on']}")
+                                    st.write(f"  *Result usage:* {_plan_step.get('result_usage', '')}")
+                                st.write(f"**Synthesis approach:** {ar.plan.get('synthesis_approach', '')}")
+                                st.divider()
+
+                                # Each sub-query result
+                                st.write("### 🔍 Sub-queries")
+                                for _plan_sq in ar.sub_queries:
+                                    _plan_icon = "✅" if _plan_sq.get("success") else "❌"
+                                    st.write(f"**{_plan_icon} Step {_plan_sq['step_id']}:** {_plan_sq['sub_question']}")
+                                    if _plan_sq.get("sql"):
+                                        st.code(_plan_sq["sql"], language="sql")
+                                    st.caption(f"Results: {_plan_sq.get('results_summary', 'N/A')}")
+                                    _plan_tok = _plan_sq.get("tokens", {})
+                                    if _plan_tok.get("input", 0) + _plan_tok.get("output", 0) > 0:
+                                        st.caption(f"Tokens — input: {_plan_tok.get('input', 0):,}  output: {_plan_tok.get('output', 0):,}")
+                                    st.divider()
+
+                                # Inspect decisions
+                                _plan_decisions = [e for e in _ar_trace if e.get("stage") in ("inspect_output", "modify_plan", "early_synthesize", "abort")]
+                                if _plan_decisions:
+                                    st.write("### 🧠 Analyzer Decisions")
+                                    for _plan_entry in _plan_decisions:
+                                        _plan_stage = _plan_entry["stage"]
+                                        if _plan_stage == "inspect_output":
+                                            st.write(f"**Decision:** {_plan_entry.get('response', '')[:500]}")
+                                        elif _plan_stage == "modify_plan":
+                                            st.write(f"**Plan modified:** {_plan_entry.get('updated_steps', '')}")
+                                        elif _plan_stage == "early_synthesize":
+                                            st.success(f"Early synthesis triggered: {_plan_entry.get('reason', '')}")
+                                        elif _plan_stage == "abort":
+                                            st.error(f"Aborted: {_plan_entry.get('reason', '')}")
+                                    st.divider()
+
+                                # Synthesis
+                                st.write("### 🔗 Synthesis")
+                                _plan_synth = next((e for e in _ar_trace if e.get("stage") == "synthesis_plan_output"), None)
+                                if _plan_synth:
+                                    st.write(f"Synthesis plan: {_plan_synth.get('response', '')[:500]}")
+                                _plan_final = next((e for e in _ar_trace if e.get("stage") == "synthesis_result"), None)
+                                if _plan_final:
+                                    _plan_status = "✅" if _plan_final.get("success") else "❌"
+                                    st.write(f"{_plan_status} Final SQL generated")
+                                    if ar.synthesis_sql:
+                                        st.code(ar.synthesis_sql, language="sql")
+
+                            # ── Decompose ────────────────────────────────────
+                            with _sub_tabs[_tab_i]:
+                                _tab_i += 1
+                                _dec_in  = next((e for e in _ar_trace if e.get("stage") == "decompose_input"),  None)
+                                _dec_out = next((e for e in _ar_trace if e.get("stage") == "decompose_output"), None)
+                                if _dec_in and _dec_in.get("system_prompt"):
+                                    st.write("**📥 SYSTEM PROMPT:**")
+                                    st.text_area("Decompose System", _dec_in["system_prompt"], height=300, key=f"an_dec_sys_{_qc}")
+                                if _dec_in:
+                                    st.write("**📥 USER PROMPT (schema + rules + question):**")
+                                    st.text_area("Decompose User", _dec_in.get("prompt", ""), height=400, key=f"an_dec_in_{_qc}")
+                                if _dec_out:
+                                    st.write("**📤 OUTPUT (plan JSON):**")
+                                    st.text_area("Decompose Output", _dec_out.get("response", ""), height=200, key=f"an_dec_out_{_qc}")
+
+                            # ── Step + Inspect tab pairs ──────────────────────
+                            for _i, _sq in enumerate(_sub_qs):
+                                with _sub_tabs[_tab_i]:
+                                    _tab_i += 1
+                                    _lt = _sq.get("llm_trace")
+
+                                    with st.expander("📥 Pass 1 — Column Identification", expanded=True):
+                                        if _lt and getattr(_lt, "reasoning_pass1_input", ""):
+                                            st.text_area("Pass 1 Input", _lt.reasoning_pass1_input, height=300, key=f"an_p1_in_{_i}_{_qc}")
+                                            st.write("**📤 Pass 1 Output:**")
+                                            st.text_area("Pass 1 Output", _lt.reasoning_pass1_output, height=150, key=f"an_p1_out_{_i}_{_qc}")
+                                        else:
+                                            st.info("Pass 1 data not available")
+
+                                    with st.expander("🔍 Context Agent — Resolver + Column Metadata", expanded=False):
+                                        if _lt and getattr(_lt, "resolver_summary", ""):
+                                            st.text_area("Resolver Summary", _lt.resolver_summary, height=200, key=f"an_res_{_i}_{_qc}")
+                                        elif _lt and getattr(_lt, "reasoning_pass1_output", ""):
+                                            st.info("Resolver: no string filter columns identified by Pass 1 — entity resolution skipped for this sub-query")
+                                        else:
+                                            st.info("Context Agent data not available")
+
+                                    with st.expander("📥 Pass 2 — Full Query Plan", expanded=True):
+                                        if _lt and getattr(_lt, "reasoning_pass2_input", ""):
+                                            st.text_area("Pass 2 Input", _lt.reasoning_pass2_input, height=300, key=f"an_p2_in_{_i}_{_qc}")
+                                            st.write("**📤 Pass 2 Output:**")
+                                            st.text_area("Pass 2 Output", _lt.reasoning_pass2_output, height=150, key=f"an_p2_out_{_i}_{_qc}")
+                                        else:
+                                            st.info("Pass 2 data not available")
+
+                                    with st.expander("⚙️ SQL Coder", expanded=True):
+                                        if _lt and getattr(_lt, "sql_gen_input", ""):
+                                            st.text_area("SQL Coder Input", _lt.sql_gen_input, height=300, key=f"an_sql_in_{_i}_{_qc}")
+                                            st.write("**📤 SQL Coder Output:**")
+                                            st.text_area("SQL Coder Output", _lt.sql_gen_output, height=150, key=f"an_sql_out_{_i}_{_qc}")
+                                        else:
+                                            st.info("SQL Coder data not available")
+
+                                    with st.expander("🗄️ Execution Result", expanded=False):
+                                        if _sq.get("sql"):
+                                            st.write("**SQL executed:**")
+                                            st.code(_sq["sql"], language="sql")
+                                        st.write(f"**Results:** {_sq.get('results_summary', 'N/A')}")
+                                        if _sq.get("identified_entity"):
+                                            st.success(f"**Identified entity:** {_sq['identified_entity']}")
+                                        _tok = _sq.get("tokens", {})
+                                        if _tok.get("input", 0) + _tok.get("output", 0) > 0:
+                                            st.caption(f"Tokens — input: {_tok.get('input', 0):,}  output: {_tok.get('output', 0):,}")
+
+                                # Inspect tab paired with this step (if one exists)
+                                if _i < len(_inspect_inputs):
+                                    with _sub_tabs[_tab_i]:
+                                        _tab_i += 1
+                                        st.write("**📥 INPUT PROMPT:**")
+                                        st.text_area("Inspect Input", _inspect_inputs[_i].get("prompt", ""), height=400, key=f"an_ins_in_{_i}_{_qc}")
+                                        if _i < len(_inspect_outputs):
+                                            st.write("**📤 OUTPUT (decision JSON):**")
+                                            st.text_area("Inspect Output", _inspect_outputs[_i].get("response", ""), height=200, key=f"an_ins_out_{_i}_{_qc}")
+
+                            # ── Synthesis ─────────────────────────────────────
+                            if _has_synthesis:
+                                with _sub_tabs[_tab_i]:
+                                    _tab_i += 1
+                                    _syn_in      = next((e for e in _ar_trace if e.get("stage") == "synthesis_plan_input"),  None)
+                                    _syn_out     = next((e for e in _ar_trace if e.get("stage") == "synthesis_plan_output"), None)
+                                    _syn_narrate = next((e for e in _ar_trace if e.get("stage") == "synthesis_narrate"),     None)
+                                    _syn_direct  = next((e for e in _ar_trace if e.get("stage") == "synthesis"),             None)
+                                    if _syn_direct:
+                                        st.info(f"Single-step synthesis — sub-query result used directly ({_syn_direct.get('type', '')})")
+                                    if _syn_in:
+                                        st.write("**📥 INPUT PROMPT:**")
+                                        st.text_area("Synthesis Input", _syn_in.get("prompt", ""), height=400, key=f"an_syn_in_{_qc}")
+                                    if _syn_out:
+                                        st.write("**📤 OUTPUT (narrate text or CTE SQL JSON):**")
+                                        st.text_area("Synthesis Output", _syn_out.get("response", ""), height=200, key=f"an_syn_out_{_qc}")
+                                    if _syn_narrate:
+                                        st.write("**📝 Narration produced:**")
+                                        st.text_area("Narration", _syn_narrate.get("narration", ""), height=200, key=f"an_syn_narrate_{_qc}")
+                                    if ar.synthesis_sql:
+                                        st.write("**Final SQL:**")
+                                        st.code(ar.synthesis_sql, language="sql")
+
+                            # ── Opus Review ───────────────────────────────────
+                            if _has_opus_an:
+                                with _sub_tabs[_tab_i]:
+                                    _opus_entry = next((e for e in _ar_trace if e.get("stage") == "opus_review"), None)
+                                    if _opus_entry:
+                                        if _opus_entry.get("input_prompt"):
+                                            st.write("**📥 INPUT PROMPT:**")
+                                            st.text_area("Opus Input", _opus_entry["input_prompt"], height=400, key=f"an_opus_in_{_qc}")
+                                        if _opus_entry.get("raw_response"):
+                                            st.write("**📤 OUTPUT:**")
+                                            st.text_area("Opus Output", _opus_entry["raw_response"], height=200, key=f"an_opus_out_{_qc}")
+                                        st.write(f"**Verdict:** {_opus_entry.get('verdict', 'N/A')}")
+                                        if _opus_entry.get("reasoning"):
+                                            st.write(f"**Reasoning:** {_opus_entry['reasoning']}")
                 # ───────────────────────────────────────────────────────────
                 # LOG QUERY - COMPREHENSIVE TRACKING
                 # ───────────────────────────────────────────────────────────
@@ -2792,6 +3190,15 @@ with tab3:
                     "Resolver Queries": result.resolver_result.queries_run if hasattr(result, 'resolver_result') and result.resolver_result else 0,
                     "All Entities Resolved": "Yes" if (hasattr(result, 'resolver_result') and result.resolver_result and result.resolver_result.all_resolved) else "N/A",
                     
+                    # Analyzer Agent (analysis-complexity queries)
+                    "Analyzer Sub-queries": len(result.analyzer_data.sub_queries) if (hasattr(result, 'analyzer_data') and result.analyzer_data) else 0,
+                    "Analyzer Total Tokens": result.tokens.analyzer["input"] + result.tokens.analyzer["output"],
+                    "Analysis Type": result.analyzer_data.plan.get("analysis_type", "") if (hasattr(result, 'analyzer_data') and result.analyzer_data) else "",
+
+                    # Summary (Issue 5)
+                    "Summary Input Tokens": _summary_tokens.get("input", 0),
+                    "Summary Output Tokens": _summary_tokens.get("output", 0),
+
                     # SQL & Results
                     "Generated SQL": result.sql,
                     "SQL Valid": "Yes" if result.validation_result and result.validation_result.get("is_valid", True) else "No",
@@ -2905,6 +3312,15 @@ with st.sidebar:
             "Resolver Queries",
             "All Entities Resolved",
             
+            # Analyzer Agent
+            "Analyzer Sub-queries",
+            "Analyzer Total Tokens",
+            "Analysis Type",
+
+            # Summary (Issue 5)
+            "Summary Input Tokens",
+            "Summary Output Tokens",
+
             # SQL & Results
             "Generated SQL",
             "SQL Valid",

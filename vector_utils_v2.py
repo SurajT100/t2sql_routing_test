@@ -21,10 +21,19 @@ import json
 # GLOBAL EMBEDDING MODEL
 # ============================================================================
 
-# Initialize once to avoid reloading
-print("🔄 Loading embedding model (all-MiniLM-L6-v2)...")
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-print("✅ Embedding model loaded (384 dimensions)")
+_embedding_model = None
+
+
+def _get_embedding_model() -> SentenceTransformer:
+    """Lazily initialize and cache the embedding model."""
+    global _embedding_model
+
+    if _embedding_model is None:
+        print("🔄 Loading embedding model (all-MiniLM-L6-v2)...")
+        _embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        print("✅ Embedding model loaded (384 dimensions)")
+
+    return _embedding_model
 
 
 # ============================================================================
@@ -41,6 +50,7 @@ def get_embedding(text: str) -> List[float]:
     Returns:
         384-dimensional vector as list
     """
+    embedding_model = _get_embedding_model()
     embedding = embedding_model.encode(text, convert_to_tensor=False)
     return embedding.tolist()
 
