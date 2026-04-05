@@ -221,39 +221,72 @@ def get_full_schema_with_opus(
 
 
 def _get_all_active_rules(vector_engine) -> List[Dict[str, Any]]:
-    """Load all active business rules (for static context-cache mode)."""
+    """
+    Load all active business rules (for static context-cache mode/fallback).
+
+    Uses a resilient multi-query strategy because deployments may differ in
+    boolean storage (`TRUE` vs 1 vs NULL defaults) or table naming.
+    """
     from sqlalchemy import text
 
-    rules = []
-    with vector_engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                """
-                SELECT id, rule_name, rule_type, rule_description, rule_data,
-                       trigger_keywords, applies_to_tables, priority, is_mandatory
-                FROM business_rules_v2
-                WHERE is_active = TRUE
-                ORDER BY priority ASC, id ASC
-                """
-            )
-        ).fetchall()
+    def _rows_to_rules(rows) -> List[Dict[str, Any]]:
+        out = []
+        for r in rows:
+            out.append({
+                "id": r[0],
+                "rule_name": r[1],
+                "rule_type": r[2],
+                "rule_description": r[3],
+                "rule_data": r[4],
+                "trigger_keywords": r[5],
+                "applies_to_tables": r[6],
+                "priority": r[7],
+                "is_mandatory": r[8],
+                # aliases used by some downstream logic
+                "keywords": r[5],
+                "tables": r[6],
+            })
+        return out
 
-    for r in rows:
-        rules.append({
-            "id": r[0],
-            "rule_name": r[1],
-            "rule_type": r[2],
-            "rule_description": r[3],
-            "rule_data": r[4],
-            "trigger_keywords": r[5],
-            "applies_to_tables": r[6],
-            "priority": r[7],
-            "is_mandatory": r[8],
-            # aliases used by some downstream logic
-            "keywords": r[5],
-            "tables": r[6],
-        })
-    return rules
+    candidate_queries = [
+        # Primary path: active-only from v2 table.
+        """
+        SELECT id, rule_name, rule_type, rule_description, rule_data,
+               trigger_keywords, applies_to_tables, priority, is_mandatory
+        FROM business_rules_v2
+        WHERE COALESCE(is_active, TRUE) = TRUE
+        ORDER BY priority ASC, id ASC
+        """,
+        # Fallback path: if is_active is unreliable, still prefer mandatory+priority order.
+        """
+        SELECT id, rule_name, rule_type, rule_description, rule_data,
+               trigger_keywords, applies_to_tables, priority, is_mandatory
+        FROM business_rules_v2
+        ORDER BY COALESCE(is_mandatory, FALSE) DESC, priority ASC, id ASC
+        """,
+        # Legacy table support.
+        """
+        SELECT id, rule_name, rule_type, rule_description, rule_data,
+               trigger_keywords, applies_to_tables, priority, is_mandatory
+        FROM business_rules
+        WHERE COALESCE(is_active, TRUE) = TRUE
+        ORDER BY priority ASC, id ASC
+        """,
+    ]
+
+    with vector_engine.connect() as conn:
+        for i, sql in enumerate(candidate_queries, start=1):
+            try:
+                rows = conn.execute(text(sql)).fetchall()
+                rules = _rows_to_rules(rows)
+                if rules:
+                    print(f"[RULES] _get_all_active_rules query#{i} returned {len(rules)} rows")
+                    return rules
+                print(f"[RULES] _get_all_active_rules query#{i} returned 0 rows")
+            except Exception as e:
+                print(f"[RULES] _get_all_active_rules query#{i} failed: {e}")
+
+    return []
 
 
 
