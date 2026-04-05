@@ -733,6 +733,35 @@ def process_query(
             result.rules_fallback_used = False
             result.context_cache_hit = True
             print(f"[STAGE2] Context cache hit: {context_cache_key}")
+
+            # Safety net: if cached rules are empty but active rules now exist,
+            # inject fallback rules so Pass 1 does not run with [].
+            if config.enable_rule_rag and result.rules_retrieved == 0 and config.rule_fallback_when_empty:
+                try:
+                    fallback_rules = _get_all_active_rules(vector_engine)
+                    fallback_rules = sorted(
+                        fallback_rules,
+                        key=lambda r: (
+                            0 if bool(r.get("is_mandatory")) else 1,
+                            r.get("priority") if isinstance(r.get("priority"), int) else 999999,
+                            r.get("id") if isinstance(r.get("id"), int) else 999999,
+                        ),
+                    )
+                    fallback_rules = fallback_rules[: max(0, int(config.rule_fallback_max_rules))]
+                    if fallback_rules:
+                        if config.compress_rules:
+                            rules_compressed = compress_rules_for_llm(fallback_rules)
+                        else:
+                            from prompt_optimizer import safe_json_dumps
+                            rules_compressed = safe_json_dumps(fallback_rules)
+                        result.rules_fallback_used = True
+                        result.rules_retrieved = len(fallback_rules)
+                        print(
+                            f"[STAGE2] Context-cache empty rules recovered via fallback: "
+                            f"{result.rules_retrieved} (max={config.rule_fallback_max_rules})"
+                        )
+                except Exception as fallback_err:
+                    print(f"[STAGE2] Context-cache fallback failed: {fallback_err}")
         else:
             bare_schema = get_bare_schema(engine, selected_tables, config.dialect)
 
@@ -763,7 +792,6 @@ def process_query(
 
                     if (
                         not rules_context
-                        and not config.context_cache_use_static_rules
                         and config.rule_fallback_when_empty
                     ):
                         fallback_rules = _get_all_active_rules(vector_engine)
