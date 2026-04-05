@@ -678,19 +678,55 @@ def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None, debug
             print("\n===== FULL RESPONSE (trimmed) =====")
             print(json.dumps(data, indent=2)[:2000])
 
-        # ✅ FIXED RESPONSE PARSING (OpenAI format)
+        # ✅ Robust response parsing (OpenAI-style variants)
         response_text = ""
         tokens = {"input": 0, "output": 0}
+        content_source = "none"
 
         choices = data.get("choices", [])
         if choices:
-            response_text = choices[0].get("message", {}).get("content", "")
+            message = choices[0].get("message", {}) or {}
+            content = message.get("content", "")
+
+            # Most common case: plain string content
+            if isinstance(content, str) and content.strip():
+                response_text = content
+                content_source = "content_string"
+
+            # Some providers return list parts:
+            # [{"type":"text","text":"..."}, ...] or [{"text":"..."}]
+            elif isinstance(content, list):
+                parts = []
+                for part in content:
+                    if isinstance(part, dict):
+                        if isinstance(part.get("text"), str) and part.get("text").strip():
+                            parts.append(part["text"])
+                        elif part.get("type") == "text" and isinstance(part.get("content"), str) and part.get("content").strip():
+                            parts.append(part["content"])
+                    elif isinstance(part, str) and part.strip():
+                        parts.append(part)
+                if parts:
+                    response_text = "\n".join(parts)
+                    content_source = "content_parts"
+
+            # Fallback for thinking models that may emit reasoning in a separate field
+            if not response_text:
+                reasoning_content = message.get("reasoning_content", "")
+                if isinstance(reasoning_content, str) and reasoning_content.strip():
+                    response_text = reasoning_content
+                    content_source = "reasoning_content"
 
         usage = data.get("usage", {})
         tokens = {
             "input": usage.get("prompt_tokens", 0),
             "output": usage.get("completion_tokens", 0)
         }
+
+        if debug:
+            print(f"[KIMI PARSE] source={content_source}, output_len={len(response_text)}")
+            if (tokens.get("input", 0) + tokens.get("output", 0)) > 0 and not response_text:
+                msg_keys = list((choices[0].get("message", {}) or {}).keys()) if choices else []
+                print(f"[KIMI PARSE WARNING] tokens>0 but empty output. message_keys={msg_keys}")
 
         return response_text, tokens
 
