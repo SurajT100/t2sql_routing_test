@@ -238,6 +238,7 @@ def _get_all_active_rules(vector_engine) -> List[Dict[str, Any]]:
             )
         ).fetchall()
 
+    print(f"[RULES] _get_all_active_rules: DB returned {len(rows)} active rows")
     for r in rows:
         rules.append({
             "id": r[0],
@@ -711,6 +712,7 @@ def process_query(
 
         schema_version = ContextCache.compute_schema_version(engine, selected_tables)
         rules_version = ContextCache.compute_rules_version(vector_engine) if config.enable_rule_rag else "no_rules"
+        print(f"[STAGE2] rules_version={rules_version!r}")
         context_cache_key = ContextCache.make_key(
             selected_tables=selected_tables,
             dialect=config.dialect,

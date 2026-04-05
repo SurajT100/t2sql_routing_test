@@ -95,9 +95,11 @@ class ContextCache:
                         "is_mandatory": r[6],
                     }
                 )
-        except Exception:
+        except Exception as e:
+            print(f"[CONTEXT CACHE] compute_rules_version DB error: {e}")
             return "empty"
 
+        print(f"[CONTEXT CACHE] compute_rules_version: {len(rules)} active rules → version hash")
         return QueryCache.compute_rules_version(rules)
 
     @staticmethod
