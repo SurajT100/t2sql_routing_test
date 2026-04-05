@@ -23,6 +23,7 @@ class ContextBundle:
     schema_text: str
     rules_compressed: str
     rules_retrieved: int
+    rules_retrieved_raw: int = 0
 
 
 class ContextCache:

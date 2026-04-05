@@ -82,6 +82,7 @@ class ContextBundle:
     columns_fetched: int = 0
     resolver_queries: int = 0
     stage_times: Dict[str, int] = field(default_factory=dict)
+    fallback_used: bool = False
 
 
 # =============================================================================
@@ -149,6 +150,11 @@ class ContextAgent:
         if not columns_by_table:
             print("[CONTEXT AGENT] No columns identified by Pass 1 — returning empty bundle")
             bundle.rules_compressed = rules_compressed
+            try:
+                _rules_list = json.loads(rules_compressed or "[]")
+                bundle.rules_retrieved = len(_rules_list) if isinstance(_rules_list, list) else 0
+            except Exception:
+                bundle.rules_retrieved = 0
             bundle.total_time_ms = int((time.time() - start_time) * 1000)
             return bundle
 
@@ -175,10 +181,11 @@ class ContextAgent:
         # ── Step 2: Filter rules to only those relevant to identified tables ──
         # Pass 1 received ALL rules (needed for column mapping).
         # Pass 2 only needs rules for the tables it will actually query.
-        filtered_rules, join_extra_tables = self._filter_rules_by_tables(
+        filtered_rules, join_extra_tables, fallback_used = self._filter_rules_by_tables(
             rules_compressed, identified_tables, joins_needed
         )
         bundle.rules_compressed = filtered_rules
+        bundle.fallback_used = fallback_used
         try:
             _source_rules = json.loads(rules_compressed or "[]")
             source_count = len(_source_rules) if isinstance(_source_rules, list) else 0
@@ -289,7 +296,7 @@ class ContextAgent:
         try:
             rules_list = json.loads(rules_compressed)
             if not isinstance(rules_list, list):
-                return rules_compressed, set()
+                return rules_compressed, set(), False
 
             # Build normalized lookup set for fast membership tests
             identified_set: set = set()
@@ -355,11 +362,22 @@ class ContextAgent:
                             join_extra_tables.add(t_clean)
                     # else: table doesn't match → drop
 
-            return json.dumps(filtered), join_extra_tables
+            # Fallback: filtering zeroed out a non-empty source list —
+            # keep mandatory + unscoped rules so LLM always gets global constraints.
+            if len(filtered) == 0 and len(rules_list) > 0:
+                fallback = [r for r in rules_list
+                            if bool(r.get("mandatory")) or r.get("priority") == 1
+                               or bool(r.get("auto_apply"))
+                               or (r.get("tables") is None and r.get("table") is None)]
+                print(f"[CONTEXT AGENT] Rule filter fallback: "
+                      f"{len(rules_list)} → 0 → {len(fallback)} fallback rules")
+                return json.dumps(fallback), join_extra_tables, True
+
+            return json.dumps(filtered), join_extra_tables, False
 
         except Exception as e:
             print(f"[CONTEXT AGENT] Rule filtering error (returning unfiltered): {e}")
-            return rules_compressed, set()
+            return rules_compressed, set(), False
 
     # ═════════════════════════════════════════════════════════════════════
     # INTERNAL: Rule Dependency Column Injection

@@ -2507,9 +2507,11 @@ with tab3:
                 # CONTEXT RETRIEVED
                 # ───────────────────────────────────────────────────────────
                 with st.expander("📚 Context Retrieved", expanded=False):
-                    col_ctx1, col_ctx2 = st.columns(2)
+                    col_ctx1, col_ctx2, col_ctx3 = st.columns(3)
                     with col_ctx1:
-                        st.metric("Rules Retrieved", result.rules_retrieved)
+                        st.metric("Raw Rules Retrieved", getattr(result, 'rules_retrieved_raw', result.rules_retrieved))
+                        st.metric("Rules After Filter", result.rules_retrieved)
+                        st.metric("Fallback Used", "Yes" if getattr(result, 'rules_fallback_used', False) else "No")
                         if enable_context_cache:
                             st.metric("Context Cache", "Hit" if result.context_cache_hit else "Miss")
                         if result.rules_compressed and result.rules_compressed != "[]":
@@ -2532,7 +2534,7 @@ with tab3:
                         else:
                             st.info("No business rules retrieved")
                             
-                    with col_ctx2:
+                    with col_ctx3:
                         st.metric("Schema Mode", "Full Schema" if result.columns_retrieved == -1 else f"{result.columns_retrieved} columns")
                         if result.schema_text:
                             st.code(result.schema_text[:800] + "..." if len(result.schema_text) > 800 else result.schema_text)
@@ -3196,7 +3198,9 @@ with tab3:
                     # RAG Details
                     "Rule RAG Used": "Yes" if enable_rule_rag else "No",
                     "Opus Descriptions": "Yes" if enable_opus_descriptions else "No",
-                    "Rules Retrieved": result.rules_retrieved,
+                    "Rules Retrieved (Raw)": getattr(result, 'rules_retrieved_raw', result.rules_retrieved),
+                    "Rules Retrieved (Filtered)": result.rules_retrieved,
+                    "Rules Fallback Used": "Yes" if getattr(result, 'rules_fallback_used', False) else "No",
                     
                     # Resolver Details
                     "Resolver Enabled": "Yes" if enable_resolver else "No",

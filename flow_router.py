@@ -466,7 +466,9 @@ class QueryResult:
     original_sql: Optional[str] = None    # The SQL before error recovery fixed it
     opus_blocked_soft: bool = False    # Opus flagged logic issue but data exists — warn don't block
     # Context used
-    rules_retrieved: int = 0
+    rules_retrieved: int = 0           # post-filter (Stage 3 context agent)
+    rules_retrieved_raw: int = 0       # pre-filter (Stage 2 DB fetch)
+    rules_fallback_used: bool = False  # fallback activated in context agent
     columns_retrieved: int = 0
     schema_text: str = ""
     rules_compressed: str = ""
@@ -725,6 +727,7 @@ def process_query(
             schema_text = cached_bundle.schema_text
             rules_compressed = cached_bundle.rules_compressed
             result.rules_retrieved = cached_bundle.rules_retrieved
+            result.rules_retrieved_raw = cached_bundle.rules_retrieved_raw
             result.context_cache_hit = True
             print(f"[STAGE2] Context cache hit: {context_cache_key}")
         else:
@@ -754,6 +757,7 @@ def process_query(
                         rules_context = context.get("rules", [])
 
                     result.rules_retrieved = len(rules_context)
+                    result.rules_retrieved_raw = len(rules_context)
                     print(f"[STAGE2] Rules retrieved: {len(rules_context)}")
                     if rules_context:
                         print(f"[STAGE2] Rule names: {[r.get('rule_name', 'unknown') for r in rules_context[:5]]}")
@@ -772,8 +776,10 @@ def process_query(
                     traceback.print_exc()
                     rules_compressed = "[]"
                     result.rules_retrieved = 0
+                    result.rules_retrieved_raw = 0
             else:
                 result.rules_retrieved = 0
+                result.rules_retrieved_raw = 0
                 rules_compressed = "[]"
 
             # write context cache only for static-rule mode (question agnostic)
@@ -787,6 +793,7 @@ def process_query(
                         schema_text=schema_text,
                         rules_compressed=rules_compressed,
                         rules_retrieved=result.rules_retrieved,
+                        rules_retrieved_raw=result.rules_retrieved_raw,
                     ),
                 )
                 print(f"[STAGE2] Context cache stored: {context_cache_key}")
@@ -946,6 +953,7 @@ def process_query(
                     result.column_metadata = _simple_bundle.metadata
                     result.rules_compressed = _simple_bundle.rules_compressed
                     result.rules_retrieved = _simple_bundle.rules_retrieved
+                    result.rules_fallback_used = _simple_bundle.fallback_used
                     result.resolver_result = _simple_bundle.resolver_result
                     result.entities_resolved = _simple_bundle.entities_resolved
                     result.resolver_time_ms = _simple_bundle.resolver_result.total_time_ms if _simple_bundle.resolver_result else 0
@@ -1058,6 +1066,7 @@ def process_query(
             result.column_metadata = bundle.metadata
             result.rules_compressed = bundle.rules_compressed
             result.rules_retrieved = bundle.rules_retrieved
+            result.rules_fallback_used = bundle.fallback_used
             result.resolver_result = bundle.resolver_result
             result.entities_resolved = bundle.entities_resolved
             result.resolver_time_ms = bundle.resolver_result.total_time_ms if bundle.resolver_result else 0
@@ -1222,6 +1231,7 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
             result.column_metadata = bundle.metadata
             result.rules_compressed = bundle.rules_compressed
             result.rules_retrieved = bundle.rules_retrieved
+            result.rules_fallback_used = bundle.fallback_used
             result.resolver_result = bundle.resolver_result
             result.entities_resolved = bundle.entities_resolved
             result.resolver_time_ms = bundle.resolver_result.total_time_ms if bundle.resolver_result else 0
