@@ -272,6 +272,8 @@ class FlowConfig:
     # RAG - Only Rule RAG now (Schema RAG removed - poor accuracy)
     enable_rule_rag: bool = True
     rule_rag_threshold: float = 0.65
+    rule_fallback_when_empty: bool = True
+    rule_fallback_max_rules: int = 100
     
     # Opus Descriptions (from one-time enrichment)
     enable_opus_descriptions: bool = True
@@ -466,7 +468,9 @@ class QueryResult:
     original_sql: Optional[str] = None    # The SQL before error recovery fixed it
     opus_blocked_soft: bool = False    # Opus flagged logic issue but data exists — warn don't block
     # Context used
+    rules_retrieved_raw: int = 0
     rules_retrieved: int = 0
+    rules_fallback_used: bool = False
     columns_retrieved: int = 0
     schema_text: str = ""
     rules_compressed: str = ""
@@ -724,9 +728,40 @@ def process_query(
             bare_schema = cached_bundle.bare_schema
             schema_text = cached_bundle.schema_text
             rules_compressed = cached_bundle.rules_compressed
+            result.rules_retrieved_raw = cached_bundle.rules_retrieved
             result.rules_retrieved = cached_bundle.rules_retrieved
+            result.rules_fallback_used = False
             result.context_cache_hit = True
             print(f"[STAGE2] Context cache hit: {context_cache_key}")
+
+            # Safety net: if cached rules are empty but active rules now exist,
+            # inject fallback rules so Pass 1 does not run with [].
+            if config.enable_rule_rag and result.rules_retrieved == 0 and config.rule_fallback_when_empty:
+                try:
+                    fallback_rules = _get_all_active_rules(vector_engine)
+                    fallback_rules = sorted(
+                        fallback_rules,
+                        key=lambda r: (
+                            0 if bool(r.get("is_mandatory")) else 1,
+                            r.get("priority") if isinstance(r.get("priority"), int) else 999999,
+                            r.get("id") if isinstance(r.get("id"), int) else 999999,
+                        ),
+                    )
+                    fallback_rules = fallback_rules[: max(0, int(config.rule_fallback_max_rules))]
+                    if fallback_rules:
+                        if config.compress_rules:
+                            rules_compressed = compress_rules_for_llm(fallback_rules)
+                        else:
+                            from prompt_optimizer import safe_json_dumps
+                            rules_compressed = safe_json_dumps(fallback_rules)
+                        result.rules_fallback_used = True
+                        result.rules_retrieved = len(fallback_rules)
+                        print(
+                            f"[STAGE2] Context-cache empty rules recovered via fallback: "
+                            f"{result.rules_retrieved} (max={config.rule_fallback_max_rules})"
+                        )
+                except Exception as fallback_err:
+                    print(f"[STAGE2] Context-cache fallback failed: {fallback_err}")
         else:
             bare_schema = get_bare_schema(engine, selected_tables, config.dialect)
 
@@ -753,6 +788,30 @@ def process_query(
                         )
                         rules_context = context.get("rules", [])
 
+                    result.rules_retrieved_raw = len(rules_context)
+
+                    if (
+                        not rules_context
+                        and config.rule_fallback_when_empty
+                    ):
+                        fallback_rules = _get_all_active_rules(vector_engine)
+                        fallback_rules = sorted(
+                            fallback_rules,
+                            key=lambda r: (
+                                0 if bool(r.get("is_mandatory")) else 1,
+                                r.get("priority") if isinstance(r.get("priority"), int) else 999999,
+                                r.get("id") if isinstance(r.get("id"), int) else 999999,
+                            ),
+                        )
+                        rules_context = fallback_rules[: max(0, int(config.rule_fallback_max_rules))]
+                        result.rules_fallback_used = True
+                        print(
+                            f"[STAGE2] Rule fallback used: loaded {len(rules_context)} active rules "
+                            f"(max={config.rule_fallback_max_rules})"
+                        )
+                    else:
+                        result.rules_fallback_used = False
+
                     result.rules_retrieved = len(rules_context)
                     print(f"[STAGE2] Rules retrieved: {len(rules_context)}")
                     if rules_context:
@@ -771,9 +830,13 @@ def process_query(
                     import traceback
                     traceback.print_exc()
                     rules_compressed = "[]"
+                    result.rules_retrieved_raw = 0
                     result.rules_retrieved = 0
+                    result.rules_fallback_used = False
             else:
+                result.rules_retrieved_raw = 0
                 result.rules_retrieved = 0
+                result.rules_fallback_used = False
                 rules_compressed = "[]"
 
             # write context cache only for static-rule mode (question agnostic)

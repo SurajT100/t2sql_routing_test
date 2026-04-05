@@ -2509,7 +2509,9 @@ with tab3:
                 with st.expander("📚 Context Retrieved", expanded=False):
                     col_ctx1, col_ctx2 = st.columns(2)
                     with col_ctx1:
-                        st.metric("Rules Retrieved", result.rules_retrieved)
+                        st.metric("Raw Rules Retrieved", result.rules_retrieved_raw)
+                        st.metric("Rules After Filter", result.rules_retrieved)
+                        st.metric("Fallback Used", "Yes" if result.rules_fallback_used else "No")
                         if enable_context_cache:
                             st.metric("Context Cache", "Hit" if result.context_cache_hit else "Miss")
                         if result.rules_compressed and result.rules_compressed != "[]":
