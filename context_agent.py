@@ -294,9 +294,7 @@ class ContextAgent:
             # Build normalized lookup set for fast membership tests
             identified_set: set = set()
             for t in identified_tables:
-                identified_set.add(t.lower())
-                if "." in t:
-                    identified_set.add(t.split(".")[-1].lower())
+                identified_set |= ContextAgent._table_name_variants(t)
 
             filtered = []
             join_extra_tables: set = set()
@@ -330,10 +328,7 @@ class ContextAgent:
                     items = tables_field if isinstance(tables_field, list) else [tables_field]
                     norm = set()
                     for t in items:
-                        s = str(t)
-                        norm.add(s.lower())
-                        if "." in s:
-                            norm.add(s.split(".")[-1].lower())
+                        norm |= ContextAgent._table_name_variants(t)
 
                     if norm & identified_set:
                         filtered.append(rule)
@@ -345,14 +340,11 @@ class ContextAgent:
 
                 # ── table field (single value) ──
                 if table_field is not None:
-                    s = str(table_field)
-                    t_norm = s.lower()
-                    t_clean = s.split(".")[-1].lower() if "." in s else t_norm
-                    if t_norm in identified_set or t_clean in identified_set:
+                    norm = ContextAgent._table_name_variants(table_field)
+                    if norm & identified_set:
                         filtered.append(rule)
                         if rule_type == "join":
-                            join_extra_tables.add(t_norm)
-                            join_extra_tables.add(t_clean)
+                            join_extra_tables |= norm
                     # else: table doesn't match → drop
 
             return json.dumps(filtered), join_extra_tables
@@ -360,6 +352,38 @@ class ContextAgent:
         except Exception as e:
             print(f"[CONTEXT AGENT] Rule filtering error (returning unfiltered): {e}")
             return rules_compressed, set()
+
+    @staticmethod
+    def _table_name_variants(name: Any) -> set:
+        """
+        Return canonical lowercase variants for robust table matching.
+
+        Supports forms like:
+          - "schema"."table"
+          - schema.table
+          - `schema`.`table`
+          - [schema].[table]
+          - table
+        """
+        raw = str(name or "").strip()
+        if not raw:
+            return set()
+
+        # Unquote common SQL identifier wrappers and normalize separators.
+        cleaned = raw.replace("`", "").replace('"', "").replace("[", "").replace("]", "").strip()
+        cleaned = re.sub(r"\s*\.\s*", ".", cleaned)
+        cleaned = cleaned.strip(".")
+        if not cleaned:
+            return set()
+
+        parts = [p.strip().lower() for p in cleaned.split(".") if p.strip()]
+        if not parts:
+            return set()
+
+        variants = {cleaned.lower(), parts[-1]}
+        if len(parts) >= 2:
+            variants.add(f"{parts[-2]}.{parts[-1]}")
+        return variants
 
     # ═════════════════════════════════════════════════════════════════════
     # INTERNAL: Rule Dependency Column Injection
