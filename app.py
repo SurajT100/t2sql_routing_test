@@ -409,13 +409,14 @@ with st.sidebar:
     if enable_opus_review:
         reviewer_llm = st.selectbox(
             "Select Reviewer LLM",
-            ["Claude Opus", "Qwen Coder (Vertex)"],
+            ["Claude Opus", "Qwen Coder (Vertex)", "Kimi K2 Thinking (Vertex)"],
             index=0,
-            help="Claude Opus: Best accuracy, higher cost | Qwen Coder: Good accuracy, lower cost"
+            help="Claude Opus: Best accuracy, higher cost | Qwen Coder: Good accuracy, lower cost | Kimi K2: Strong reasoning, balanced performance"
         )
         st.session_state.reviewer_provider = {
             "Claude Opus": "claude_opus",
-            "Qwen Coder (Vertex)": "vertex_qwen_thinking"
+            "Qwen Coder (Vertex)": "vertex_qwen_thinking",
+            "Kimi K2 Thinking (Vertex)": "vertex_kimi_k2_thinking"
         }[reviewer_llm]
     else:
         st.session_state.reviewer_provider = "claude_opus"
@@ -424,7 +425,11 @@ with st.sidebar:
     st.session_state.max_opus_retries = max_retries
     
     if enable_opus_review:
-        reviewer_name = "Opus" if st.session_state.reviewer_provider == "claude_opus" else "Qwen Coder"
+        reviewer_name = {
+            "claude_opus": "Opus",
+            "vertex_qwen_thinking": "Qwen Coder",
+            "vertex_kimi_k2_thinking": "Kimi K2"
+        }.get(st.session_state.reviewer_provider, "Qwen Coder")
         st.success(f"✅ **{reviewer_name} Independent Review Active**")
         st.info(f"📊 **How it works:**\n"
                 "1. **Sonnet** analyzes question + business rules → Creates plan\n"
@@ -957,6 +962,11 @@ with tab2:
         # ======================
         if rule_type == "📊 Metric Definition":
             st.subheader("Add Metric Definition")
+            metric_table_name = st.selectbox(
+                "Table*",
+                options=list(selected_schema.keys()),
+                key="metric_table_selector"
+            )
             
             with st.form("metric_form"):
                 col1, col2 = st.columns(2)
@@ -974,16 +984,14 @@ with tab2:
                         help="How users might refer to this metric"
                     )
                     
-                    table_name = st.selectbox(
-                        "Table*",
-                        options=list(selected_schema.keys())
-                    )
+                    st.write(f"**Selected Table:** `{metric_table_name}`")
                 
                 with col2:
-                    if table_name:
+                    if metric_table_name:
                         column_name = st.selectbox(
                             "Column*",
-                            options=selected_schema[table_name]
+                            options=selected_schema[metric_table_name],
+                            key=f"metric_column_selector_{metric_table_name}"
                         )
                     else:
                         column_name = st.text_input("Column*")
@@ -1025,7 +1033,7 @@ with tab2:
                 
                 if test_rule or save_rule:
                     # Validate
-                    if not metric_name or not user_terms or not table_name or not column_name:
+                    if not metric_name or not user_terms or not metric_table_name or not column_name:
                         st.error("❌ Please fill all required fields (*)")
                     else:
                         # Build rule data
@@ -1033,7 +1041,7 @@ with tab2:
                         
                         rule_data = {
                             "user_terms": keywords,
-                            "table": table_name,
+                            "table": metric_table_name,
                             "column": column_name,
                             "aggregation": aggregation,
                             "formula": f"{aggregation}({column_name})" + (f" {transform}" if transform else ""),
@@ -1087,7 +1095,7 @@ with tab2:
                                             "desc": description,
                                             "data": json.dumps(rule_data),
                                             "keywords": keywords,
-                                            "tables": [table_name],
+                                            "tables": [metric_table_name],
                                             "columns": [column_name],
                                             "embedding": str(embedding)
                                         }
@@ -1116,6 +1124,19 @@ with tab2:
         # ======================
         elif rule_type == "🔗 Table Join":
             st.subheader("Add Table Join Relationship")
+            col_join_sel1, col_join_sel2 = st.columns(2)
+            with col_join_sel1:
+                table1 = st.selectbox(
+                    "Table 1*",
+                    options=list(selected_schema.keys()),
+                    key="join_table1_selector"
+                )
+            with col_join_sel2:
+                table2 = st.selectbox(
+                    "Table 2*",
+                    options=list(selected_schema.keys()),
+                    key="join_table2_selector"
+                )
             
             with st.form("join_form"):
                 join_name = st.text_input(
@@ -1128,35 +1149,25 @@ with tab2:
                 col1, col2 = st.columns(2)
                 
                 with col1:
-                    st.write("**Table 1**")
-                    table1 = st.selectbox(
-                        "Table*",
-                        options=list(selected_schema.keys()),
-                        key="table1"
-                    )
+                    st.write(f"**Table 1:** `{table1}`")
                     
                     if table1:
                         column1 = st.selectbox(
                             "Column*",
                             options=selected_schema[table1],
-                            key="column1"
+                            key=f"join_column1_selector_{table1}"
                         )
                     else:
                         column1 = None
                 
                 with col2:
-                    st.write("**Table 2**")
-                    table2 = st.selectbox(
-                        "Table*",
-                        options=list(selected_schema.keys()),
-                        key="table2"
-                    )
+                    st.write(f"**Table 2:** `{table2}`")
                     
                     if table2:
                         column2 = st.selectbox(
                             "Column*",
                             options=selected_schema[table2],
-                            key="column2"
+                            key=f"join_column2_selector_{table2}"
                         )
                     else:
                         column2 = None
@@ -1257,6 +1268,11 @@ with tab2:
         # ======================
         elif rule_type == "🎯 Filter Rule":
             st.subheader("Add Filter Rule")
+            filter_table_name = st.selectbox(
+                "Table*",
+                options=list(selected_schema.keys()),
+                key="filter_table_selector"
+            )
             
             with st.form("filter_form"):
                 filter_name = st.text_input(
@@ -1272,15 +1288,13 @@ with tab2:
                 col1, col2 = st.columns(2)
                 
                 with col1:
-                    table_name = st.selectbox(
-                        "Table*",
-                        options=list(selected_schema.keys())
-                    )
+                    st.write(f"**Selected Table:** `{filter_table_name}`")
                     
-                    if table_name:
+                    if filter_table_name:
                         column_name = st.selectbox(
                             "Column*",
-                            options=selected_schema[table_name]
+                            options=selected_schema[filter_table_name],
+                            key=f"filter_column_selector_{filter_table_name}"
                         )
                     else:
                         column_name = None
@@ -1310,7 +1324,7 @@ with tab2:
                     save_filter = st.form_submit_button("💾 Save", type="primary", use_container_width=True)
                 
                 if test_filter or save_filter:
-                    if not filter_name or not user_terms or not table_name or not column_name or not values:
+                    if not filter_name or not user_terms or not filter_table_name or not column_name or not values:
                         st.error("❌ Fill all required fields")
                     else:
                         value_list = [v.strip() for v in values.split(",")]
@@ -1319,16 +1333,16 @@ with tab2:
                         # Build SQL pattern
                         if operator in ["IN", "NOT IN"]:
                             values_str = ", ".join([f"'{v}'" for v in value_list])
-                            sql_pattern = f'"{table_name}"."{column_name}" {operator} ({values_str})'
+                            sql_pattern = f'"{filter_table_name}"."{column_name}" {operator} ({values_str})'
                         elif operator == "BETWEEN":
-                            sql_pattern = f'"{table_name}"."{column_name}" BETWEEN \'{value_list[0]}\' AND \'{value_list[1]}\''
+                            sql_pattern = f'"{filter_table_name}"."{column_name}" BETWEEN \'{value_list[0]}\' AND \'{value_list[1]}\''
                         else:
-                            sql_pattern = f'"{table_name}"."{column_name}" {operator} \'{value_list[0]}\''
+                            sql_pattern = f'"{filter_table_name}"."{column_name}" {operator} \'{value_list[0]}\''
                         
                         rule_data = {
                             "filter_name": filter_name,
                             "user_terms": keywords,
-                            "table": table_name,
+                            "table": filter_table_name,
                             "column": column_name,
                             "operator": operator,
                             "values": value_list,
@@ -1361,7 +1375,7 @@ with tab2:
                                             "desc": description,
                                             "data": json.dumps(rule_data),
                                             "keywords": keywords,
-                                            "tables": [table_name],
+                                            "tables": [filter_table_name],
                                             "columns": [column_name],
                                             "embedding": str(embedding)
                                         }
@@ -1742,18 +1756,19 @@ Searchable keywords: {' '.join(sorted(auto_keywords))}"""
                                 st.error(f"❌ Failed: {str(e)}")
             
             else:  # COLUMN DESCRIPTION FORM
+                col_desc_table_name = st.selectbox(
+                    "Table*",
+                    options=list(selected_schema.keys()),
+                    key="col_desc_table_selector"
+                )
                 with st.form("column_description_form"):
-                    table_name = st.selectbox(
-                        "Table*",
-                        options=list(selected_schema.keys()),
-                        key="col_desc_table"
-                    )
+                    st.write(f"**Selected Table:** `{col_desc_table_name}`")
                     
                     # Column dropdown
                     column_name = st.selectbox(
                         "Column*",
-                        options=selected_schema.get(table_name, []) if table_name else [],
-                        key="col_desc_column"
+                        options=selected_schema.get(col_desc_table_name, []) if col_desc_table_name else [],
+                        key=f"col_desc_column_selector_{col_desc_table_name}"
                     )
                     
                     column_description = st.text_area(
@@ -1771,7 +1786,7 @@ Searchable keywords: {' '.join(sorted(auto_keywords))}"""
                     save_col_desc = st.form_submit_button("💾 Save Column Description", type="primary")
                     
                     if save_col_desc:
-                        if not table_name or not column_name:
+                        if not col_desc_table_name or not column_name:
                             st.error("❌ Select table and column")
                         elif not column_description:
                             st.error("❌ Add description")
@@ -1783,14 +1798,14 @@ Searchable keywords: {' '.join(sorted(auto_keywords))}"""
                                 # USE SMART KEYWORD EXTRACTION
                                 rule_data = {
                                     "description_type": "column",
-                                    "table": table_name,
+                                    "table": col_desc_table_name,
                                     "column": column_name,
                                     "description": column_description,
                                     "user_terms": manual_keywords
                                 }
                                 
                                 auto_keywords = extract_smart_keywords(
-                                    rule_name=f"Column: {table_name}.{column_name}",
+                                    rule_name=f"Column: {col_desc_table_name}.{column_name}",
                                     description=column_description,
                                     rule_type="term_alias",
                                     rule_data=rule_data
@@ -1805,7 +1820,7 @@ Searchable keywords: {' '.join(sorted(auto_keywords))}"""
                                     auto_keywords
                                 )
                                 
-                                embedding_text = f"{table_name} {column_name} {enhanced_description} {' '.join(all_keywords)}"
+                                embedding_text = f"{col_desc_table_name} {column_name} {enhanced_description} {' '.join(all_keywords)}"
                                 embedding = get_embedding(embedding_text)
                                 
                                 with VECTOR_ENGINE.connect() as conn:
@@ -1821,18 +1836,18 @@ Searchable keywords: {' '.join(sorted(auto_keywords))}"""
                                              CAST(:columns AS text[]), 3, CAST(:embedding AS vector))
                                         """),
                                         {
-                                            "name": f"Column: {table_name}.{column_name}",
+                                            "name": f"Column: {col_desc_table_name}.{column_name}",
                                             "desc": enhanced_description,
                                             "data": json.dumps(rule_data),
                                             "keywords": all_keywords,
-                                            "tables": [table_name],
+                                            "tables": [col_desc_table_name],
                                             "columns": [column_name],
                                             "embedding": str(embedding)
                                         }
                                     )
                                     conn.commit()
                                 
-                                st.success(f"✅ Description for '{table_name}.{column_name}' saved!")
+                                st.success(f"✅ Description for '{col_desc_table_name}.{column_name}' saved!")
                                 st.info(f"🔍 Auto-generated {len(auto_keywords)} additional keywords: {', '.join(list(auto_keywords)[:10])}...")
                                 
                             except Exception as e:
