@@ -466,6 +466,7 @@ class QueryResult:
     original_sql: Optional[str] = None    # The SQL before error recovery fixed it
     opus_blocked_soft: bool = False    # Opus flagged logic issue but data exists — warn don't block
     # Context used
+    rules_retrieved_stage2: int = 0
     rules_retrieved: int = 0
     columns_retrieved: int = 0
     schema_text: str = ""
@@ -724,6 +725,7 @@ def process_query(
             bare_schema = cached_bundle.bare_schema
             schema_text = cached_bundle.schema_text
             rules_compressed = cached_bundle.rules_compressed
+            result.rules_retrieved_stage2 = cached_bundle.rules_retrieved
             result.rules_retrieved = cached_bundle.rules_retrieved
             result.context_cache_hit = True
             print(f"[STAGE2] Context cache hit: {context_cache_key}")
@@ -753,6 +755,7 @@ def process_query(
                         )
                         rules_context = context.get("rules", [])
 
+                    result.rules_retrieved_stage2 = len(rules_context)
                     result.rules_retrieved = len(rules_context)
                     print(f"[STAGE2] Rules retrieved: {len(rules_context)}")
                     if rules_context:
@@ -771,8 +774,10 @@ def process_query(
                     import traceback
                     traceback.print_exc()
                     rules_compressed = "[]"
+                    result.rules_retrieved_stage2 = 0
                     result.rules_retrieved = 0
             else:
+                result.rules_retrieved_stage2 = 0
                 result.rules_retrieved = 0
                 rules_compressed = "[]"
 
@@ -945,6 +950,7 @@ def process_query(
                     )
                     result.column_metadata = _simple_bundle.metadata
                     result.rules_compressed = _simple_bundle.rules_compressed
+                    result.rules_retrieved_stage2 = result.rules_retrieved_stage2 or _simple_bundle.rules_retrieved
                     result.rules_retrieved = _simple_bundle.rules_retrieved
                     result.resolver_result = _simple_bundle.resolver_result
                     result.entities_resolved = _simple_bundle.entities_resolved
@@ -1057,6 +1063,7 @@ def process_query(
             # Store agent results
             result.column_metadata = bundle.metadata
             result.rules_compressed = bundle.rules_compressed
+            result.rules_retrieved_stage2 = result.rules_retrieved_stage2 or bundle.rules_retrieved
             result.rules_retrieved = bundle.rules_retrieved
             result.resolver_result = bundle.resolver_result
             result.entities_resolved = bundle.entities_resolved
@@ -1221,6 +1228,7 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
             
             result.column_metadata = bundle.metadata
             result.rules_compressed = bundle.rules_compressed
+            result.rules_retrieved_stage2 = result.rules_retrieved_stage2 or bundle.rules_retrieved
             result.rules_retrieved = bundle.rules_retrieved
             result.resolver_result = bundle.resolver_result
             result.entities_resolved = bundle.entities_resolved

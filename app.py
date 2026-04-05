@@ -2509,7 +2509,8 @@ with tab3:
                 with st.expander("📚 Context Retrieved", expanded=False):
                     col_ctx1, col_ctx2 = st.columns(2)
                     with col_ctx1:
-                        st.metric("Rules Retrieved", result.rules_retrieved)
+                        st.metric("Rules Retrieved (Stage 2)", getattr(result, "rules_retrieved_stage2", result.rules_retrieved))
+                        st.metric("Rules Sent to Reasoning", result.rules_retrieved)
                         if enable_context_cache:
                             st.metric("Context Cache", "Hit" if result.context_cache_hit else "Miss")
                         if result.rules_compressed and result.rules_compressed != "[]":
@@ -3196,6 +3197,7 @@ with tab3:
                     # RAG Details
                     "Rule RAG Used": "Yes" if enable_rule_rag else "No",
                     "Opus Descriptions": "Yes" if enable_opus_descriptions else "No",
+                    "Rules Retrieved (Stage2)": getattr(result, "rules_retrieved_stage2", result.rules_retrieved),
                     "Rules Retrieved": result.rules_retrieved,
                     
                     # Resolver Details
