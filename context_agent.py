@@ -179,8 +179,11 @@ class ContextAgent:
             rules_compressed, identified_tables, joins_needed
         )
         bundle.rules_compressed = filtered_rules
-        print(f"[CONTEXT AGENT] Rules filtered: {bundle.rules_retrieved} → kept for identified tables "
-              f"(joins_needed={joins_needed})")
+        try:
+            _source_rules = json.loads(rules_compressed or "[]")
+            source_count = len(_source_rules) if isinstance(_source_rules, list) else 0
+        except Exception:
+            source_count = 0
 
         # ── Step 3: Build focused schema (only identified tables; only relevant cols get descriptions) ──
         # Pass 1 column keys give us the exact set of tables needed.
@@ -198,6 +201,8 @@ class ContextAgent:
             bundle.rules_retrieved = len(rules_list) if isinstance(rules_list, list) else 0
         except Exception:
             bundle.rules_retrieved = 0
+        print(f"[CONTEXT AGENT] Rules filtered: {source_count} → {bundle.rules_retrieved} "
+              f"(joins_needed={joins_needed})")
         
         # ── Step 4: Entity resolution (live DB) ──
         if self.enable_resolver and string_filter_columns:
@@ -298,6 +303,15 @@ class ContextAgent:
 
             for rule in rules_list:
                 rule_type = rule.get("type", "")
+                priority = rule.get("priority")
+                is_mandatory = bool(rule.get("mandatory")) or priority == 1 or bool(rule.get("auto_apply"))
+
+                # Mandatory/critical rules must always be retained for Pass 2.
+                # They encode global business constraints and defaults that should
+                # not disappear just because Pass 1 table detection was sparse.
+                if is_mandatory:
+                    filtered.append(rule)
+                    continue
 
                 # ── join rules: drop wholesale when joins not needed ──
                 if rule_type == "join" and not joins_needed:
