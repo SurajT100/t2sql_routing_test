@@ -409,13 +409,14 @@ with st.sidebar:
     if enable_opus_review:
         reviewer_llm = st.selectbox(
             "Select Reviewer LLM",
-            ["Claude Opus", "Qwen Coder (Vertex)"],
+            ["Claude Opus", "Qwen Coder (Vertex)", "Kimi K2 Thinking (Vertex)"],
             index=0,
-            help="Claude Opus: Best accuracy, higher cost | Qwen Coder: Good accuracy, lower cost"
+            help="Claude Opus: Best accuracy, higher cost | Qwen Coder: Good accuracy, lower cost | Kimi K2: Strong reasoning, balanced performance"
         )
         st.session_state.reviewer_provider = {
             "Claude Opus": "claude_opus",
-            "Qwen Coder (Vertex)": "vertex_qwen_thinking"
+            "Qwen Coder (Vertex)": "vertex_qwen_thinking",
+            "Kimi K2 Thinking (Vertex)": "vertex_kimi_k2_thinking"
         }[reviewer_llm]
     else:
         st.session_state.reviewer_provider = "claude_opus"
@@ -424,7 +425,11 @@ with st.sidebar:
     st.session_state.max_opus_retries = max_retries
     
     if enable_opus_review:
-        reviewer_name = "Opus" if st.session_state.reviewer_provider == "claude_opus" else "Qwen Coder"
+        reviewer_name = {
+            "claude_opus": "Opus",
+            "vertex_qwen_thinking": "Qwen Coder",
+            "vertex_kimi_k2_thinking": "Kimi K2"
+        }.get(st.session_state.reviewer_provider, "Qwen Coder")
         st.success(f"✅ **{reviewer_name} Independent Review Active**")
         st.info(f"📊 **How it works:**\n"
                 "1. **Sonnet** analyzes question + business rules → Creates plan\n"
