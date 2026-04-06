@@ -460,8 +460,11 @@ def get_relevant_context(engine, question: str,
     # TIER 4: Similar examples
     examples = []
     if use_vector:
-        examples = search_similar_examples(engine, question, 
-                                          top_k=3, threshold=0.70)
+        try:
+            examples = search_similar_examples(engine, question,
+                                               top_k=3, threshold=0.70)
+        except Exception as e:
+            print(f"[DEBUG RAG] Tier 4 examples skipped (table missing or error): {e}")
     
     # Organize rules by type
     rules_by_type = {
