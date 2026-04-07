@@ -238,6 +238,7 @@ def _get_all_active_rules(vector_engine) -> List[Dict[str, Any]]:
             )
         ).fetchall()
 
+    print(f"[RULES] _get_all_active_rules: DB returned {len(rows)} active rows")
     for r in rows:
         rules.append({
             "id": r[0],
@@ -466,7 +467,9 @@ class QueryResult:
     original_sql: Optional[str] = None    # The SQL before error recovery fixed it
     opus_blocked_soft: bool = False    # Opus flagged logic issue but data exists — warn don't block
     # Context used
-    rules_retrieved: int = 0
+    rules_retrieved: int = 0           # post-filter (Stage 3 context agent)
+    rules_retrieved_raw: int = 0       # pre-filter (Stage 2 DB fetch)
+    rules_fallback_used: bool = False  # fallback activated in context agent
     columns_retrieved: int = 0
     schema_text: str = ""
     rules_compressed: str = ""
@@ -709,6 +712,7 @@ def process_query(
 
         schema_version = ContextCache.compute_schema_version(engine, selected_tables)
         rules_version = ContextCache.compute_rules_version(vector_engine) if config.enable_rule_rag else "no_rules"
+        print(f"[STAGE2] rules_version={rules_version!r}")
         context_cache_key = ContextCache.make_key(
             selected_tables=selected_tables,
             dialect=config.dialect,
@@ -725,6 +729,7 @@ def process_query(
             schema_text = cached_bundle.schema_text
             rules_compressed = cached_bundle.rules_compressed
             result.rules_retrieved = cached_bundle.rules_retrieved
+            result.rules_retrieved_raw = cached_bundle.rules_retrieved_raw
             result.context_cache_hit = True
             print(f"[STAGE2] Context cache hit: {context_cache_key}")
         else:
@@ -754,6 +759,7 @@ def process_query(
                         rules_context = context.get("rules", [])
 
                     result.rules_retrieved = len(rules_context)
+                    result.rules_retrieved_raw = len(rules_context)
                     print(f"[STAGE2] Rules retrieved: {len(rules_context)}")
                     if rules_context:
                         print(f"[STAGE2] Rule names: {[r.get('rule_name', 'unknown') for r in rules_context[:5]]}")
@@ -772,8 +778,10 @@ def process_query(
                     traceback.print_exc()
                     rules_compressed = "[]"
                     result.rules_retrieved = 0
+                    result.rules_retrieved_raw = 0
             else:
                 result.rules_retrieved = 0
+                result.rules_retrieved_raw = 0
                 rules_compressed = "[]"
 
             # write context cache only for static-rule mode (question agnostic)
@@ -787,6 +795,7 @@ def process_query(
                         schema_text=schema_text,
                         rules_compressed=rules_compressed,
                         rules_retrieved=result.rules_retrieved,
+                        rules_retrieved_raw=result.rules_retrieved_raw,
                     ),
                 )
                 print(f"[STAGE2] Context cache stored: {context_cache_key}")
@@ -811,8 +820,7 @@ def process_query(
         if user_specified_date:
             try:
                 rules_list = json.loads(rules_compressed)
-                filtered_rules = []
-                skipped = []
+                annotated = []
 
                 for rule in rules_list:
                     rule_data = rule.get("data", rule.get("rule_data", {}))
@@ -822,13 +830,21 @@ def process_query(
                         and any(kw in str(rule_data).lower() for kw in ["date", "month", "year", "fy", "financial", "period"])
                     )
                     if is_auto_date:
-                        skipped.append(rule.get("name", rule.get("rule_name", "unknown")))
-                    else:
-                        filtered_rules.append(rule)
+                        # Keep the rule but annotate it so the LLM adapts
+                        # the date range to the user's explicit request
+                        rule["_user_date_override"] = True
+                        rule["_override_note"] = (
+                            f"USER OVERRIDE: The user's question says '{question}'. "
+                            f"Use the financial year/date definition from this rule "
+                            f"to compute the correct date range for the user's "
+                            f"requested period. Do NOT apply the default current-period "
+                            f"filter — adjust it to match what the user explicitly asked for."
+                        )
+                        annotated.append(rule.get("name", rule.get("rule_name", "unknown")))
 
-                if skipped:
-                    rules_compressed = json.dumps(filtered_rules)
-                    print(f"[STAGE2] Date override — skipped auto_apply: {skipped}")
+                if annotated:
+                    rules_compressed = json.dumps(rules_list)
+                    print(f"[STAGE2] Date override — annotated (not removed): {annotated}")
             except Exception as e:
                 print(f"[STAGE2] Date override filter error: {e}")
         
@@ -946,6 +962,7 @@ def process_query(
                     result.column_metadata = _simple_bundle.metadata
                     result.rules_compressed = _simple_bundle.rules_compressed
                     result.rules_retrieved = _simple_bundle.rules_retrieved
+                    result.rules_fallback_used = _simple_bundle.fallback_used
                     result.resolver_result = _simple_bundle.resolver_result
                     result.entities_resolved = _simple_bundle.entities_resolved
                     result.resolver_time_ms = _simple_bundle.resolver_result.total_time_ms if _simple_bundle.resolver_result else 0
@@ -1058,6 +1075,7 @@ def process_query(
             result.column_metadata = bundle.metadata
             result.rules_compressed = bundle.rules_compressed
             result.rules_retrieved = bundle.rules_retrieved
+            result.rules_fallback_used = bundle.fallback_used
             result.resolver_result = bundle.resolver_result
             result.entities_resolved = bundle.entities_resolved
             result.resolver_time_ms = bundle.resolver_result.total_time_ms if bundle.resolver_result else 0
@@ -1094,20 +1112,27 @@ def process_query(
                     prefill=prefill, system_prompt=_p2_system,
                 )
             else:
-                pass2_prompt = create_pass2_prompt(
+                _p2_user = create_pass2_prompt(
                     question=question,
                     pass1_output=pass1_response,
                     metadata=bundle.metadata,
                     dialect_info=config.dialect_info,
                     resolver_text=bundle.resolver_text,
-                    rules=bundle.rules_compressed,
+                    rules="",  # included via _p2_system prepend below
                 )
+                # Non-Claude providers ignore system_prompt param → merge into user message
+                pass2_prompt = f"{_p2_system}\n\n{_p2_user}" if _p2_system else _p2_user
                 pass2_response, pass2_tokens = call_llm(
                     pass2_prompt, config.reasoning_provider, prefill=prefill,
                 )
             result.tokens.reasoning_pass2 = pass2_tokens
             _accumulate_cache_tokens(result.tokens.reasoning_pass2, pass2_tokens)
-            result.llm_trace.reasoning_pass2_input = pass2_prompt
+            # For Claude caching: system_prompt is sent separately but not in pass2_prompt.
+            # Merge both into the trace so the full context is visible in the UI.
+            if _is_claude_provider(config.reasoning_provider) and config.enable_prompt_caching and _p2_system:
+                result.llm_trace.reasoning_pass2_input = f"[SYSTEM PROMPT]\n{_p2_system}\n\n[USER MESSAGE]\n{pass2_prompt}"
+            else:
+                result.llm_trace.reasoning_pass2_input = pass2_prompt
             result.llm_trace.reasoning_pass2_output = pass2_response
             result.pass2_plan = pass2_response
             print(f"[STAGE3] Pass 2 complete — {pass2_tokens.get('input',0)+pass2_tokens.get('output',0)} tokens")
@@ -1222,6 +1247,7 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
             result.column_metadata = bundle.metadata
             result.rules_compressed = bundle.rules_compressed
             result.rules_retrieved = bundle.rules_retrieved
+            result.rules_fallback_used = bundle.fallback_used
             result.resolver_result = bundle.resolver_result
             result.entities_resolved = bundle.entities_resolved
             result.resolver_time_ms = bundle.resolver_result.total_time_ms if bundle.resolver_result else 0
@@ -2198,18 +2224,37 @@ def _run_opus_review(
                     response_text = response_text[start:end]
             
             review = json.loads(response_text)
-        except:
-            review = {"verdict": "UNCERTAIN", "issues": ["Parse error"], "reasoning": opus_response[:200]}
-        
+        except Exception:
+            review = {"verdict": "UNCERTAIN", "issues": ["Parse error"], "reasoning": opus_response[:200], "_parse_error": True}
+
         verdict = review.get("verdict", "UNCERTAIN")
-        
-        if verdict in ["CORRECT", "UNCERTAIN"]:
+
+        if verdict == "CORRECT":
             return {
                 "verdict": verdict,
                 "final_review": review,
                 "attempts": attempt,
                 "tokens": total_tokens,
-                # Propagate refined SQL when it changed (reviewed & approved on attempt 2+)
+                "corrected_sql": current_sql if current_sql != sql else None,
+                "corrected_results": current_results if current_sql != sql else None,
+                "refinement_tokens": refinement_tokens,
+                "trace_opus_input": trace_opus_input,
+                "trace_opus_output": trace_opus_output,
+                "trace_refinement_input": trace_refinement_input,
+                "trace_refinement_output": trace_refinement_output,
+            }
+
+        if verdict == "UNCERTAIN":
+            # Parse errors get one more review attempt (same SQL, no refinement)
+            if review.get("_parse_error") and attempt < config.max_retries:
+                print(f"[OPUS] Parse error on attempt {attempt}, retrying review...")
+                continue
+            # Genuine UNCERTAIN — accept as-is
+            return {
+                "verdict": verdict,
+                "final_review": review,
+                "attempts": attempt,
+                "tokens": total_tokens,
                 "corrected_sql": current_sql if current_sql != sql else None,
                 "corrected_results": current_results if current_sql != sql else None,
                 "refinement_tokens": refinement_tokens,
@@ -2237,6 +2282,13 @@ def _run_opus_review(
             trace_refinement_output = refine_response
             
             new_sql = extract_sql_from_response(refine_response)
+
+            # Guard: if extracted SQL is a fragment (not starting with SELECT/WITH),
+            # keep the previous SQL instead of displaying a broken fragment in the UI
+            import re as _re
+            if new_sql and not _re.match(r'^\s*(SELECT|WITH)\b', new_sql, _re.IGNORECASE):
+                print(f"[REFINE] Extracted SQL is a fragment, keeping previous SQL")
+                new_sql = current_sql
 
             # If model repeats same SQL after INCORRECT verdict, force a full regeneration
             if (not new_sql or new_sql.strip() == current_sql.strip()) and verdict == "INCORRECT":

@@ -470,7 +470,7 @@ def call_qwen_vertex(prompt: str):
     MODEL_NAME = "qwen3-coder-480b-a35b-instruct"
     SERVICE_ACCOUNT_JSON = (
         r"D:\cDRIVE\Test\project_llm_decision_with_rag_v14_with_analyzer_need_to_test\google_json"
-        r"llm-test-491910-88c51981e0b6.json"
+        r"\llm-test-491910-88c51981e0b6.json"
     )
 
     credentials = service_account.Credentials.from_service_account_file(

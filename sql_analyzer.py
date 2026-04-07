@@ -194,7 +194,9 @@ Use "synthesize" ONLY in these specific cases:
 
 Use "abort" if the data shows the question cannot be answered at all (e.g. the primary dataset returned 0 rows).
 Use "modify" if remaining steps need to change based on what you learned (e.g. a column name or value differs from expectation, or an identified entity should be substituted in).
-Use "proceed" to continue with remaining steps as-is. This is the DEFAULT — use it unless one of the synthesize/abort/modify conditions above strictly applies. Do NOT skip steps just because you feel the data collected so far is sufficient."""
+Use "proceed" to continue with remaining steps as-is. This is the DEFAULT — use it unless one of the synthesize/abort/modify conditions above strictly applies. Do NOT skip steps just because you feel the data collected so far is sufficient.
+
+Return ONLY the JSON object. No reasoning outside the JSON."""
 
 
 def _build_synthesis_prompt(
@@ -858,6 +860,7 @@ class SQLAnalyzer:
         """
         Inject summaries of dependency results into the sub_question so the
         pipeline has the context it needs (e.g. specific values to filter on).
+        Uses prominent formatting so the downstream LLM doesn't ignore it.
         """
         deps = step.get("depends_on", [])
         if not deps:
@@ -868,15 +871,22 @@ class SQLAnalyzer:
             for c in completed:
                 if c["step_id"] == dep_id:
                     dep_summaries.append(
-                        f"[Context from step {dep_id}: {c['results_summary']}]"
+                        f"--- Step {dep_id} results (MUST use these values) ---\n"
+                        f"SQL: {c.get('sql', 'N/A')}\n"
+                        f"Data: {c['results_summary']}\n"
                     )
                     break
 
         if not dep_summaries:
             return step["sub_question"]
 
-        context_block = " ".join(dep_summaries)
-        return f"{step['sub_question']} (Additional context: {context_block})"
+        context_block = "\n".join(dep_summaries)
+        return (
+            f"IMPORTANT: Use the data from prior steps below. "
+            f"Do NOT query for this data again or use different filters.\n\n"
+            f"{context_block}\n\n"
+            f"QUESTION: {step['sub_question']}"
+        )
 
     @staticmethod
     def _extract_sql_from_response(raw_response: str, parsed_obj: Optional[Dict]) -> str:

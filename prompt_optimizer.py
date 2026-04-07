@@ -813,14 +813,26 @@ def extract_sql_from_response(response: str) -> str:
         if cleaned.startswith('```'):
             cleaned = re.sub(r'^```(?:json|sql)?\s*', '', cleaned)
             cleaned = re.sub(r'\s*```$', '', cleaned)
-        
+
         if cleaned.startswith('{'):
             data = json.loads(cleaned)
             if "sql" in data:
                 return data["sql"].strip()
     except:
         pass
-    
+
+    # Recovery for truncated JSON where "sql" key exists but JSON is incomplete
+    # (e.g., refinement response hit max_tokens and cut off mid-JSON)
+    sql_value_match = re.search(
+        r'"sql"\s*:\s*"((?:SELECT|WITH)\s+.*?)(?:"\s*\}?\s*$|$)',
+        response, re.DOTALL | re.IGNORECASE
+    )
+    if sql_value_match:
+        candidate = sql_value_match.group(1).strip()
+        candidate = candidate.replace('\\"', '"').replace('\\n', '\n').replace('\\t', '\t')
+        if re.search(r'\bFROM\b', candidate, re.IGNORECASE):
+            return candidate
+
     # Try to extract from SQL markdown code block
     sql_match = re.search(r'```sql\s*(.*?)\s*```', response, re.DOTALL | re.IGNORECASE)
     if sql_match:
