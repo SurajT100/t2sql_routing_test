@@ -1105,20 +1105,27 @@ def process_query(
                     prefill=prefill, system_prompt=_p2_system,
                 )
             else:
-                pass2_prompt = create_pass2_prompt(
+                _p2_user = create_pass2_prompt(
                     question=question,
                     pass1_output=pass1_response,
                     metadata=bundle.metadata,
                     dialect_info=config.dialect_info,
                     resolver_text=bundle.resolver_text,
-                    rules=bundle.rules_compressed,
+                    rules="",  # included via _p2_system prepend below
                 )
+                # Non-Claude providers ignore system_prompt param → merge into user message
+                pass2_prompt = f"{_p2_system}\n\n{_p2_user}" if _p2_system else _p2_user
                 pass2_response, pass2_tokens = call_llm(
                     pass2_prompt, config.reasoning_provider, prefill=prefill,
                 )
             result.tokens.reasoning_pass2 = pass2_tokens
             _accumulate_cache_tokens(result.tokens.reasoning_pass2, pass2_tokens)
-            result.llm_trace.reasoning_pass2_input = pass2_prompt
+            # For Claude caching: system_prompt is sent separately but not in pass2_prompt.
+            # Merge both into the trace so the full context is visible in the UI.
+            if _is_claude_provider(config.reasoning_provider) and config.enable_prompt_caching and _p2_system:
+                result.llm_trace.reasoning_pass2_input = f"[SYSTEM PROMPT]\n{_p2_system}\n\n[USER MESSAGE]\n{pass2_prompt}"
+            else:
+                result.llm_trace.reasoning_pass2_input = pass2_prompt
             result.llm_trace.reasoning_pass2_output = pass2_response
             result.pass2_plan = pass2_response
             print(f"[STAGE3] Pass 2 complete — {pass2_tokens.get('input',0)+pass2_tokens.get('output',0)} tokens")
