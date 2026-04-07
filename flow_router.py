@@ -820,8 +820,7 @@ def process_query(
         if user_specified_date:
             try:
                 rules_list = json.loads(rules_compressed)
-                filtered_rules = []
-                skipped = []
+                annotated = []
 
                 for rule in rules_list:
                     rule_data = rule.get("data", rule.get("rule_data", {}))
@@ -831,13 +830,21 @@ def process_query(
                         and any(kw in str(rule_data).lower() for kw in ["date", "month", "year", "fy", "financial", "period"])
                     )
                     if is_auto_date:
-                        skipped.append(rule.get("name", rule.get("rule_name", "unknown")))
-                    else:
-                        filtered_rules.append(rule)
+                        # Keep the rule but annotate it so the LLM adapts
+                        # the date range to the user's explicit request
+                        rule["_user_date_override"] = True
+                        rule["_override_note"] = (
+                            f"USER OVERRIDE: The user's question says '{question}'. "
+                            f"Use the financial year/date definition from this rule "
+                            f"to compute the correct date range for the user's "
+                            f"requested period. Do NOT apply the default current-period "
+                            f"filter — adjust it to match what the user explicitly asked for."
+                        )
+                        annotated.append(rule.get("name", rule.get("rule_name", "unknown")))
 
-                if skipped:
-                    rules_compressed = json.dumps(filtered_rules)
-                    print(f"[STAGE2] Date override — skipped auto_apply: {skipped}")
+                if annotated:
+                    rules_compressed = json.dumps(rules_list)
+                    print(f"[STAGE2] Date override — annotated (not removed): {annotated}")
             except Exception as e:
                 print(f"[STAGE2] Date override filter error: {e}")
         
@@ -2217,18 +2224,37 @@ def _run_opus_review(
                     response_text = response_text[start:end]
             
             review = json.loads(response_text)
-        except:
-            review = {"verdict": "UNCERTAIN", "issues": ["Parse error"], "reasoning": opus_response[:200]}
-        
+        except Exception:
+            review = {"verdict": "UNCERTAIN", "issues": ["Parse error"], "reasoning": opus_response[:200], "_parse_error": True}
+
         verdict = review.get("verdict", "UNCERTAIN")
-        
-        if verdict in ["CORRECT", "UNCERTAIN"]:
+
+        if verdict == "CORRECT":
             return {
                 "verdict": verdict,
                 "final_review": review,
                 "attempts": attempt,
                 "tokens": total_tokens,
-                # Propagate refined SQL when it changed (reviewed & approved on attempt 2+)
+                "corrected_sql": current_sql if current_sql != sql else None,
+                "corrected_results": current_results if current_sql != sql else None,
+                "refinement_tokens": refinement_tokens,
+                "trace_opus_input": trace_opus_input,
+                "trace_opus_output": trace_opus_output,
+                "trace_refinement_input": trace_refinement_input,
+                "trace_refinement_output": trace_refinement_output,
+            }
+
+        if verdict == "UNCERTAIN":
+            # Parse errors get one more review attempt (same SQL, no refinement)
+            if review.get("_parse_error") and attempt < config.max_retries:
+                print(f"[OPUS] Parse error on attempt {attempt}, retrying review...")
+                continue
+            # Genuine UNCERTAIN — accept as-is
+            return {
+                "verdict": verdict,
+                "final_review": review,
+                "attempts": attempt,
+                "tokens": total_tokens,
                 "corrected_sql": current_sql if current_sql != sql else None,
                 "corrected_results": current_results if current_sql != sql else None,
                 "refinement_tokens": refinement_tokens,
@@ -2256,6 +2282,13 @@ def _run_opus_review(
             trace_refinement_output = refine_response
             
             new_sql = extract_sql_from_response(refine_response)
+
+            # Guard: if extracted SQL is a fragment (not starting with SELECT/WITH),
+            # keep the previous SQL instead of displaying a broken fragment in the UI
+            import re as _re
+            if new_sql and not _re.match(r'^\s*(SELECT|WITH)\b', new_sql, _re.IGNORECASE):
+                print(f"[REFINE] Extracted SQL is a fragment, keeping previous SQL")
+                new_sql = current_sql
 
             # If model repeats same SQL after INCORRECT verdict, force a full regeneration
             if (not new_sql or new_sql.strip() == current_sql.strip()) and verdict == "INCORRECT":

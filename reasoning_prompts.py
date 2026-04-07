@@ -105,7 +105,8 @@ RULES:
 - List every column that will be used anywhere in the query
 - string_filter_columns = columns where user provided a human-readable value
   that may not match exactly (names, partial codes, categories)
-- Do NOT write SQL or plan aggregations yet — just column identification"""
+- Do NOT write SQL or plan aggregations yet — just column identification
+- Output ONLY the JSON object below — no thinking, no reasoning, no explanation before or after it"""
 
 
 # =============================================================================
@@ -323,6 +324,12 @@ CRITICAL FILTER RULES:
   → Exact match is fine (e.g. user said "Active", samples contain "Active")
 - If ⚠️ PARTIAL MATCH LIKELY NEEDED is flagged AND no entity resolution is available
   → You MUST use wildcards, never exact match
+- If a business rule has "_user_date_override": true, read its "_override_note"
+  and adjust the date range to match the user's explicit request — do NOT apply
+  the rule's default period
+- When a single user value could match multiple columns (e.g., a location name
+  might be in "Region" or "Block"), use OR between those columns, not AND.
+  Only use AND when different user values map to different columns.
 
 OUTPUT (JSON only, NO SQL — intent and plan only):
 {{
@@ -348,7 +355,8 @@ OUTPUT (JSON only, NO SQL — intent and plan only):
   "notes": "any edge cases or casting needed"
 }}
 
-IMPORTANT: Output is a PLAN — no SQL syntax in filters, write conditions as strings only."""
+IMPORTANT: Output is a PLAN — no SQL syntax in filters, write conditions as strings only.
+Output ONLY the JSON object above — no thinking, no reasoning, no explanation before or after it."""
 
 
 # =============================================================================
