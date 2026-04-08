@@ -1157,6 +1157,9 @@ def process_query(
                 result.llm_trace.reasoning_pass2_input = pass2_prompt
             result.llm_trace.reasoning_pass2_output = pass2_response
             result.pass2_plan = pass2_response
+            if not pass2_response or not pass2_response.strip():
+                print(f"[STAGE3] ⚠️ WARNING: Pass 2 returned EMPTY response from {config.reasoning_provider}. "
+                      f"Tokens reported: {pass2_tokens}. SQL Coder will receive blank plan.")
             print(f"[STAGE3] Pass 2 complete — {pass2_tokens.get('input',0)+pass2_tokens.get('output',0)} tokens")
 
             # Keep SQL generation anchored to Pass 1 table/column selection so the

@@ -2833,6 +2833,9 @@ with tab3:
                                 st.write("**📥 PASS 2 — Full Plan with Metadata:**")
                                 st.text_area("Pass 2 Input", result.llm_trace.reasoning_pass2_input, height=300, key=f"pass2_in_{_qc}")
                                 st.write("**📤 Pass 2 Output:**")
+                                if not result.llm_trace.reasoning_pass2_output or not result.llm_trace.reasoning_pass2_output.strip():
+                                    st.warning("Pass 2 output is empty — the reasoning LLM returned a blank response. "
+                                               "This may indicate an API error or timeout. Check console logs for details.")
                                 st.text_area("Pass 2 Output", result.llm_trace.reasoning_pass2_output, height=200, key=f"pass2_out_{_qc}")
                         elif has_legacy:
                             # Legacy single-pass reasoning
@@ -3070,6 +3073,8 @@ with tab3:
                                         if _lt and getattr(_lt, "reasoning_pass2_input", ""):
                                             st.text_area("Pass 2 Input", _lt.reasoning_pass2_input, height=300, key=f"an_p2_in_{_i}_{_qc}")
                                             st.write("**📤 Pass 2 Output:**")
+                                            if not getattr(_lt, "reasoning_pass2_output", "") or not _lt.reasoning_pass2_output.strip():
+                                                st.warning("Pass 2 output is empty — the reasoning LLM returned a blank response.")
                                             st.text_area("Pass 2 Output", _lt.reasoning_pass2_output, height=150, key=f"an_p2_out_{_i}_{_qc}")
                                         else:
                                             st.info("Pass 2 data not available")

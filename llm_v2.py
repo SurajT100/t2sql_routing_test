@@ -724,9 +724,11 @@ def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None, debug
 
         if debug:
             print(f"[KIMI PARSE] source={content_source}, output_len={len(response_text)}")
-            if (tokens.get("input", 0) + tokens.get("output", 0)) > 0 and not response_text:
-                msg_keys = list((choices[0].get("message", {}) or {}).keys()) if choices else []
-                print(f"[KIMI PARSE WARNING] tokens>0 but empty output. message_keys={msg_keys}")
+
+        # Always warn when tokens were consumed but output is empty (not just in debug mode)
+        if (tokens.get("input", 0) + tokens.get("output", 0)) > 0 and not response_text:
+            msg_keys = list((choices[0].get("message", {}) or {}).keys()) if choices else []
+            print(f"[KIMI K2 WARNING] tokens>0 but empty output. message_keys={msg_keys}")
 
         return response_text, tokens
 
