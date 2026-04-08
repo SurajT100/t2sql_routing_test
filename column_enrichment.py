@@ -17,6 +17,7 @@ Usage:
 from typing import Dict, List, Any, Optional
 from sqlalchemy import text
 import json
+import re
 
 
 def generate_column_description_prompt(
@@ -58,7 +59,7 @@ OUTPUT FORMAT (JSON):
 def enrich_single_column(
     column_info: Dict,
     table_columns: List[str],
-    llm_provider: str = "claude_opus"
+    llm_provider: str = "vertex_kimi_k2_thinking"
 ) -> Dict[str, str]:
     """
     Use Opus to generate rich description for a single column.
@@ -83,14 +84,20 @@ def enrich_single_column(
     
     try:
         response, tokens = call_llm(prompt, llm_provider, prefill="{")
-        
-        # Ensure valid JSON
+
+        # Normalize response: strip markdown fences (Kimi K2 may wrap JSON in ```json...```)
         response = response.strip()
+        response = re.sub(r'^```(?:json)?\s*', '', response).strip()
+        response = re.sub(r'\s*```$', '', response).strip()
+
+        # Extract JSON object boundaries
         if not response.startswith("{"):
-            response = "{" + response
+            idx = response.find("{")
+            response = response[idx:] if idx != -1 else "{" + response
         if not response.endswith("}"):
-            response = response + "}"
-        
+            idx = response.rfind("}")
+            response = response[:idx + 1] if idx != -1 else response + "}"
+
         result = json.loads(response)
         
         # Combine into a single rich description
@@ -114,10 +121,10 @@ def enrich_single_column(
         }
 
 
-def enrich_columns_with_opus(
+def enrich_columns_with_llm(
     vector_engine,
     table_name: str,
-    llm_provider: str = "claude_opus",
+    llm_provider: str = "vertex_kimi_k2_thinking",
     progress_callback=None
 ) -> Dict[str, Any]:
     """
@@ -360,8 +367,12 @@ WHERE opus_description IS NOT NULL;
 """
 
 
+# Backward-compatible alias (app.py imports this name)
+enrich_columns_with_opus = enrich_columns_with_llm
+
+
 if __name__ == "__main__":
     print("Column Enrichment Module")
     print("=" * 60)
-    print("\nTo add Opus enrichment columns to your database, run:")
+    print("\nTo add LLM enrichment columns to your database, run:")
     print(SCHEMA_UPDATE_SQL)

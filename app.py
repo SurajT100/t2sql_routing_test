@@ -826,10 +826,10 @@ ON schema_columns USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)
                         total_count = len(existing_enrichments)
                         
                         if enriched_count > 0:
-                            st.success(f"✅ {enriched_count}/{total_count} columns already enriched with Opus")
-                            
+                            st.success(f"✅ {enriched_count}/{total_count} columns already enriched with AI")
+
                             # Show existing descriptions
-                            with st.expander("View Opus Descriptions", expanded=False):
+                            with st.expander("View AI Descriptions", expanded=False):
                                 for col_info in existing_enrichments:
                                     if col_info.get("opus_description"):
                                         st.write(f"**{col_info['column_name']}** ({col_info['data_type']})")
@@ -845,10 +845,10 @@ ON schema_columns USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)
                     
                     with col_enrich1:
                         enrich_clicked = st.button(
-                            "🚀 Enrich with Opus",
+                            "🚀 Enrich with Kimi K2",
                             type="primary",
                             use_container_width=True,
-                            help="Uses Claude Opus to generate intelligent descriptions"
+                            help="Uses Kimi K2 to generate intelligent descriptions"
                         )
                     
                     with col_enrich2:
@@ -873,13 +873,13 @@ ON schema_columns USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)
                                 def enrich_progress(col_name, status):
                                     current_col[0] += 1
                                     progress_bar.progress(min(current_col[0] / max(total_cols, 1), 1.0))
-                                    status_text.text(f"🤖 Opus analyzing: {col_name}...")
-                                
-                                with st.spinner(f"Enriching {total_cols} columns with Opus..."):
+                                    status_text.text(f"🤖 Kimi K2 analyzing: {col_name}...")
+
+                                with st.spinner(f"Enriching {total_cols} columns with Kimi K2..."):
                                     result = enrich_columns_with_opus(
                                         VECTOR_ENGINE,
                                         selected_table_enrich,
-                                        llm_provider="claude_opus",
+                                        llm_provider="vertex_kimi_k2_thinking",
                                         progress_callback=enrich_progress
                                     )
                                 
@@ -890,7 +890,7 @@ ON schema_columns USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)
                                 st.error(f"❌ Error: {result['error']}")
                             else:
                                 st.success(f"""
-                                ✅ **Opus Enrichment Complete!**
+                                ✅ **Kimi K2 Enrichment Complete!**
                                 - Columns enriched: {result['enriched']}
                                 - Errors: {result['errors']}
                                 - Total tokens used: {result['total_tokens']:,}
