@@ -1785,13 +1785,47 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
         if should_opus:
             stage_start = time.time()
 
+            # Extract time + strategy from Pass 2 plan for refinement context only.
+            # NEVER passed to Opus review — auditor must reason independently.
+            _planner_context = ""
+            if getattr(result, 'pass2_plan', '') and result.pass2_plan:
+                try:
+                    _plan_data = json.loads(result.pass2_plan)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    _plan_data = {}
+                if _plan_data:
+                    _ctx_parts = []
+                    ti = _plan_data.get('time_interpretation') or {}
+                    resolved = (ti.get('resolved_range') or '').strip()
+                    logic = (ti.get('logic') or '').strip()
+                    if resolved and resolved.lower() not in ('none', 'unknown', ''):
+                        _ctx_parts.append(f"Date range intended: {resolved}")
+                    if logic and logic.lower() not in ('none', 'unknown', ''):
+                        _ctx_parts.append(f"Date logic: {logic}")
+                    qs = _plan_data.get('query_strategy') or {}
+                    stype = (qs.get('type') or '').strip()
+                    if stype:
+                        _ctx_parts.append(f"Query strategy: {stype}")
+                    for _step in (qs.get('steps') or []):
+                        _goal = (_step.get('goal') or '').strip()
+                        if _goal:
+                            _ctx_parts.append(f"  Step {_step.get('step', '?')}: {_goal}")
+                    _planner_context = "\n".join(_ctx_parts)
+                if _planner_context:
+                    print(f"[OPUS] Planner context extracted for refinement ({len(_planner_context)} chars)")
+                else:
+                    print(f"[OPUS] No usable planner context extracted (pass2_plan present but fields empty/none)")
+
             # Use pruned focused_schema for Opus Review to save tokens.
             # Fall back to full schema_text if pruning safety triggered, bypassed, or unavailable.
-            _opus_schema = (
-                schema_text
-                if (result.pruning_fallback or config.bypass_table_pruning or not result.focused_schema)
-                else result.focused_schema
-            )
+            if result.pruning_fallback or config.bypass_table_pruning or not result.focused_schema:
+                print(f"[OPUS] Using full schema (fallback). pruning_fallback={getattr(result, 'pruning_fallback', None)}, "
+                      f"bypass={config.bypass_table_pruning}, "
+                      f"focused_schema={'present' if result.focused_schema else 'MISSING'}")
+                _opus_schema = schema_text
+            else:
+                print(f"[OPUS] Using pruned schema ({len(result.focused_schema)} chars)")
+                _opus_schema = result.focused_schema
 
             opus_result = _run_opus_review(
                 question=question,
@@ -1801,7 +1835,8 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
                 rules_compressed=rules_compressed,
                 config=config,
                 engine=engine,
-                use_opus_refinement=(result.complexity == "hard")
+                use_opus_refinement=(result.complexity == "hard"),
+                pass2_plan=_planner_context,
             )
             
             result.llm_trace.opus_input = opus_result.get("trace_opus_input", "")
@@ -2172,7 +2207,8 @@ def _run_opus_review(
     rules_compressed: str,
     config: FlowConfig,
     engine,
-    use_opus_refinement: bool = False
+    use_opus_refinement: bool = False,
+    pass2_plan: str = ""
 ) -> Dict[str, Any]:
     """
     Run Opus review with optional retry on INCORRECT verdict.
@@ -2308,7 +2344,8 @@ def _run_opus_review(
         
         if attempt < config.max_retries:
             refine_prompt = create_refinement_prompt(
-                question, current_sql, review, schema_text, rules_compressed
+                question, current_sql, review, schema_text, rules_compressed,
+                pass2_plan=pass2_plan,
             )
             
             refinement_provider = config.opus_provider if use_opus_refinement else config.reasoning_provider
@@ -2334,8 +2371,12 @@ def _run_opus_review(
 
             # If model repeats same SQL after INCORRECT verdict, force a full regeneration
             if (not new_sql or new_sql.strip() == current_sql.strip()) and verdict == "INCORRECT":
+                from datetime import date as _date
+                _today = _date.today().isoformat()
                 force_prompt = f"""Previous refinement repeated the same incorrect SQL.
 Generate a NEW corrected SQL from scratch that resolves all auditor failures.
+
+TODAY: {_today}
 
 QUESTION:
 {question}
@@ -2348,6 +2389,12 @@ SCHEMA:
 
 BUSINESS RULES:
 {rules_compressed}
+
+{f"PLANNER CONTEXT (reference only — verify independently):{chr(10)}{pass2_plan}{chr(10)}" if pass2_plan else ""}DATE HANDLING: Use dynamic date calculation with CURRENT_DATE and
+EXTRACT/MAKE_DATE functions — never hardcode date literals. If a fiscal
+year business rule applies, implement it with dynamic calculation. If the
+user requested a specific period (e.g., "last year"), adjust the dynamic
+calculation to target that period relative to the business rule's date system.
 
 REJECTED SQL:
 {current_sql}
