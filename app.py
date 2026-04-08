@@ -2827,6 +2827,9 @@ with tab3:
                                 st.write("**📥 PASS 1 — Column Identification:**")
                                 st.text_area("Pass 1 Input", result.llm_trace.reasoning_pass1_input, height=300, key=f"pass1_in_{_qc}")
                                 st.write("**📤 Pass 1 Output:**")
+                                if not result.llm_trace.reasoning_pass1_output or not result.llm_trace.reasoning_pass1_output.strip():
+                                    st.warning("Pass 1 output is empty — the reasoning LLM returned a blank response "
+                                               "(possible API error or rate-limit). Check console logs for details.")
                                 st.text_area("Pass 1 Output", result.llm_trace.reasoning_pass1_output, height=200, key=f"pass1_out_{_qc}")
                                 st.divider()
                             if has_pass2:
@@ -2885,6 +2888,9 @@ with tab3:
                             st.write("**📥 INPUT PROMPT:**")
                             st.text_area("Opus Input", result.llm_trace.opus_input, height=400, key=f"opus_in_{_qc}")
                             st.write("**📤 OUTPUT:**")
+                            if not result.llm_trace.opus_output or not result.llm_trace.opus_output.strip():
+                                st.warning("Opus reviewer output is empty — the reviewer LLM returned a blank response "
+                                           "(possible API error or rate-limit). Check console logs for details.")
                             st.text_area("Opus Output", result.llm_trace.opus_output, height=200, key=f"opus_out_{_qc}")
                         else:
                             st.info("Opus review not used for this query")

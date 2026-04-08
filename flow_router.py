@@ -1061,6 +1061,9 @@ def process_query(
             result.tokens.reasoning_pass1 = pass1_tokens
             _accumulate_cache_tokens(result.tokens.reasoning_pass1, pass1_tokens)
             result.llm_trace.reasoning_pass1_output = pass1_response
+            if not pass1_response or not pass1_response.strip():
+                print(f"[STAGE3] WARNING: Pass 1 returned EMPTY response from "
+                      f"{config.reasoning_provider}. Tokens: {pass1_tokens}.")
             print(f"[STAGE3] Pass 1 complete — {pass1_tokens.get('input',0)+pass1_tokens.get('output',0)} tokens")
 
             # ── CONTEXT AGENT: Focused retrieval for ONLY identified columns ──
@@ -2248,7 +2251,10 @@ def _run_opus_review(
         if attempt == 1:
             trace_opus_input = opus_prompt
             trace_opus_output = opus_response
-        
+            if not opus_response or not opus_response.strip():
+                print(f"[OPUS REVIEW] WARNING: Reviewer returned EMPTY response from "
+                      f"{config.opus_provider}. Tokens: {opus_tokens}.")
+
         try:
             response_text = opus_response
             if "```json" in response_text:
