@@ -249,6 +249,34 @@ def format_metadata_for_prompt(metadata: Dict[str, Any]) -> str:
 # PASS 2 — FULL PLAN WITH METADATA AWARENESS
 # =============================================================================
 
+def build_date_context() -> str:
+    """
+    Compute raw calendar date facts from the current system date.
+    Called fresh at query time — never hardcoded.
+    Generic: works for any database, any date system, any set of business rules.
+    """
+    today = date.today()
+    year = today.year
+    month = today.month
+    day = today.day
+    calendar_quarter = (month + 2) // 3   # ceil(month/3) without importing math
+    prev_year = year - 1
+    month_start = f"{year}-{month:02d}-01"
+    year_start = f"{year}-01-01"
+    today_str = f"{year}-{month:02d}-{day:02d}"
+
+    return (
+        f"DATE CONTEXT (raw date facts for reference):\n"
+        f"- TODAY: {today_str}\n"
+        f"- Current calendar year: {year}\n"
+        f"- Current month: {month}\n"
+        f"- Current quarter (calendar): Q{calendar_quarter} {year}\n"
+        f"- Previous calendar year: {prev_year}\n"
+        f"- Start of current month: {month_start}\n"
+        f"- Start of current year: {year_start}"
+    )
+
+
 def create_pass2_prompt(
     question: str,
     pass1_output: str,
@@ -278,6 +306,7 @@ def create_pass2_prompt(
     quote_char = dialect_info.get("quote_char", '"') if dialect_info else '"'
     string_quote = dialect_info.get("string_quote", "'") if dialect_info else "'"
     today = date.today().isoformat()
+    date_context = build_date_context()
 
     metadata_text = format_metadata_for_prompt(metadata)
 
@@ -304,6 +333,7 @@ DATABASE: {dialect_name}
 COLUMN FORMAT: {quote_char}column_name{quote_char}
 STRING FORMAT: {string_quote}value{string_quote}
 TODAY: {today}
+{date_context}
 
 ORIGINAL QUESTION: {question}
 
@@ -331,22 +361,81 @@ CRITICAL FILTER RULES:
   might be in "Region" or "Block"), use OR between those columns, not AND.
   Only use AND when different user values map to different columns.
 
+DATE INTERPRETATION:
+Use the DATE CONTEXT facts above as raw reference. Then:
+1. Check if the user mentioned a time period ("last year", "this quarter", "Jan 2025", etc.)
+2. Check if any business rules define a date system (fiscal year, calendar year, custom periods)
+3. Combine both:
+   - If business rules define a date system AND user references a relative period
+     ("last year", "this quarter") → interpret relative to that system
+   - If NO date-system rules exist AND user references a relative period
+     → interpret relative to calendar year using the DATE CONTEXT above
+   - If user gives explicit dates ("Jan to March 2025") → use those dates
+     regardless of any rules
+   - If no time mentioned AND a default date rule has auto_apply for this query type
+     → apply the rule's default period
+   - If no time mentioned AND no applicable date rules exist → no date filter
+4. Document your reasoning in time_interpretation.logic so the auditor can verify.
+
+MULTI-STEP DETECTION:
+If the question asks for TWO or MORE things where the second depends on the first,
+you MUST use query_strategy.type = "multi_step" and define each step separately.
+Examples of multi-step:
+  "Which X did the most Y, and what Z did they have?"
+    → Step 1: find top X by Y, Step 2: find Z for that X
+  "Top region by sales and their best performing month"
+    → Step 1: find top region, Step 2: find best month for that region
+  "Best salesperson and who are their clients"
+    → Step 1: find best salesperson, Step 2: list their clients
+Examples of single-step:
+  "Total sales by region" → single GROUP BY
+  "Who had the most sales?" → single GROUP BY + ORDER + LIMIT
+  "Average order value" → single aggregation
+
+OVERRIDE DOCUMENTATION:
+If the user's question explicitly mentions a time period or condition that conflicts
+with an auto_apply business rule's default behavior, the user's explicit request
+takes priority. Document every such override in the "overrides" array.
+If no conflict exists, leave "overrides" as an empty array [].
+
 OUTPUT (JSON only, NO SQL — intent and plan only):
 {{
   "understanding": "What user wants in plain terms",
+  "time_interpretation": {{
+    "user_said": "exact time phrase from question, or 'none' if no time reference",
+    "business_rule_applied": "name of date-related business rule used, or 'none' if no date rules exist",
+    "resolved_range": "explicit start and end dates, or 'none' if no date filter needed",
+    "logic": "1-2 sentence explanation: how user phrase + rules (or absence of rules) led to this range"
+  }},
+  "query_strategy": {{
+    "type": "single_step or multi_step",
+    "steps": [
+      {{
+        "step": 1,
+        "goal": "what this step computes",
+        "group_by": ["columns for this step"],
+        "aggregation": "aggregation for this step or null",
+        "output": "what this step produces for the next step or as final output"
+      }}
+    ],
+    "reasoning": "why single vs multi step was chosen"
+  }},
+  "overrides": [
+    {{
+      "rule_name": "name of the business rule being overridden",
+      "default_behavior": "what the rule normally does",
+      "applied_instead": "what was actually applied",
+      "reason": "why the override was necessary"
+    }}
+  ],
   "tables": ["schema.table"],
   "columns": {{"table": ["col1", "col2"]}},
   "joins": [],
   "filters": [
     {{
-      "column": "status_column",
-      "condition": " = 'Open'",
-      "reason": "show open status"
-    }},
-    {{
-      "column": "category_column",
-      "condition": "<> 'ExactValue'",
-      "reason": "exact match confirmed from samples"
+      "column": "column_name",
+      "condition": "condition as string",
+      "reason": "why this filter"
     }}
   ],
   "aggregations": ["SUM(col)"],
@@ -355,8 +444,13 @@ OUTPUT (JSON only, NO SQL — intent and plan only):
   "notes": "any edge cases or casting needed"
 }}
 
-IMPORTANT: Output is a PLAN — no SQL syntax in filters, write conditions as strings only.
-Output ONLY the JSON object above — no thinking, no reasoning, no explanation before or after it."""
+IMPORTANT:
+- Output is a PLAN — no SQL syntax in filters, write conditions as strings only.
+- Output ONLY the JSON object — no thinking, no reasoning, no explanation before or after it.
+- The time_interpretation, query_strategy, and overrides fields are MANDATORY in every response.
+- If no time reference exists, still include time_interpretation with "none" values.
+- If single step, still include query_strategy with one step.
+- If no overrides, still include overrides as empty array []."""
 
 
 # =============================================================================
