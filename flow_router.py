@@ -1816,22 +1816,26 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
                 else:
                     print(f"[OPUS] No usable planner context extracted (pass2_plan present but fields empty/none)")
 
-            # Use pruned focused_schema for Opus Review to save tokens.
-            # Fall back to full schema_text if pruning safety triggered, bypassed, or unavailable.
-            if result.pruning_fallback or config.bypass_table_pruning or not result.focused_schema:
-                print(f"[OPUS] Using full schema (fallback). pruning_fallback={getattr(result, 'pruning_fallback', None)}, "
-                      f"bypass={config.bypass_table_pruning}, "
-                      f"focused_schema={'present' if result.focused_schema else 'MISSING'}")
-                _opus_schema = schema_text
-            else:
-                print(f"[OPUS] Using pruned schema ({len(result.focused_schema)} chars)")
-                _opus_schema = result.focused_schema
+            # Schema strategy:
+            # - Opus Review: ALWAYS full schema (must verify table selection independently)
+            # - Refinement: pruned schema (tables already validated by Opus)
+            _refinement_schema = (
+                result.focused_schema
+                if result.focused_schema
+                and not result.pruning_fallback
+                and not config.bypass_table_pruning
+                else schema_text
+            )
+            print(f"[SCHEMA] Opus=full ({len(schema_text)} chars), "
+                  f"Refinement={'pruned' if _refinement_schema != schema_text else 'full'} "
+                  f"({len(_refinement_schema)} chars)")
 
             opus_result = _run_opus_review(
                 question=question,
                 sql=result.sql,
                 results=result.results,
-                schema_text=_opus_schema,
+                schema_text=schema_text,
+                refinement_schema=_refinement_schema,
                 rules_compressed=rules_compressed,
                 config=config,
                 engine=engine,
@@ -2208,7 +2212,8 @@ def _run_opus_review(
     config: FlowConfig,
     engine,
     use_opus_refinement: bool = False,
-    pass2_plan: str = ""
+    pass2_plan: str = "",
+    refinement_schema: str = ""
 ) -> Dict[str, Any]:
     """
     Run Opus review with optional retry on INCORRECT verdict.
@@ -2224,6 +2229,8 @@ def _run_opus_review(
       - trace_refinement_input / trace_refinement_output
       - corrected_sql / corrected_results / refinement_tokens (if refined)
     """
+    _eff_ref_schema = refinement_schema or schema_text
+
     from llm_v2 import call_llm
     from db import run_sql
     from prompt_optimizer import (
@@ -2344,7 +2351,7 @@ def _run_opus_review(
         
         if attempt < config.max_retries:
             refine_prompt = create_refinement_prompt(
-                question, current_sql, review, schema_text, rules_compressed,
+                question, current_sql, review, _eff_ref_schema, rules_compressed,
                 pass2_plan=pass2_plan,
             )
             
@@ -2385,7 +2392,7 @@ AUDITOR FEEDBACK JSON:
 {json.dumps(review, ensure_ascii=False)}
 
 SCHEMA:
-{schema_text}
+{_eff_ref_schema}
 
 BUSINESS RULES:
 {rules_compressed}
