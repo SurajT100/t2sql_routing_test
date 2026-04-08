@@ -656,20 +656,34 @@ def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None, debug
             print("URL:", url)
             print(json.dumps(payload, indent=2)[:1000])
 
-        # ---------------- API CALL ----------------
-        response = requests.post(url, headers=headers, json=payload, timeout=90)
+        # ---------------- API CALL (with 429 retry) ----------------
+        import time as _time
+        _max_retries = 3
+        _retry_delays = [2, 4, 8]  # seconds between attempts
 
-        if debug:
-            print("\n===== RESPONSE STATUS =====")
-            print("Status Code:", response.status_code)
+        for _attempt in range(_max_retries):
+            response = requests.post(url, headers=headers, json=payload, timeout=90)
 
-        if response.status_code != 200:
+            if debug:
+                print("\n===== RESPONSE STATUS =====")
+                print("Status Code:", response.status_code)
+
+            if response.status_code == 200:
+                break  # success — proceed to parse
+
+            if response.status_code == 429 and _attempt < _max_retries - 1:
+                _wait = _retry_delays[_attempt]
+                print(f"[KIMI K2] 429 rate-limit on attempt {_attempt + 1}/{_max_retries}. "
+                      f"Retrying in {_wait}s...")
+                _time.sleep(_wait)
+                continue
+
+            # Non-429 error OR final attempt — log and return empty
             print("\n===== ERROR RESPONSE =====")
             try:
                 print(json.dumps(response.json(), indent=2))
             except Exception:
                 print(response.text)
-
             return "", {"input": 0, "output": 0, "error_code": response.status_code}
 
         data = response.json()
