@@ -858,6 +858,36 @@ def process_query(
                 print(f"[STAGE2] Date override filter error: {e}")
         
         result.rules_compressed = rules_compressed
+
+        # Compute fiscal year context once per query (empty string if no FY rule found).
+        # Injected into Pass 2, Opus, Refinement, and force-regen prompts below.
+        _fy_context = ""
+        try:
+            _rules_for_fy = json.loads(rules_compressed) if rules_compressed and rules_compressed != "[]" else []
+        except Exception:
+            _rules_for_fy = []
+        if _rules_for_fy:
+            from reasoning_prompts import detect_fy_start_month, build_fy_context as _build_fy_context
+            from datetime import date as _date_cls
+            _fy_start = detect_fy_start_month(_rules_for_fy)
+            if _fy_start:
+                _fy_rule_name = ""
+                _fy_tables = None
+                for _r in _rules_for_fy:
+                    if _r.get('auto_apply') and _r.get('type') == 'default':
+                        _fy_rule_name = _r.get('name', '')
+                        _fy_tables = _r.get('applies_to_queries') or None
+                        break
+                _fy_context = _build_fy_context(
+                    today=_date_cls.today(),
+                    fy_start_month=_fy_start,
+                    rule_name=_fy_rule_name,
+                    applicable_tables=_fy_tables,
+                )
+                print(f"[FY_CONTEXT] Detected FY start month={_fy_start}, rule='{_fy_rule_name}'")
+            else:
+                print(f"[FY_CONTEXT] No parseable FY rule found — using calendar year DATE CONTEXT only")
+
         result.stages_completed.append("schema_and_rag")
         result.stage_times["schema_and_rag"] = int((time.time() - stage_start) * 1000)
         
@@ -878,7 +908,9 @@ def process_query(
             create_pass2_prompt,
             create_opus_complex_prompt,
             parse_pass1_output,
-            parse_pass2_output
+            parse_pass2_output,
+            detect_fy_start_month,
+            build_fy_context,
         )
 
         dialect_syntax = get_dialect_syntax_rules(config.dialect_info.get('dialect', 'postgresql'))
@@ -1131,6 +1163,7 @@ def process_query(
                     dialect_info=config.dialect_info,
                     resolver_text=bundle.resolver_text,
                     rules="",  # already in system_prompt to avoid duplication
+                    fy_context=_fy_context,
                 )
                 pass2_response, pass2_tokens = call_llm(
                     pass2_prompt, config.reasoning_provider,
@@ -1144,6 +1177,7 @@ def process_query(
                     dialect_info=config.dialect_info,
                     resolver_text=bundle.resolver_text,
                     rules="",  # included via _p2_system prepend below
+                    fy_context=_fy_context,
                 )
                 # Non-Claude providers ignore system_prompt param → merge into user message
                 pass2_prompt = f"{_p2_system}\n\n{_p2_user}" if _p2_system else _p2_user
@@ -1838,6 +1872,7 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
                 engine=engine,
                 use_opus_refinement=(result.complexity == "hard"),
                 pass2_plan=_planner_context,
+                fy_context=_fy_context,
             )
             
             result.llm_trace.opus_input = opus_result.get("trace_opus_input", "")
@@ -2210,7 +2245,8 @@ def _run_opus_review(
     engine,
     use_opus_refinement: bool = False,
     pass2_plan: str = "",
-    refinement_schema: str = ""
+    refinement_schema: str = "",
+    fy_context: str = "",
 ) -> Dict[str, Any]:
     """
     Run Opus review with optional retry on INCORRECT verdict.
@@ -2274,6 +2310,7 @@ def _run_opus_review(
             columns_used=columns_used,
             schema_text="" if use_cache else schema_text,
             rules_compressed="" if use_cache else rules_compressed,
+            fy_context=fy_context,
         )
 
         if use_prefill:
@@ -2350,6 +2387,7 @@ def _run_opus_review(
             refine_prompt = create_refinement_prompt(
                 question, current_sql, review, _eff_ref_schema, rules_compressed,
                 pass2_plan=pass2_plan,
+                fy_context=fy_context,
             )
             
             refinement_provider = config.opus_provider if use_opus_refinement else config.reasoning_provider
@@ -2377,10 +2415,12 @@ def _run_opus_review(
             if (not new_sql or new_sql.strip() == current_sql.strip()) and verdict == "INCORRECT":
                 from datetime import date as _date
                 _today = _date.today().isoformat()
+                _force_fy_block = ("\n" + fy_context) if fy_context else ""
                 force_prompt = f"""Previous refinement repeated the same incorrect SQL.
 Generate a NEW corrected SQL from scratch that resolves all auditor failures.
 
 TODAY: {_today}
+{_force_fy_block}
 
 QUESTION:
 {question}

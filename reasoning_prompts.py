@@ -277,13 +277,197 @@ def build_date_context() -> str:
     )
 
 
+def detect_fy_start_month(business_rules: List[Dict]) -> Optional[int]:
+    """
+    Scan business rules for a fiscal year definition.
+    Expects the compressed rules list (output of compress_rules_for_llm after json.loads).
+    Returns the FY start month (int 1-12) or None if no FY rule found.
+    """
+    import re
+
+    month_names = {
+        'january': 1, 'february': 2, 'march': 3, 'april': 4,
+        'may': 5, 'june': 6, 'july': 7, 'august': 8,
+        'september': 9, 'october': 10, 'november': 11, 'december': 12
+    }
+
+    found_fy_keyword = False
+
+    for rule in business_rules:
+        if not (rule.get('auto_apply') and rule.get('type') == 'default'):
+            continue
+
+        # Check for explicit fy_start_month field first (future-proofing)
+        if rule.get('fy_start_month'):
+            return int(rule['fy_start_month'])
+
+        apply_text = (
+            str(rule.get('apply', '')) + ' ' + str(rule.get('desc', ''))
+        ).lower()
+
+        # Skip if no fiscal/financial year indicators
+        has_fy_indicator = any(w in apply_text for w in
+            ['financial', 'fiscal', 'fy', 'april 1', '1st april',
+             'august 1', '1st august'])
+        if not has_fy_indicator:
+            continue
+
+        found_fy_keyword = True
+
+        for month_name, month_num in month_names.items():
+            if month_num == 1:
+                continue  # January start = calendar year, skip
+
+            # Match: "april 1", "april 1st", "1st april", "1 april", "from april"
+            patterns = [
+                rf'\b{month_name}\s+1',
+                rf'\b1\s*(?:st|ST)?\s+{month_name}',
+                rf'from\s+{month_name}',
+            ]
+
+            for pattern in patterns:
+                if re.search(pattern, apply_text):
+                    # Verify the end month is also mentioned
+                    end_month_num = month_num - 1 if month_num > 1 else 12
+                    end_month_name = [k for k, v in month_names.items()
+                                      if v == end_month_num][0]
+                    if end_month_name in apply_text:
+                        return month_num
+
+    if found_fy_keyword:
+        import logging
+        logging.warning(
+            "[FY_CONTEXT] FY rule detected but start month could not be parsed. "
+            "FY context not injected."
+        )
+
+    return None
+
+
+def build_fy_context(
+    today: date,
+    fy_start_month: int,
+    rule_name: str = "",
+    applicable_tables: Optional[List[str]] = None,
+) -> str:
+    """
+    Compute fiscal year and quarter boundaries from today's date.
+    All values are computed dynamically — nothing hardcoded.
+
+    Args:
+        today: date object (pass date.today() at call site — never call internally)
+        fy_start_month: int (e.g., 4 for April)
+        rule_name: str (name of the business rule)
+        applicable_tables: list of table names or query types the rule applies to
+
+    Returns:
+        FISCAL YEAR CONTEXT block to inject into prompts, or "" if invalid input.
+    """
+    from calendar import monthrange
+
+    if not fy_start_month or fy_start_month < 1 or fy_start_month > 12:
+        return ""
+
+    year = today.year
+    month = today.month
+
+    # Fiscal Year boundaries
+    fy_end_month = fy_start_month - 1 if fy_start_month > 1 else 12
+
+    if month >= fy_start_month:
+        current_fy_start_year = year
+    else:
+        current_fy_start_year = year - 1
+
+    def fy_start_date(start_year: int) -> date:
+        return date(start_year, fy_start_month, 1)
+
+    def fy_end_date(start_year: int) -> date:
+        end_year = start_year + 1 if fy_end_month < fy_start_month else start_year
+        last_day = monthrange(end_year, fy_end_month)[1]
+        return date(end_year, fy_end_month, last_day)
+
+    current_fy_start = fy_start_date(current_fy_start_year)
+    current_fy_end = fy_end_date(current_fy_start_year)
+    prev_fy_start = fy_start_date(current_fy_start_year - 1)
+    prev_fy_end = fy_end_date(current_fy_start_year - 1)
+
+    # Fiscal Quarter boundaries
+    def fiscal_quarter_dates(fy_start_year: int, quarter_num: int):
+        """Return (start_date, end_date) for a fiscal quarter (1-4)."""
+        offset = (quarter_num - 1) * 3
+        q_start_month = ((fy_start_month - 1 + offset) % 12) + 1
+        q_end_month = ((fy_start_month - 1 + offset + 2) % 12) + 1
+
+        # A month belongs to the FY starting at fy_start_year if it's >= fy_start_month;
+        # months that wrap around (< fy_start_month) fall in the next calendar year.
+        q_start_year = fy_start_year if q_start_month >= fy_start_month else fy_start_year + 1
+        q_end_year = fy_start_year if q_end_month >= fy_start_month else fy_start_year + 1
+
+        q_start = date(q_start_year, q_start_month, 1)
+        last_day = monthrange(q_end_year, q_end_month)[1]
+        q_end = date(q_end_year, q_end_month, last_day)
+        return q_start, q_end
+
+    # Find current fiscal quarter
+    current_fq = None
+    current_fq_start = None
+    current_fq_end = None
+    for q in range(1, 5):
+        q_start, q_end = fiscal_quarter_dates(current_fy_start_year, q)
+        if q_start <= today <= q_end:
+            current_fq = q
+            current_fq_start = q_start
+            current_fq_end = q_end
+            break
+
+    # Previous fiscal quarter
+    prev_fq = None
+    prev_fq_start = None
+    prev_fq_end = None
+    if current_fq is not None:
+        if current_fq > 1:
+            prev_fq = current_fq - 1
+            prev_fq_start, prev_fq_end = fiscal_quarter_dates(current_fy_start_year, prev_fq)
+        else:  # current_fq == 1, prev is Q4 of previous FY
+            prev_fq = 4
+            prev_fq_start, prev_fq_end = fiscal_quarter_dates(current_fy_start_year - 1, 4)
+
+    # Build context string
+    tables_str = ", ".join(applicable_tables) if applicable_tables else "all tables"
+    rule_label = f'"{rule_name}"' if rule_name else "fiscal year rule"
+
+    lines = [
+        f"FISCAL YEAR CONTEXT (from business rule {rule_label}, "
+        f"applies to: {tables_str} — use as ground truth, do not recalculate):",
+        f"- Fiscal year runs: month {fy_start_month} to month {fy_end_month}",
+        f'- Current FY: {current_fy_start} to {current_fy_end}',
+        f'- "this year" = Current FY: {current_fy_start} to {current_fy_end}',
+        f'- "last year" = Previous FY: {prev_fy_start} to {prev_fy_end}',
+    ]
+
+    if current_fq is not None:
+        lines.extend([
+            f'- Current fiscal quarter: Q{current_fq} ({current_fq_start} to {current_fq_end})',
+            f'- "this quarter" = Q{current_fq}: {current_fq_start} to {current_fq_end}',
+        ])
+
+    if prev_fq is not None and prev_fq_start is not None:
+        lines.append(
+            f'- "last quarter" = Q{prev_fq}: {prev_fq_start} to {prev_fq_end}'
+        )
+
+    return "\n".join(lines)
+
+
 def create_pass2_prompt(
     question: str,
     pass1_output: str,
     metadata: Dict[str, Any],
     dialect_info: Dict = None,
     resolver_text: str = "",
-    rules: str = "[]"
+    rules: str = "[]",
+    fy_context: str = "",
 ) -> str:
     """
     Pass 2: Build complete query plan using Pass 1 columns + metadata.
@@ -326,6 +510,8 @@ BUSINESS RULES (relevant to identified columns):
 {rules}
 """
 
+    fy_context_section = ("\n" + fy_context) if fy_context else ""
+
     return f"""You are completing a SQL query plan. You already identified the tables 
 and columns needed. Now use the actual stored values to finalize all filters correctly.
 
@@ -334,7 +520,7 @@ COLUMN FORMAT: {quote_char}column_name{quote_char}
 STRING FORMAT: {string_quote}value{string_quote}
 TODAY: {today}
 {date_context}
-
+{fy_context_section}
 ORIGINAL QUESTION: {question}
 
 YOUR PASS 1 OUTPUT (tables + columns already identified):

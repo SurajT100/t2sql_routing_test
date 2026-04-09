@@ -582,7 +582,8 @@ def create_opus_review_prompt_optimized(
     rules_applied: List[str] = None,
     error: str = None,
     schema_text: str = "",
-    rules_compressed: str = "[]"
+    rules_compressed: str = "[]",
+    fy_context: str = "",
 ) -> str:
     """
     Strict Opus review prompt.
@@ -606,6 +607,7 @@ def create_opus_review_prompt_optimized(
         Strict review prompt for Opus
     """
     today = date.today().isoformat()
+    _fy_block = ("\n" + fy_context) if fy_context else ""
 
     if error:
         return f"""Review this failed SQL query.
@@ -641,6 +643,7 @@ not just plausible. Be critical. Wrong column = wrong answer even if the query r
 {rules_compressed}
 
 TODAY: {today}
+{_fy_block}
 
 ## USER QUESTION
 {question}
@@ -753,13 +756,15 @@ def create_refinement_prompt(
     opus_feedback: Dict,
     schema: str,
     rules: str,
-    pass2_plan: str = ""
+    pass2_plan: str = "",
+    fy_context: str = "",
 ) -> str:
     """
     Create prompt for SQL refinement after Opus rejection.
     Fixes only what Opus flagged, preserves everything else.
     """
     today = date.today().isoformat()
+    _fy_block = (fy_context + "\n") if fy_context else ""
 
     issues = opus_feedback.get("issues", [])
     reasoning = opus_feedback.get("reasoning", "")
@@ -806,7 +811,7 @@ Failed checks: {failed_checks_text}
 
 ## ORIGINAL QUESTION
 TODAY: {today}
-{question}
+{_fy_block}{question}
 
 ## REJECTED SQL
 ```sql
