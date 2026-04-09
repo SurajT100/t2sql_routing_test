@@ -437,24 +437,36 @@ def build_fy_context(
     tables_str = ", ".join(applicable_tables) if applicable_tables else "all tables"
     rule_label = f'"{rule_name}"' if rule_name else "fiscal year rule"
 
+    from datetime import timedelta
+
+    def _excl(d):
+        """Return the exclusive upper bound (next day) for use with TIMESTAMP columns."""
+        return d + timedelta(days=1)
+
     lines = [
         f"FISCAL YEAR CONTEXT (from business rule {rule_label}, "
         f"applies to: {tables_str} — use as ground truth, do not recalculate):",
         f"- Fiscal year runs: month {fy_start_month} to month {fy_end_month}",
-        f'- Current FY: {current_fy_start} to {current_fy_end}',
-        f'- "this year" = Current FY: {current_fy_start} to {current_fy_end}',
-        f'- "last year" = Previous FY: {prev_fy_start} to {prev_fy_end}',
+        f'- Current FY: {current_fy_start} to {current_fy_end}'
+        f'  (TIMESTAMP: use >= {current_fy_start} AND < {_excl(current_fy_end)})',
+        f'- "this year" = Current FY: {current_fy_start} to {current_fy_end}'
+        f'  (TIMESTAMP: use >= {current_fy_start} AND < {_excl(current_fy_end)})',
+        f'- "last year" = Previous FY: {prev_fy_start} to {prev_fy_end}'
+        f'  (TIMESTAMP: use >= {prev_fy_start} AND < {_excl(prev_fy_end)})',
     ]
 
     if current_fq is not None:
         lines.extend([
-            f'- Current fiscal quarter: Q{current_fq} ({current_fq_start} to {current_fq_end})',
-            f'- "this quarter" = Q{current_fq}: {current_fq_start} to {current_fq_end}',
+            f'- Current fiscal quarter: Q{current_fq} ({current_fq_start} to {current_fq_end})'
+            f'  (TIMESTAMP: use >= {current_fq_start} AND < {_excl(current_fq_end)})',
+            f'- "this quarter" = Q{current_fq}: {current_fq_start} to {current_fq_end}'
+            f'  (TIMESTAMP: use >= {current_fq_start} AND < {_excl(current_fq_end)})',
         ])
 
     if prev_fq is not None and prev_fq_start is not None:
         lines.append(
             f'- "last quarter" = Q{prev_fq}: {prev_fq_start} to {prev_fq_end}'
+            f'  (TIMESTAMP: use >= {prev_fq_start} AND < {_excl(prev_fq_end)})'
         )
 
     return "\n".join(lines)
@@ -540,6 +552,11 @@ CRITICAL FILTER RULES:
   → Exact match is fine (e.g. user said "Active", samples contain "Active")
 - If ⚠️ PARTIAL MATCH LIKELY NEEDED is flagged AND no entity resolution is available
   → You MUST use wildcards, never exact match
+- TIMESTAMP BOUNDARY RULE: When filtering a TIMESTAMP (datetime) column by a date range,
+  NEVER use col <= 'YYYY-MM-DD' for the upper bound (this misses records after midnight).
+  Always use col < 'YYYY-MM-DD+1' (exclusive next day) instead.
+  Example: fiscal year end March 31 → use col >= '2026-04-01' AND col < '2027-04-01'
+  The FISCAL YEAR CONTEXT above already shows the correct exclusive bound for each period.
 - If a business rule has "_user_date_override": true, read its "_override_note"
   and adjust the date range to match the user's explicit request — do NOT apply
   the rule's default period

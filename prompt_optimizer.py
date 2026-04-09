@@ -719,6 +719,17 @@ Would a business user looking at these results get the answer, or would they say
    - If NO date-related business rule exists for this query type, calendar year
      interpretation is acceptable for relative phrases like "last year".
    - Use the TODAY date provided in this prompt to verify date arithmetic.
+   ENTITY-RESOLVED FILTERS:
+   - The Pass 2 plan may include ENTITY RESOLUTIONS — results from a live database
+     lookup that determined the exact match strategy for each user-mentioned entity.
+   - If a filter uses ILIKE, LIKE, or a pattern, check whether an entity resolution
+     was performed for that value. If it was, the pattern strategy was chosen by the
+     resolver because an exact match was not found — do NOT flag this as wrong.
+   - Only flag a pattern filter as incorrect if: (a) no entity resolution was done
+     AND samples show the exact value exists verbatim, OR (b) the pattern is so broad
+     it would return unintended rows (e.g., '%a%' for a short common letter).
+   - Entity-resolved conditions come from the live database; they override guessing.
+     If the Pass 2 plan says "use ILIKE '%Acme%'" based on entity resolution, accept it.
 
 3. AGGREGATION VERIFICATION
    - Does the aggregation match what the question asks for?
