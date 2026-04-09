@@ -1789,10 +1789,7 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
             # NEVER passed to Opus review — auditor must reason independently.
             _planner_context = ""
             if getattr(result, 'pass2_plan', '') and result.pass2_plan:
-                try:
-                    _plan_data = json.loads(result.pass2_plan)
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    _plan_data = {}
+                _plan_data = parse_pass2_output(result.pass2_plan)
                 if _plan_data:
                     _ctx_parts = []
                     ti = _plan_data.get('time_interpretation') or {}

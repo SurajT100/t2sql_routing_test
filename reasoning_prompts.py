@@ -368,6 +368,25 @@ Use the DATE CONTEXT facts above as raw reference. Then:
 3. Combine both:
    - If business rules define a date system AND user references a relative period
      ("last year", "this quarter") → interpret relative to that system
+     CRITICAL DISTINCTION — relative vs explicit dates:
+     Relative phrases like "last year", "this year", "last quarter", "this quarter"
+     are NOT explicit dates. They must be interpreted WITHIN whatever date system applies:
+       If a fiscal year rule is active (e.g., April-March, August-July):
+         → "last year"    = previous fiscal year
+         → "this year"    = current fiscal year
+         → "last quarter" = previous fiscal quarter per that system
+       If NO date-system rule is active:
+         → "last year"    = previous calendar year (Jan 1 – Dec 31)
+         → "this year"    = current calendar year
+         → "last quarter" = previous calendar quarter
+     Only EXPLICIT dates override the business rule's date system:
+       "January to March 2025"         → exact dates, ignore fiscal year rule
+       "in 2024"                       → calendar year 2024, ignore fiscal year rule
+       "calendar year 2025"            → user explicitly requested calendar year
+       "from April 2024 to March 2025" → exact dates as stated
+     "last year" with an active fiscal year rule is NOT an override — it is a relative
+     phrase interpreted within the fiscal year system. Only document it in "overrides"
+     if the user explicitly requests calendar year or specific dates that conflict.
    - If NO date-system rules exist AND user references a relative period
      → interpret relative to calendar year using the DATE CONTEXT above
    - If user gives explicit dates ("Jan to March 2025") → use those dates
@@ -446,7 +465,11 @@ OUTPUT (JSON only, NO SQL — intent and plan only):
 
 IMPORTANT:
 - Output is a PLAN — no SQL syntax in filters, write conditions as strings only.
-- Output ONLY the JSON object — no thinking, no reasoning, no explanation before or after it.
+- OUTPUT FORMAT (MANDATORY — parse failure if not followed):
+  Your response must start with {{ and end with }}.
+  No thinking, no reasoning, no chain-of-thought, no explanation before or after the JSON.
+  Do not include markdown code fences. Do not show your work.
+  Start immediately with the opening brace {{.
 - The time_interpretation, query_strategy, and overrides fields are MANDATORY in every response.
 - If no time reference exists, still include time_interpretation with "none" values.
 - If single step, still include query_strategy with one step.
@@ -651,16 +674,48 @@ def parse_pass1_output(response: str) -> Dict:
 
 def parse_pass2_output(response: str) -> Dict:
     """
-    Safely parse Pass 2 JSON output.
-    Returns empty dict on failure.
+    Safely parse Pass 2 JSON output. Multi-strategy extraction:
+    1. Strip whitespace, try json.loads
+    2. Strip markdown fences, retry json.loads
+    3. Brace-balanced scan: find first { and matching }
+    4. All fail: log error and return {}
     """
+    import re as _re
+
+    # Strategy 1: direct parse
+    cleaned = response.strip()
     try:
-        cleaned = response.strip()
-        if cleaned.startswith("```"):
-            import re
-            cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
-            cleaned = re.sub(r'\s*```$', '', cleaned)
         return json.loads(cleaned)
-    except Exception as e:
-        print(f"[PASS2 PARSE] Failed: {e}")
-        return {}
+    except Exception:
+        pass
+
+    # Strategy 2: strip markdown fences
+    if cleaned.startswith("```"):
+        cleaned = _re.sub(r'^```(?:json)?\s*', '', cleaned)
+        cleaned = _re.sub(r'\s*```$', '', cleaned)
+        try:
+            return json.loads(cleaned)
+        except Exception:
+            pass
+
+    # Strategy 3: brace-balanced scan for embedded JSON (handles CoT before JSON)
+    start = response.find('{')
+    if start >= 0:
+        depth = 0
+        for i in range(start, len(response)):
+            if response[i] == '{':
+                depth += 1
+            elif response[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        parsed = json.loads(response[start:i + 1])
+                        print(f"[PASS2 PARSE] Extracted JSON via brace-balanced scan (offset {start})")
+                        return parsed
+                    except json.JSONDecodeError:
+                        pass
+                    break
+
+    # Strategy 4: all failed
+    print(f"[PASS2 PARSE] Failed all strategies. Raw start: {response[:200]!r}")
+    return {}
