@@ -1,6 +1,7 @@
 import requests
 import anthropic
 import os
+import concurrent.futures as _cf
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -47,7 +48,7 @@ def call_llm(
     elif provider == "vertex_qwen_thinking":
         return call_vertex_qwen_thinking(prompt, stop_sequences)
     elif provider == "vertex_kimi_k2_thinking":
-        return call_vertex_kimi_k2_thinking(prompt, stop_sequences)
+        return call_vertex_kimi_k2_thinking(prompt, stop_sequences, prefill=prefill)
     elif provider == "o1_mini":
         return call_o1_mini(prompt)
     elif provider == "o1":
@@ -589,7 +590,7 @@ def call_vertex_qwen_thinking(prompt: str, stop_sequences: list = None):
     
     return response_text, tokens
 
-def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None, debug: bool = True):
+def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None, debug: bool = True, prefill: str = None):
     """
     Call Kimi K2 Thinking via Vertex AI MaaS endpoint.
     Returns: (response_text, token_dict)
@@ -636,14 +637,12 @@ def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None, debug
         }
 
         # ✅ FIXED PAYLOAD (OpenAI-style)
+        messages = [{"role": "user", "content": prompt}]
+        if prefill:
+            messages.append({"role": "assistant", "content": prefill})
         payload = {
             "model": MODEL_NAME,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
+            "messages": messages,
             "temperature": 0.6,
             "max_tokens": 4096
         }
@@ -656,13 +655,22 @@ def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None, debug
             print("URL:", url)
             print(json.dumps(payload, indent=2)[:1000])
 
-        # ---------------- API CALL (with 429 retry) ----------------
+        # ---------------- API CALL (with 429 retry + total-time cap) ----------------
         import time as _time
         _max_retries = 3
         _retry_delays = [2, 4, 8]  # seconds between attempts
+        _TOTAL_TIMEOUT = 150        # hard cap per attempt (handles slow-streaming hangs)
 
         for _attempt in range(_max_retries):
-            response = requests.post(url, headers=headers, json=payload, timeout=90)
+            _fut = _cf.ThreadPoolExecutor(max_workers=1).submit(
+                requests.post, url, headers=headers, json=payload, timeout=90
+            )
+            try:
+                response = _fut.result(timeout=_TOTAL_TIMEOUT)
+            except _cf.TimeoutError:
+                print(f"[KIMI K2] Total timeout ({_TOTAL_TIMEOUT}s) on attempt "
+                      f"{_attempt + 1}/{_max_retries}")
+                return "", {"input": 0, "output": 0, "error": f"total_timeout_{_TOTAL_TIMEOUT}s"}
 
             if debug:
                 print("\n===== RESPONSE STATUS =====")

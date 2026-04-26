@@ -736,6 +736,15 @@ Would a business user looking at these results get the answer, or would they say
    - If NO date-related business rule exists for this query type, calendar year
      interpretation is acceptable for relative phrases like "last year".
    - Use the TODAY date provided in this prompt to verify date arithmetic.
+   HARDCODED DATES: If the SQL uses hardcoded date literals instead of dynamic
+   expressions (MAKE_DATE, EXTRACT, CURRENT_DATE), verify mathematically whether
+   those literals ARE correct for the user's stated time period using TODAY.
+   If '2025-04-01' correctly represents the start of last financial year when
+   TODAY = 2026-04-26, the date filter is PASS — do NOT mark INCORRECT simply
+   because the SQL uses literals instead of MAKE_DATE(). The business rule's
+   dynamic-syntax example is a best-practice guide, not a strict format requirement.
+   Only flag the date filter INCORRECT if the literal dates represent the WRONG
+   period (e.g. current FY used instead of last FY, or dates are off by a year).
    ENTITY-RESOLVED FILTERS:
    - The Pass 2 plan may include ENTITY RESOLUTIONS — results from a live database
      lookup that determined the exact match strategy for each user-mentioned entity.

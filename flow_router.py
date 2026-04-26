@@ -516,6 +516,11 @@ def _is_claude_provider(provider: str) -> bool:
     return provider.startswith("claude_")
 
 
+def _supports_json_prefill(provider: str) -> bool:
+    """Return True when the provider honours an assistant-turn prefill to force JSON output."""
+    return provider.startswith("claude_") or "kimi" in provider.lower()
+
+
 def _build_static_system_prompt(
     dialect_syntax: str = "",
     schema: str = "",
@@ -1128,19 +1133,19 @@ def process_query(
             result.stages_completed.append("context_agent")
             result.stage_times["context_agent"] = bundle.total_time_ms
             result.focused_schema = bundle.focused_schema
-            result.pruning_fallback = bundle.pruning_fallback
-            result.rule_extra_tables = bundle.rule_extra_tables
+            result.pruning_fallback = getattr(bundle, 'pruning_fallback', False)
+            result.rule_extra_tables = getattr(bundle, 'rule_extra_tables', [])
 
             print(f"[STAGE3] Context Agent complete — {bundle.total_time_ms}ms | "
                   f"descs:{bundle.opus_descriptions_fetched} rules:{bundle.rules_retrieved} "
                   f"entities:{bundle.entities_resolved} "
-                  f"pruning_fallback={bundle.pruning_fallback} "
+                  f"pruning_fallback={result.pruning_fallback} "
                   f"rule_tables={len(bundle.rule_extra_tables)}")
 
             # Pass 2: Full plan with FOCUSED context
             # Schema: use focused (pruned) schema to save tokens.
             # Fall back to full bare_schema if pruning safety was triggered or bypassed.
-            _use_full_p2_schema = bundle.pruning_fallback or config.bypass_table_pruning
+            _use_full_p2_schema = getattr(bundle, 'pruning_fallback', False) or config.bypass_table_pruning
             _p2_schema = bare_schema if _use_full_p2_schema else bundle.focused_schema
             _schema_saved = len(bare_schema) - len(_p2_schema)
             print(f"[TABLE PRUNING] Pass 2 schema: {len(bare_schema)} → {len(_p2_schema)} chars "
@@ -1318,8 +1323,8 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
             result.stages_completed.append("context_agent")
             result.stage_times["context_agent"] = bundle.total_time_ms
             result.focused_schema = bundle.focused_schema
-            result.pruning_fallback = bundle.pruning_fallback
-            result.rule_extra_tables = bundle.rule_extra_tables
+            result.pruning_fallback = getattr(bundle, 'pruning_fallback', False)
+            result.rule_extra_tables = getattr(bundle, 'rule_extra_tables', [])
 
             # Opus single call: FOCUSED schema + rules + metadata + resolutions → SQL
             _opus_system = _build_static_system_prompt(
@@ -2284,7 +2289,7 @@ def _run_opus_review(
     trace_refinement_input = ""
     trace_refinement_output = ""
 
-    use_prefill = _is_claude_provider(config.opus_provider)
+    use_prefill = _supports_json_prefill(config.opus_provider)
     use_cache = _is_claude_provider(config.opus_provider) and config.enable_prompt_caching
 
     # Build cacheable system prompt (schema + rules) for Opus review
@@ -2392,7 +2397,7 @@ def _run_opus_review(
             )
             
             refinement_provider = config.opus_provider if use_opus_refinement else config.reasoning_provider
-            prefill = "{" if "claude" in refinement_provider else None
+            prefill = "{" if _supports_json_prefill(refinement_provider) else None
             refine_response, refine_tokens = call_llm(
                 refine_prompt, refinement_provider, prefill=prefill
             )
@@ -2446,7 +2451,7 @@ REJECTED SQL:
 
 Return ONLY SQL. No explanation."""
                 force_provider = config.opus_provider if use_opus_refinement else config.reasoning_provider
-                force_prefill = "{" if "claude" in force_provider else None
+                force_prefill = "{" if _supports_json_prefill(force_provider) else None
                 force_response, force_tokens = call_llm(force_prompt, force_provider, prefill=force_prefill)
                 refinement_tokens["input"] += force_tokens.get("input", 0)
                 refinement_tokens["output"] += force_tokens.get("output", 0)
@@ -2455,11 +2460,13 @@ Return ONLY SQL. No explanation."""
                 new_sql = extract_sql_from_response(force_response)
 
             if new_sql and new_sql != current_sql:
+                _prev_sql = current_sql
                 current_sql = new_sql
                 try:
                     current_results = run_sql(engine, current_sql)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[REFINE] Refined SQL failed to execute: {e}")
+                    current_sql = _prev_sql  # revert to keep sql ↔ results in sync
     
     return {
         "verdict": "FAILED_AFTER_RETRIES",
