@@ -552,17 +552,32 @@ CRITICAL FILTER RULES:
   → Exact match is fine (e.g. user said "Active", samples contain "Active")
 - If ⚠️ PARTIAL MATCH LIKELY NEEDED is flagged AND no entity resolution is available
   → You MUST use wildcards, never exact match
-- DATE CONDITIONS: For date filters derived from a fiscal-year or date-system
-  business rule, always write the condition as a dynamic PostgreSQL expression
-  (MAKE_DATE, EXTRACT, CURRENT_DATE) rather than a pre-computed literal date string.
-  TODAY is provided only for reasoning — do NOT hardcode it or any computed date into the plan.
-  Example for "last year" with April-March fiscal year:
-    CORRECT: >= MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::INT - 1, 4, 1)
-             AND < MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::INT, 4, 1)
-    WRONG:   >= '2025-04-01' AND < '2026-04-01'
-  This rule applies to all relative time phrases: "last year", "this year",
-  "last quarter", "current FY", etc. Only use literal date strings when the
-  user explicitly stated exact calendar dates (e.g. "from Jan 2025 to Mar 2025").
+- DATE CONDITIONS: For date filters derived from a fiscal-year business rule:
+  1. READ the FISCAL YEAR CONTEXT block above — it already tells you the exact
+     date boundaries for "last year", "this year", etc. Use those as your ground
+     truth, NOT your own date arithmetic.
+  2. Translate those boundary dates into dynamic MAKE_DATE() expressions.
+     Derive the year offset by comparing the FY context year values to
+     EXTRACT(YEAR FROM CURRENT_DATE) — do NOT guess the offset.
+     Example when TODAY is in April–December (e.g. 2026-04-26):
+       FY context shows: "last year" = 2025-04-01 to 2026-03-31
+       EXTRACT(YEAR FROM CURRENT_DATE) = 2026
+       2025 = 2026 - 1  →  offset -1 for start
+       2026 = 2026 + 0  →  offset  0 for end (exclusive)
+       CORRECT: >= MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::INT - 1, 4, 1)
+                AND < MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::INT, 4, 1)
+     Example when TODAY is in January–March (e.g. 2026-02-15):
+       FY context shows: "last year" = 2024-04-01 to 2025-03-31
+       EXTRACT(YEAR FROM CURRENT_DATE) = 2026
+       2024 = 2026 - 2  →  offset -2 for start
+       2025 = 2026 - 1  →  offset -1 for end
+       CORRECT: >= MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::INT - 2, 4, 1)
+                AND < MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::INT - 1, 4, 1)
+  3. NEVER write plain string literals ('2025-04-01') — always use MAKE_DATE().
+  4. Only use literal date strings when the user explicitly stated exact calendar
+     dates (e.g. "from Jan 2025 to Mar 2025").
+  This applies to all relative time phrases: "last year", "this year",
+  "last quarter", "current FY", etc.
 - TIMESTAMP BOUNDARY RULE: When filtering a TIMESTAMP (datetime) column by a date range,
   NEVER use col <= 'YYYY-MM-DD' for the upper bound (this misses records after midnight).
   Always use col < 'YYYY-MM-DD+1' (exclusive next day) instead.
