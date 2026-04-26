@@ -195,6 +195,23 @@ def compress_rules_for_llm(rules: List[Dict]) -> str:
     return safe_json_dumps(compressed, separators=(',', ':'))
 
 
+# Fields kept only for retrieval/display; Pass 1 needs structural logic, not metadata.
+_PASS1_DROP = frozenset({
+    "keywords", "priority", "mandatory",
+    "desc", "description", "description_type", "subtype",
+})
+
+
+def strip_for_pass1(rules_json: str) -> str:
+    """Remove metadata-only fields from compressed rules before sending to Pass 1."""
+    try:
+        rules = json.loads(rules_json) if rules_json else []
+    except Exception:
+        return rules_json
+    stripped = [{k: v for k, v in rule.items() if k not in _PASS1_DROP} for rule in rules]
+    return safe_json_dumps(stripped, separators=(',', ':'))
+
+
 def decompress_rules_for_display(compressed_json: str) -> List[Dict]:
     """
     Convert compressed rules back to readable format for UI display.

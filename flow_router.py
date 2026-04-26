@@ -588,6 +588,7 @@ def process_query(
     from schema_rag import get_relevant_schema, get_relevant_schema_simple, format_schema_for_llm, get_full_schema
     from prompt_optimizer import (
         compress_rules_for_llm,
+        strip_for_pass1,
         create_easy_query_prompt,
         create_medium_query_prompt,
         create_hard_query_prompt,
@@ -1057,7 +1058,7 @@ def process_query(
             _p1_system = _build_static_system_prompt(
                 dialect_syntax=dialect_syntax,
                 schema=bare_schema,
-                rules=rules_compressed,
+                rules=strip_for_pass1(rules_compressed),
                 extra_instructions=(
                     f"You are a SQL query planner for {dialect_name_upper}. "
                     f"Your task is to identify which tables and columns are needed.\n"
@@ -1084,7 +1085,7 @@ def process_query(
             else:
                 pass1_prompt = create_pass1_prompt(
                     question=question, schema=bare_schema,
-                    rules=rules_compressed, dialect_info=config.dialect_info,
+                    rules=strip_for_pass1(rules_compressed), dialect_info=config.dialect_info,
                 )
                 pass1_response, pass1_tokens = call_llm(
                     pass1_prompt, config.reasoning_provider, prefill=prefill,
@@ -1252,7 +1253,7 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
             _cp1_system = _build_static_system_prompt(
                 dialect_syntax=dialect_syntax,
                 schema=bare_schema,
-                rules=rules_compressed,
+                rules=strip_for_pass1(rules_compressed),
                 extra_instructions=(
                     f"You are a SQL query planner for {dialect_name_upper}. "
                     f"Identify which tables and columns are needed.\n"
@@ -1279,7 +1280,7 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
             else:
                 pass1_prompt = create_pass1_prompt(
                     question=question, schema=bare_schema,
-                    rules=rules_compressed, dialect_info=config.dialect_info,
+                    rules=strip_for_pass1(rules_compressed), dialect_info=config.dialect_info,
                 )
                 pass1_response, pass1_tokens = call_llm(
                     pass1_prompt, config.reasoning_provider, prefill=prefill,

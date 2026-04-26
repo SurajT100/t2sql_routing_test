@@ -639,8 +639,7 @@ OUTPUT (JSON only, NO SQL — intent and plan only):
         "aggregation": "aggregation for this step or null",
         "output": "what this step produces for the next step or as final output"
       }}
-    ],
-    "reasoning": "why single vs multi step was chosen"
+    ]
   }},
   "overrides": [
     {{
