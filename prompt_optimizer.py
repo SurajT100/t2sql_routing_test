@@ -653,14 +653,14 @@ OUTPUT (JSON):
     prompt = f"""You are an independent SQL auditor. Your job is to verify this SQL is ACTUALLY CORRECT,
 not just plausible. Be critical. Wrong column = wrong answer even if the query runs.
 
+## CURRENT DATE
+TODAY: {today}
+{_fy_block}
 ## SCHEMA (ground truth — check every column name and data type)
 {schema_text}
 
 ## BUSINESS RULES (verify each rule was applied correctly, not just referenced)
 {rules_compressed}
-
-TODAY: {today}
-{_fy_block}
 
 ## USER QUESTION
 {question}
@@ -738,11 +738,13 @@ Would a business user looking at these results get the answer, or would they say
    - Use the TODAY date provided in this prompt to verify date arithmetic.
    HARDCODED DATES: If the SQL uses hardcoded date literals instead of dynamic
    expressions (MAKE_DATE, EXTRACT, CURRENT_DATE), verify mathematically whether
-   those literals ARE correct for the user's stated time period using TODAY.
-   If '2025-04-01' correctly represents the start of last financial year when
-   TODAY = 2026-04-26, the date filter is PASS — do NOT mark INCORRECT simply
-   because the SQL uses literals instead of MAKE_DATE(). The business rule's
-   dynamic-syntax example is a best-practice guide, not a strict format requirement.
+   those literals ARE correct for the user's stated time period using the TODAY
+   date from the CURRENT DATE section at the top of this prompt.
+   Example: if TODAY = {today} and the user asked for "last year" with an
+   April-March fiscal year, then '2025-04-01' as the start date IS correct —
+   mark it PASS. Do NOT mark INCORRECT simply because the SQL uses literals
+   instead of MAKE_DATE(). The business rule's dynamic-syntax example is a
+   best-practice guide, not a strict format requirement.
    Only flag the date filter INCORRECT if the literal dates represent the WRONG
    period (e.g. current FY used instead of last FY, or dates are off by a year).
    ENTITY-RESOLVED FILTERS:
