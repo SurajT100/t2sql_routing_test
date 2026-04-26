@@ -337,6 +337,7 @@ with st.sidebar:
             "OpenAI o1-mini (Recommended)",
             "OpenAI o1 (Best Reasoning)",
             "Claude Sonnet 4",
+            "Claude Sonnet 4.6",
             "Claude Haiku 4.5",
             "Groq Llama 3.3 70B",
             "xAI Grok Beta",
@@ -345,12 +346,13 @@ with st.sidebar:
         ],
         key="reasoning_llm"
     )
-    
+
     reasoning_map = {
         "NVIDIA Qwen 3 Next 80B (Thinking)": "nvidia_qwen3",
         "OpenAI o1-mini (Recommended)": "o1_mini",
         "OpenAI o1 (Best Reasoning)": "o1",
         "Claude Sonnet 4": "claude_sonnet",
+        "Claude Sonnet 4.6": "claude_sonnet_46",
         "Claude Haiku 4.5": "claude_haiku",
         "Groq Llama 3.3 70B": "groq",
         "xAI Grok Beta": "grok",
