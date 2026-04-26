@@ -48,7 +48,7 @@ def call_llm(
     elif provider == "vertex_qwen_thinking":
         return call_vertex_qwen_thinking(prompt, stop_sequences)
     elif provider == "vertex_kimi_k2_thinking":
-        return call_vertex_kimi_k2_thinking(prompt, stop_sequences)
+        return call_vertex_kimi_k2_thinking(prompt, stop_sequences, prefill=prefill)
     elif provider == "o1_mini":
         return call_o1_mini(prompt)
     elif provider == "o1":
@@ -590,7 +590,7 @@ def call_vertex_qwen_thinking(prompt: str, stop_sequences: list = None):
     
     return response_text, tokens
 
-def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None, debug: bool = True):
+def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None, debug: bool = True, prefill: str = None):
     """
     Call Kimi K2 Thinking via Vertex AI MaaS endpoint.
     Returns: (response_text, token_dict)
@@ -637,14 +637,12 @@ def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None, debug
         }
 
         # ✅ FIXED PAYLOAD (OpenAI-style)
+        messages = [{"role": "user", "content": prompt}]
+        if prefill:
+            messages.append({"role": "assistant", "content": prefill})
         payload = {
             "model": MODEL_NAME,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
+            "messages": messages,
             "temperature": 0.6,
             "max_tokens": 2000
         }

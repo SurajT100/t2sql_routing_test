@@ -516,6 +516,11 @@ def _is_claude_provider(provider: str) -> bool:
     return provider.startswith("claude_")
 
 
+def _supports_json_prefill(provider: str) -> bool:
+    """Return True when the provider honours an assistant-turn prefill to force JSON output."""
+    return provider.startswith("claude_") or "kimi" in provider.lower()
+
+
 def _build_static_system_prompt(
     dialect_syntax: str = "",
     schema: str = "",
@@ -2284,7 +2289,7 @@ def _run_opus_review(
     trace_refinement_input = ""
     trace_refinement_output = ""
 
-    use_prefill = _is_claude_provider(config.opus_provider)
+    use_prefill = _supports_json_prefill(config.opus_provider)
     use_cache = _is_claude_provider(config.opus_provider) and config.enable_prompt_caching
 
     # Build cacheable system prompt (schema + rules) for Opus review
@@ -2392,7 +2397,7 @@ def _run_opus_review(
             )
             
             refinement_provider = config.opus_provider if use_opus_refinement else config.reasoning_provider
-            prefill = "{" if "claude" in refinement_provider else None
+            prefill = "{" if _supports_json_prefill(refinement_provider) else None
             refine_response, refine_tokens = call_llm(
                 refine_prompt, refinement_provider, prefill=prefill
             )
@@ -2446,7 +2451,7 @@ REJECTED SQL:
 
 Return ONLY SQL. No explanation."""
                 force_provider = config.opus_provider if use_opus_refinement else config.reasoning_provider
-                force_prefill = "{" if "claude" in force_provider else None
+                force_prefill = "{" if _supports_json_prefill(force_provider) else None
                 force_response, force_tokens = call_llm(force_prompt, force_provider, prefill=force_prefill)
                 refinement_tokens["input"] += force_tokens.get("input", 0)
                 refinement_tokens["output"] += force_tokens.get("output", 0)
