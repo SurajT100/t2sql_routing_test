@@ -1133,19 +1133,19 @@ def process_query(
             result.stages_completed.append("context_agent")
             result.stage_times["context_agent"] = bundle.total_time_ms
             result.focused_schema = bundle.focused_schema
-            result.pruning_fallback = bundle.pruning_fallback
-            result.rule_extra_tables = bundle.rule_extra_tables
+            result.pruning_fallback = getattr(bundle, 'pruning_fallback', False)
+            result.rule_extra_tables = getattr(bundle, 'rule_extra_tables', [])
 
             print(f"[STAGE3] Context Agent complete — {bundle.total_time_ms}ms | "
                   f"descs:{bundle.opus_descriptions_fetched} rules:{bundle.rules_retrieved} "
                   f"entities:{bundle.entities_resolved} "
-                  f"pruning_fallback={bundle.pruning_fallback} "
+                  f"pruning_fallback={result.pruning_fallback} "
                   f"rule_tables={len(bundle.rule_extra_tables)}")
 
             # Pass 2: Full plan with FOCUSED context
             # Schema: use focused (pruned) schema to save tokens.
             # Fall back to full bare_schema if pruning safety was triggered or bypassed.
-            _use_full_p2_schema = bundle.pruning_fallback or config.bypass_table_pruning
+            _use_full_p2_schema = getattr(bundle, 'pruning_fallback', False) or config.bypass_table_pruning
             _p2_schema = bare_schema if _use_full_p2_schema else bundle.focused_schema
             _schema_saved = len(bare_schema) - len(_p2_schema)
             print(f"[TABLE PRUNING] Pass 2 schema: {len(bare_schema)} → {len(_p2_schema)} chars "
@@ -1323,8 +1323,8 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
             result.stages_completed.append("context_agent")
             result.stage_times["context_agent"] = bundle.total_time_ms
             result.focused_schema = bundle.focused_schema
-            result.pruning_fallback = bundle.pruning_fallback
-            result.rule_extra_tables = bundle.rule_extra_tables
+            result.pruning_fallback = getattr(bundle, 'pruning_fallback', False)
+            result.rule_extra_tables = getattr(bundle, 'rule_extra_tables', [])
 
             # Opus single call: FOCUSED schema + rules + metadata + resolutions → SQL
             _opus_system = _build_static_system_prompt(

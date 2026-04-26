@@ -644,7 +644,7 @@ def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None, debug
             "model": MODEL_NAME,
             "messages": messages,
             "temperature": 0.6,
-            "max_tokens": 2000
+            "max_tokens": 4096
         }
 
         if stop_sequences:
