@@ -518,7 +518,14 @@ def _is_claude_provider(provider: str) -> bool:
 
 def _supports_json_prefill(provider: str) -> bool:
     """Return True when the provider honours an assistant-turn prefill to force JSON output."""
-    return provider.startswith("claude_") or "kimi" in provider.lower()
+    prov = provider.lower()
+    # Kimi K2 supports prefill via messages list even though it has "thinking" in the name
+    if "kimi" in prov:
+        return True
+    # Claude extended-thinking models reject assistant-message prefill with HTTP 400
+    if "thinking" in prov:
+        return False
+    return prov.startswith("claude_")
 
 
 def _build_static_system_prompt(
@@ -966,7 +973,7 @@ def process_query(
                         f"that may not match exactly (names, categories, codes). "
                         f"Each entry MUST be a dict with keys: table, column, user_value, filter_type."
                     )
-                    _sp1_prefill = "{" if _is_claude_provider(config.reasoning_provider) else None
+                    _sp1_prefill = "{" if _supports_json_prefill(config.reasoning_provider) else None
                     if _is_claude_provider(config.reasoning_provider) and config.enable_prompt_caching:
                         _sp1_response, _sp1_tokens = call_llm(
                             _sp1_user,
@@ -1080,7 +1087,7 @@ def process_query(
                 f"that may not match exactly (names, categories, codes). "
                 f"Each entry MUST be a dict with keys: table, column, user_value, filter_type."
             )
-            prefill = "{" if _is_claude_provider(config.reasoning_provider) else None
+            prefill = "{" if _supports_json_prefill(config.reasoning_provider) else None
             if _is_claude_provider(config.reasoning_provider) and config.enable_prompt_caching:
                 pass1_response, pass1_tokens = call_llm(
                     _p1_user, config.reasoning_provider,
@@ -1275,7 +1282,7 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
                 f"that may not match exactly (names, categories, codes). "
                 f"Each entry MUST be a dict with keys: table, column, user_value, filter_type."
             )
-            prefill = "{" if _is_claude_provider(config.reasoning_provider) else None
+            prefill = "{" if _supports_json_prefill(config.reasoning_provider) else None
             if _is_claude_provider(config.reasoning_provider) and config.enable_prompt_caching:
                 pass1_response, pass1_tokens = call_llm(
                     _cp1_user, config.reasoning_provider,
@@ -1411,7 +1418,7 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
                 schema=schema_text,
                 rules=rules_compressed,
             ) if (_is_claude_provider(config.reasoning_provider) and config.enable_prompt_caching) else None
-            prefill = "{" if _is_claude_provider(config.reasoning_provider) else None
+            prefill = "{" if _supports_json_prefill(config.reasoning_provider) else None
             reasoning_response, reasoning_tokens = call_llm(
                 reasoning_prompt, config.reasoning_provider,
                 prefill=prefill,
@@ -1685,7 +1692,7 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
                         dialect_info=config.dialect_info,
                         use_opus=False
                     )
-                    prefill = "{" if "claude" in config.reasoning_provider else None
+                    prefill = "{" if _supports_json_prefill(config.reasoning_provider) else None
                     retry_response, retry_tokens = call_llm(
                         retry_prompt, config.reasoning_provider, prefill=prefill
                     )

@@ -214,7 +214,18 @@ def call_claude_sonnet(
     if stop_sequences:
         params["stop_sequences"] = stop_sequences
 
-    message = client.messages.create(**params)
+    try:
+        message = client.messages.create(**params)
+    except Exception as e:
+        # Claude 4.x models (e.g. claude-sonnet-4-6) reject assistant-turn prefill.
+        # Retry once without the prefill message.
+        if prefill and "prefill" in str(e).lower():
+            print(f"[SONNET] Model rejected prefill, retrying without it: {e}")
+            params["messages"] = [{"role": "user", "content": prompt}]
+            message = client.messages.create(**params)
+            prefill = None  # no prefix to prepend to response
+        else:
+            raise
 
     tokens = {
         "input": message.usage.input_tokens,
