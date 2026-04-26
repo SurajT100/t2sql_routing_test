@@ -1,6 +1,7 @@
 import requests
 import anthropic
 import os
+import concurrent.futures as _cf
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -645,7 +646,7 @@ def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None, debug
                 }
             ],
             "temperature": 0.6,
-            "max_tokens": 4096
+            "max_tokens": 2000
         }
 
         if stop_sequences:
@@ -656,13 +657,22 @@ def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None, debug
             print("URL:", url)
             print(json.dumps(payload, indent=2)[:1000])
 
-        # ---------------- API CALL (with 429 retry) ----------------
+        # ---------------- API CALL (with 429 retry + total-time cap) ----------------
         import time as _time
         _max_retries = 3
         _retry_delays = [2, 4, 8]  # seconds between attempts
+        _TOTAL_TIMEOUT = 150        # hard cap per attempt (handles slow-streaming hangs)
 
         for _attempt in range(_max_retries):
-            response = requests.post(url, headers=headers, json=payload, timeout=90)
+            _fut = _cf.ThreadPoolExecutor(max_workers=1).submit(
+                requests.post, url, headers=headers, json=payload, timeout=90
+            )
+            try:
+                response = _fut.result(timeout=_TOTAL_TIMEOUT)
+            except _cf.TimeoutError:
+                print(f"[KIMI K2] Total timeout ({_TOTAL_TIMEOUT}s) on attempt "
+                      f"{_attempt + 1}/{_max_retries}")
+                return "", {"input": 0, "output": 0, "error": f"total_timeout_{_TOTAL_TIMEOUT}s"}
 
             if debug:
                 print("\n===== RESPONSE STATUS =====")
