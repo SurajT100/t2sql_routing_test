@@ -1147,7 +1147,7 @@ def process_query(
                   f"descs:{bundle.opus_descriptions_fetched} rules:{bundle.rules_retrieved} "
                   f"entities:{bundle.entities_resolved} "
                   f"pruning_fallback={result.pruning_fallback} "
-                  f"rule_tables={len(bundle.rule_extra_tables)}")
+                  f"rule_tables={len(result.rule_extra_tables)}")
 
             # Pass 2: Full plan with FOCUSED context
             # Schema: use focused (pruned) schema to save tokens.
