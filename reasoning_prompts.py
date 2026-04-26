@@ -552,6 +552,17 @@ CRITICAL FILTER RULES:
   → Exact match is fine (e.g. user said "Active", samples contain "Active")
 - If ⚠️ PARTIAL MATCH LIKELY NEEDED is flagged AND no entity resolution is available
   → You MUST use wildcards, never exact match
+- DATE CONDITIONS: For date filters derived from a fiscal-year or date-system
+  business rule, always write the condition as a dynamic PostgreSQL expression
+  (MAKE_DATE, EXTRACT, CURRENT_DATE) rather than a pre-computed literal date string.
+  TODAY is provided only for reasoning — do NOT hardcode it or any computed date into the plan.
+  Example for "last year" with April-March fiscal year:
+    CORRECT: >= MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::INT - 1, 4, 1)
+             AND < MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::INT, 4, 1)
+    WRONG:   >= '2025-04-01' AND < '2026-04-01'
+  This rule applies to all relative time phrases: "last year", "this year",
+  "last quarter", "current FY", etc. Only use literal date strings when the
+  user explicitly stated exact calendar dates (e.g. "from Jan 2025 to Mar 2025").
 - TIMESTAMP BOUNDARY RULE: When filtering a TIMESTAMP (datetime) column by a date range,
   NEVER use col <= 'YYYY-MM-DD' for the upper bound (this misses records after midnight).
   Always use col < 'YYYY-MM-DD+1' (exclusive next day) instead.
