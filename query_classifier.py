@@ -110,10 +110,7 @@ def _keyword_fallback(question: str) -> tuple:
     analysis_words = ("what if", "simulate", "scenario", "impact of", "effect of",
                       "drill into", "what would happen", "if we raised", "if we removed")
     hard_words = ("compare", "versus", " vs ", "yoy", "year over year", "growth rate",
-                  "percentage", "% of", "ranking", "running total", "excluding",
-                  "best performing", "top performing", "worst performing",
-                  "who is best", "who has highest", "who has lowest",
-                  "and why", "explain why", "reason for")
+                  "percentage", "% of", "ranking", "running total", "excluding")
     medium_words = ("total", "sum", "count", "average", "avg", "group by", "grouped",
                     "by region", "by month", "by year", "top 10", "top 5", "highest", "lowest")
 
