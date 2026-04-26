@@ -522,8 +522,8 @@ def _supports_json_prefill(provider: str) -> bool:
     # Kimi K2 supports prefill via messages list even though it has "thinking" in the name
     if "kimi" in prov:
         return True
-    # Claude extended-thinking models reject assistant-message prefill with HTTP 400
-    if "thinking" in prov:
+    # Claude 4.x models and extended-thinking models reject assistant-message prefill (HTTP 400)
+    if "thinking" in prov or prov in ("claude_sonnet_46", "claude_opus_47"):
         return False
     return prov.startswith("claude_")
 

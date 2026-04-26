@@ -37,6 +37,7 @@ def call_llm(
     - o1_mini: OpenAI o1-mini (best reasoning/price)
     - o1: OpenAI o1 (best reasoning, expensive)
     - claude_sonnet: Claude Sonnet 4.5
+    - claude_sonnet_46: Claude Sonnet 4.6 (no prefill support)
     - claude_opus: Claude Opus 4.5
     - claude_haiku: Claude Haiku 4.5
     - groq: Groq Llama 3.3 70B
@@ -55,6 +56,8 @@ def call_llm(
         return call_o1(prompt)
     elif provider == "claude_sonnet":
         return call_claude_sonnet(prompt, prefill, stop_sequences, system_prompt)
+    elif provider == "claude_sonnet_46":
+        return call_claude_sonnet_46(prompt, stop_sequences, system_prompt)
     elif provider == "claude_opus":
         return call_claude_opus(prompt, prefill, stop_sequences, system_prompt)
     elif provider == "claude_haiku":
@@ -239,6 +242,52 @@ def call_claude_sonnet(
         response_text = prefill + response_text
 
     return response_text, tokens
+
+
+def call_claude_sonnet_46(
+    prompt: str,
+    stop_sequences: list = None,
+    system_prompt: str = None,
+):
+    """
+    Call Claude Sonnet 4.6 for reasoning and analysis.
+
+    Claude 4.x models do not support assistant-message prefill — calling with
+    an assistant turn raises HTTP 400. This function never sends prefill and
+    relies on the prompt's explicit JSON-only instructions instead.
+
+    Returns: (response_text, token_dict)
+    """
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+    params = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 16000,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    if system_prompt:
+        params["system"] = [
+            {
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
+    if stop_sequences:
+        params["stop_sequences"] = stop_sequences
+
+    message = client.messages.create(**params)
+
+    tokens = {
+        "input": message.usage.input_tokens,
+        "output": message.usage.output_tokens,
+        "cache_creation_input_tokens": getattr(message.usage, "cache_creation_input_tokens", 0) or 0,
+        "cache_read_input_tokens": getattr(message.usage, "cache_read_input_tokens", 0) or 0,
+    }
+
+    return message.content[0].text, tokens
 
 
 def call_claude_opus(
