@@ -2455,11 +2455,13 @@ Return ONLY SQL. No explanation."""
                 new_sql = extract_sql_from_response(force_response)
 
             if new_sql and new_sql != current_sql:
+                _prev_sql = current_sql
                 current_sql = new_sql
                 try:
                     current_results = run_sql(engine, current_sql)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[REFINE] Refined SQL failed to execute: {e}")
+                    current_sql = _prev_sql  # revert to keep sql ↔ results in sync
     
     return {
         "verdict": "FAILED_AFTER_RETRIES",
