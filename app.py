@@ -337,6 +337,7 @@ with st.sidebar:
             "OpenAI o1-mini (Recommended)",
             "OpenAI o1 (Best Reasoning)",
             "Claude Sonnet 4",
+            "Claude Sonnet 4.6",
             "Claude Haiku 4.5",
             "Groq Llama 3.3 70B",
             "xAI Grok Beta",
@@ -345,12 +346,13 @@ with st.sidebar:
         ],
         key="reasoning_llm"
     )
-    
+
     reasoning_map = {
         "NVIDIA Qwen 3 Next 80B (Thinking)": "nvidia_qwen3",
         "OpenAI o1-mini (Recommended)": "o1_mini",
         "OpenAI o1 (Best Reasoning)": "o1",
         "Claude Sonnet 4": "claude_sonnet",
+        "Claude Sonnet 4.6": "claude_sonnet_46",
         "Claude Haiku 4.5": "claude_haiku",
         "Groq Llama 3.3 70B": "groq",
         "xAI Grok Beta": "grok",
@@ -826,10 +828,10 @@ ON schema_columns USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)
                         total_count = len(existing_enrichments)
                         
                         if enriched_count > 0:
-                            st.success(f"✅ {enriched_count}/{total_count} columns already enriched with Opus")
-                            
+                            st.success(f"✅ {enriched_count}/{total_count} columns already enriched with AI")
+
                             # Show existing descriptions
-                            with st.expander("View Opus Descriptions", expanded=False):
+                            with st.expander("View AI Descriptions", expanded=False):
                                 for col_info in existing_enrichments:
                                     if col_info.get("opus_description"):
                                         st.write(f"**{col_info['column_name']}** ({col_info['data_type']})")
@@ -845,10 +847,10 @@ ON schema_columns USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)
                     
                     with col_enrich1:
                         enrich_clicked = st.button(
-                            "🚀 Enrich with Opus",
+                            "🚀 Enrich with Kimi K2",
                             type="primary",
                             use_container_width=True,
-                            help="Uses Claude Opus to generate intelligent descriptions"
+                            help="Uses Kimi K2 to generate intelligent descriptions"
                         )
                     
                     with col_enrich2:
@@ -873,13 +875,13 @@ ON schema_columns USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)
                                 def enrich_progress(col_name, status):
                                     current_col[0] += 1
                                     progress_bar.progress(min(current_col[0] / max(total_cols, 1), 1.0))
-                                    status_text.text(f"🤖 Opus analyzing: {col_name}...")
-                                
-                                with st.spinner(f"Enriching {total_cols} columns with Opus..."):
+                                    status_text.text(f"🤖 Kimi K2 analyzing: {col_name}...")
+
+                                with st.spinner(f"Enriching {total_cols} columns with Kimi K2..."):
                                     result = enrich_columns_with_opus(
                                         VECTOR_ENGINE,
                                         selected_table_enrich,
-                                        llm_provider="claude_opus",
+                                        llm_provider="vertex_kimi_k2_thinking",
                                         progress_callback=enrich_progress
                                     )
                                 
@@ -890,7 +892,7 @@ ON schema_columns USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)
                                 st.error(f"❌ Error: {result['error']}")
                             else:
                                 st.success(f"""
-                                ✅ **Opus Enrichment Complete!**
+                                ✅ **Kimi K2 Enrichment Complete!**
                                 - Columns enriched: {result['enriched']}
                                 - Errors: {result['errors']}
                                 - Total tokens used: {result['total_tokens']:,}
@@ -2827,12 +2829,18 @@ with tab3:
                                 st.write("**📥 PASS 1 — Column Identification:**")
                                 st.text_area("Pass 1 Input", result.llm_trace.reasoning_pass1_input, height=300, key=f"pass1_in_{_qc}")
                                 st.write("**📤 Pass 1 Output:**")
+                                if not result.llm_trace.reasoning_pass1_output or not result.llm_trace.reasoning_pass1_output.strip():
+                                    st.warning("Pass 1 output is empty — the reasoning LLM returned a blank response "
+                                               "(possible API error or rate-limit). Check console logs for details.")
                                 st.text_area("Pass 1 Output", result.llm_trace.reasoning_pass1_output, height=200, key=f"pass1_out_{_qc}")
                                 st.divider()
                             if has_pass2:
                                 st.write("**📥 PASS 2 — Full Plan with Metadata:**")
                                 st.text_area("Pass 2 Input", result.llm_trace.reasoning_pass2_input, height=300, key=f"pass2_in_{_qc}")
                                 st.write("**📤 Pass 2 Output:**")
+                                if not result.llm_trace.reasoning_pass2_output or not result.llm_trace.reasoning_pass2_output.strip():
+                                    st.warning("Pass 2 output is empty — the reasoning LLM returned a blank response. "
+                                               "This may indicate an API error or timeout. Check console logs for details.")
                                 st.text_area("Pass 2 Output", result.llm_trace.reasoning_pass2_output, height=200, key=f"pass2_out_{_qc}")
                         elif has_legacy:
                             # Legacy single-pass reasoning
@@ -2882,6 +2890,9 @@ with tab3:
                             st.write("**📥 INPUT PROMPT:**")
                             st.text_area("Opus Input", result.llm_trace.opus_input, height=400, key=f"opus_in_{_qc}")
                             st.write("**📤 OUTPUT:**")
+                            if not result.llm_trace.opus_output or not result.llm_trace.opus_output.strip():
+                                st.warning("Opus reviewer output is empty — the reviewer LLM returned a blank response "
+                                           "(possible API error or rate-limit). Check console logs for details.")
                             st.text_area("Opus Output", result.llm_trace.opus_output, height=200, key=f"opus_out_{_qc}")
                         else:
                             st.info("Opus review not used for this query")
@@ -3070,6 +3081,8 @@ with tab3:
                                         if _lt and getattr(_lt, "reasoning_pass2_input", ""):
                                             st.text_area("Pass 2 Input", _lt.reasoning_pass2_input, height=300, key=f"an_p2_in_{_i}_{_qc}")
                                             st.write("**📤 Pass 2 Output:**")
+                                            if not getattr(_lt, "reasoning_pass2_output", "") or not _lt.reasoning_pass2_output.strip():
+                                                st.warning("Pass 2 output is empty — the reasoning LLM returned a blank response.")
                                             st.text_area("Pass 2 Output", _lt.reasoning_pass2_output, height=150, key=f"an_p2_out_{_i}_{_qc}")
                                         else:
                                             st.info("Pass 2 data not available")

@@ -1,6 +1,7 @@
 import requests
 import anthropic
 import os
+import concurrent.futures as _cf
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -36,6 +37,7 @@ def call_llm(
     - o1_mini: OpenAI o1-mini (best reasoning/price)
     - o1: OpenAI o1 (best reasoning, expensive)
     - claude_sonnet: Claude Sonnet 4.5
+    - claude_sonnet_46: Claude Sonnet 4.6 (no prefill support)
     - claude_opus: Claude Opus 4.5
     - claude_haiku: Claude Haiku 4.5
     - groq: Groq Llama 3.3 70B
@@ -47,13 +49,15 @@ def call_llm(
     elif provider == "vertex_qwen_thinking":
         return call_vertex_qwen_thinking(prompt, stop_sequences)
     elif provider == "vertex_kimi_k2_thinking":
-        return call_vertex_kimi_k2_thinking(prompt, stop_sequences)
+        return call_vertex_kimi_k2_thinking(prompt, stop_sequences, prefill=prefill)
     elif provider == "o1_mini":
         return call_o1_mini(prompt)
     elif provider == "o1":
         return call_o1(prompt)
     elif provider == "claude_sonnet":
         return call_claude_sonnet(prompt, prefill, stop_sequences, system_prompt)
+    elif provider == "claude_sonnet_46":
+        return call_claude_sonnet_46(prompt, stop_sequences, system_prompt)
     elif provider == "claude_opus":
         return call_claude_opus(prompt, prefill, stop_sequences, system_prompt)
     elif provider == "claude_haiku":
@@ -213,7 +217,18 @@ def call_claude_sonnet(
     if stop_sequences:
         params["stop_sequences"] = stop_sequences
 
-    message = client.messages.create(**params)
+    try:
+        message = client.messages.create(**params)
+    except Exception as e:
+        # Claude 4.x models (e.g. claude-sonnet-4-6) reject assistant-turn prefill.
+        # Retry once without the prefill message.
+        if prefill and "prefill" in str(e).lower():
+            print(f"[SONNET] Model rejected prefill, retrying without it: {e}")
+            params["messages"] = [{"role": "user", "content": prompt}]
+            message = client.messages.create(**params)
+            prefill = None  # no prefix to prepend to response
+        else:
+            raise
 
     tokens = {
         "input": message.usage.input_tokens,
@@ -227,6 +242,52 @@ def call_claude_sonnet(
         response_text = prefill + response_text
 
     return response_text, tokens
+
+
+def call_claude_sonnet_46(
+    prompt: str,
+    stop_sequences: list = None,
+    system_prompt: str = None,
+):
+    """
+    Call Claude Sonnet 4.6 for reasoning and analysis.
+
+    Claude 4.x models do not support assistant-message prefill — calling with
+    an assistant turn raises HTTP 400. This function never sends prefill and
+    relies on the prompt's explicit JSON-only instructions instead.
+
+    Returns: (response_text, token_dict)
+    """
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+    params = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 16000,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    if system_prompt:
+        params["system"] = [
+            {
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
+    if stop_sequences:
+        params["stop_sequences"] = stop_sequences
+
+    message = client.messages.create(**params)
+
+    tokens = {
+        "input": message.usage.input_tokens,
+        "output": message.usage.output_tokens,
+        "cache_creation_input_tokens": getattr(message.usage, "cache_creation_input_tokens", 0) or 0,
+        "cache_read_input_tokens": getattr(message.usage, "cache_read_input_tokens", 0) or 0,
+    }
+
+    return message.content[0].text, tokens
 
 
 def call_claude_opus(
@@ -589,7 +650,7 @@ def call_vertex_qwen_thinking(prompt: str, stop_sequences: list = None):
     
     return response_text, tokens
 
-def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None, debug: bool = True):
+def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None, debug: bool = True, prefill: str = None):
     """
     Call Kimi K2 Thinking via Vertex AI MaaS endpoint.
     Returns: (response_text, token_dict)
@@ -636,14 +697,12 @@ def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None, debug
         }
 
         # ✅ FIXED PAYLOAD (OpenAI-style)
+        messages = [{"role": "user", "content": prompt}]
+        if prefill:
+            messages.append({"role": "assistant", "content": prefill})
         payload = {
             "model": MODEL_NAME,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
+            "messages": messages,
             "temperature": 0.6,
             "max_tokens": 4096
         }
@@ -656,20 +715,43 @@ def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None, debug
             print("URL:", url)
             print(json.dumps(payload, indent=2)[:1000])
 
-        # ---------------- API CALL ----------------
-        response = requests.post(url, headers=headers, json=payload, timeout=90)
+        # ---------------- API CALL (with 429 retry + total-time cap) ----------------
+        import time as _time
+        _max_retries = 3
+        _retry_delays = [2, 4, 8]  # seconds between attempts
+        _TOTAL_TIMEOUT = 150        # hard cap per attempt (handles slow-streaming hangs)
 
-        if debug:
-            print("\n===== RESPONSE STATUS =====")
-            print("Status Code:", response.status_code)
+        for _attempt in range(_max_retries):
+            _fut = _cf.ThreadPoolExecutor(max_workers=1).submit(
+                requests.post, url, headers=headers, json=payload, timeout=90
+            )
+            try:
+                response = _fut.result(timeout=_TOTAL_TIMEOUT)
+            except _cf.TimeoutError:
+                print(f"[KIMI K2] Total timeout ({_TOTAL_TIMEOUT}s) on attempt "
+                      f"{_attempt + 1}/{_max_retries}")
+                return "", {"input": 0, "output": 0, "error": f"total_timeout_{_TOTAL_TIMEOUT}s"}
 
-        if response.status_code != 200:
+            if debug:
+                print("\n===== RESPONSE STATUS =====")
+                print("Status Code:", response.status_code)
+
+            if response.status_code == 200:
+                break  # success — proceed to parse
+
+            if response.status_code == 429 and _attempt < _max_retries - 1:
+                _wait = _retry_delays[_attempt]
+                print(f"[KIMI K2] 429 rate-limit on attempt {_attempt + 1}/{_max_retries}. "
+                      f"Retrying in {_wait}s...")
+                _time.sleep(_wait)
+                continue
+
+            # Non-429 error OR final attempt — log and return empty
             print("\n===== ERROR RESPONSE =====")
             try:
                 print(json.dumps(response.json(), indent=2))
             except Exception:
                 print(response.text)
-
             return "", {"input": 0, "output": 0, "error_code": response.status_code}
 
         data = response.json()
@@ -724,9 +806,11 @@ def call_vertex_kimi_k2_thinking(prompt: str, stop_sequences: list = None, debug
 
         if debug:
             print(f"[KIMI PARSE] source={content_source}, output_len={len(response_text)}")
-            if (tokens.get("input", 0) + tokens.get("output", 0)) > 0 and not response_text:
-                msg_keys = list((choices[0].get("message", {}) or {}).keys()) if choices else []
-                print(f"[KIMI PARSE WARNING] tokens>0 but empty output. message_keys={msg_keys}")
+
+        # Always warn when tokens were consumed but output is empty (not just in debug mode)
+        if (tokens.get("input", 0) + tokens.get("output", 0)) > 0 and not response_text:
+            msg_keys = list((choices[0].get("message", {}) or {}).keys()) if choices else []
+            print(f"[KIMI K2 WARNING] tokens>0 but empty output. message_keys={msg_keys}")
 
         return response_text, tokens
 

@@ -249,13 +249,237 @@ def format_metadata_for_prompt(metadata: Dict[str, Any]) -> str:
 # PASS 2 — FULL PLAN WITH METADATA AWARENESS
 # =============================================================================
 
+def build_date_context() -> str:
+    """
+    Compute raw calendar date facts from the current system date.
+    Called fresh at query time — never hardcoded.
+    Generic: works for any database, any date system, any set of business rules.
+    """
+    today = date.today()
+    year = today.year
+    month = today.month
+    day = today.day
+    calendar_quarter = (month + 2) // 3   # ceil(month/3) without importing math
+    prev_year = year - 1
+    month_start = f"{year}-{month:02d}-01"
+    year_start = f"{year}-01-01"
+    today_str = f"{year}-{month:02d}-{day:02d}"
+
+    return (
+        f"DATE CONTEXT (raw date facts for reference):\n"
+        f"- TODAY: {today_str}\n"
+        f"- Current calendar year: {year}\n"
+        f"- Current month: {month}\n"
+        f"- Current quarter (calendar): Q{calendar_quarter} {year}\n"
+        f"- Previous calendar year: {prev_year}\n"
+        f"- Start of current month: {month_start}\n"
+        f"- Start of current year: {year_start}"
+    )
+
+
+def detect_fy_start_month(business_rules: List[Dict]) -> Optional[int]:
+    """
+    Scan business rules for a fiscal year definition.
+    Expects the compressed rules list (output of compress_rules_for_llm after json.loads).
+    Returns the FY start month (int 1-12) or None if no FY rule found.
+    """
+    import re
+
+    month_names = {
+        'january': 1, 'february': 2, 'march': 3, 'april': 4,
+        'may': 5, 'june': 6, 'july': 7, 'august': 8,
+        'september': 9, 'october': 10, 'november': 11, 'december': 12
+    }
+
+    found_fy_keyword = False
+
+    for rule in business_rules:
+        if not (rule.get('auto_apply') and rule.get('type') == 'default'):
+            continue
+
+        # Check for explicit fy_start_month field first (future-proofing)
+        if rule.get('fy_start_month'):
+            return int(rule['fy_start_month'])
+
+        apply_text = (
+            str(rule.get('apply', '')) + ' ' + str(rule.get('desc', ''))
+        ).lower()
+
+        # Skip if no fiscal/financial year indicators
+        has_fy_indicator = any(w in apply_text for w in
+            ['financial', 'fiscal', 'fy', 'april 1', '1st april',
+             'august 1', '1st august'])
+        if not has_fy_indicator:
+            continue
+
+        found_fy_keyword = True
+
+        for month_name, month_num in month_names.items():
+            if month_num == 1:
+                continue  # January start = calendar year, skip
+
+            # Match: "april 1", "april 1st", "1st april", "1 april", "from april"
+            patterns = [
+                rf'\b{month_name}\s+1',
+                rf'\b1\s*(?:st|ST)?\s+{month_name}',
+                rf'from\s+{month_name}',
+            ]
+
+            for pattern in patterns:
+                if re.search(pattern, apply_text):
+                    # Verify the end month is also mentioned
+                    end_month_num = month_num - 1 if month_num > 1 else 12
+                    end_month_name = [k for k, v in month_names.items()
+                                      if v == end_month_num][0]
+                    if end_month_name in apply_text:
+                        return month_num
+
+    if found_fy_keyword:
+        import logging
+        logging.warning(
+            "[FY_CONTEXT] FY rule detected but start month could not be parsed. "
+            "FY context not injected."
+        )
+
+    return None
+
+
+def build_fy_context(
+    today: date,
+    fy_start_month: int,
+    rule_name: str = "",
+    applicable_tables: Optional[List[str]] = None,
+) -> str:
+    """
+    Compute fiscal year and quarter boundaries from today's date.
+    All values are computed dynamically — nothing hardcoded.
+
+    Args:
+        today: date object (pass date.today() at call site — never call internally)
+        fy_start_month: int (e.g., 4 for April)
+        rule_name: str (name of the business rule)
+        applicable_tables: list of table names or query types the rule applies to
+
+    Returns:
+        FISCAL YEAR CONTEXT block to inject into prompts, or "" if invalid input.
+    """
+    from calendar import monthrange
+
+    if not fy_start_month or fy_start_month < 1 or fy_start_month > 12:
+        return ""
+
+    year = today.year
+    month = today.month
+
+    # Fiscal Year boundaries
+    fy_end_month = fy_start_month - 1 if fy_start_month > 1 else 12
+
+    if month >= fy_start_month:
+        current_fy_start_year = year
+    else:
+        current_fy_start_year = year - 1
+
+    def fy_start_date(start_year: int) -> date:
+        return date(start_year, fy_start_month, 1)
+
+    def fy_end_date(start_year: int) -> date:
+        end_year = start_year + 1 if fy_end_month < fy_start_month else start_year
+        last_day = monthrange(end_year, fy_end_month)[1]
+        return date(end_year, fy_end_month, last_day)
+
+    current_fy_start = fy_start_date(current_fy_start_year)
+    current_fy_end = fy_end_date(current_fy_start_year)
+    prev_fy_start = fy_start_date(current_fy_start_year - 1)
+    prev_fy_end = fy_end_date(current_fy_start_year - 1)
+
+    # Fiscal Quarter boundaries
+    def fiscal_quarter_dates(fy_start_year: int, quarter_num: int):
+        """Return (start_date, end_date) for a fiscal quarter (1-4)."""
+        offset = (quarter_num - 1) * 3
+        q_start_month = ((fy_start_month - 1 + offset) % 12) + 1
+        q_end_month = ((fy_start_month - 1 + offset + 2) % 12) + 1
+
+        # A month belongs to the FY starting at fy_start_year if it's >= fy_start_month;
+        # months that wrap around (< fy_start_month) fall in the next calendar year.
+        q_start_year = fy_start_year if q_start_month >= fy_start_month else fy_start_year + 1
+        q_end_year = fy_start_year if q_end_month >= fy_start_month else fy_start_year + 1
+
+        q_start = date(q_start_year, q_start_month, 1)
+        last_day = monthrange(q_end_year, q_end_month)[1]
+        q_end = date(q_end_year, q_end_month, last_day)
+        return q_start, q_end
+
+    # Find current fiscal quarter
+    current_fq = None
+    current_fq_start = None
+    current_fq_end = None
+    for q in range(1, 5):
+        q_start, q_end = fiscal_quarter_dates(current_fy_start_year, q)
+        if q_start <= today <= q_end:
+            current_fq = q
+            current_fq_start = q_start
+            current_fq_end = q_end
+            break
+
+    # Previous fiscal quarter
+    prev_fq = None
+    prev_fq_start = None
+    prev_fq_end = None
+    if current_fq is not None:
+        if current_fq > 1:
+            prev_fq = current_fq - 1
+            prev_fq_start, prev_fq_end = fiscal_quarter_dates(current_fy_start_year, prev_fq)
+        else:  # current_fq == 1, prev is Q4 of previous FY
+            prev_fq = 4
+            prev_fq_start, prev_fq_end = fiscal_quarter_dates(current_fy_start_year - 1, 4)
+
+    # Build context string
+    tables_str = ", ".join(applicable_tables) if applicable_tables else "all tables"
+    rule_label = f'"{rule_name}"' if rule_name else "fiscal year rule"
+
+    from datetime import timedelta
+
+    def _excl(d):
+        """Return the exclusive upper bound (next day) for use with TIMESTAMP columns."""
+        return d + timedelta(days=1)
+
+    lines = [
+        f"FISCAL YEAR CONTEXT (from business rule {rule_label}, "
+        f"applies to: {tables_str} — use as ground truth, do not recalculate):",
+        f"- Fiscal year runs: month {fy_start_month} to month {fy_end_month}",
+        f'- Current FY: {current_fy_start} to {current_fy_end}'
+        f'  (TIMESTAMP: use >= {current_fy_start} AND < {_excl(current_fy_end)})',
+        f'- "this year" = Current FY: {current_fy_start} to {current_fy_end}'
+        f'  (TIMESTAMP: use >= {current_fy_start} AND < {_excl(current_fy_end)})',
+        f'- "last year" = Previous FY: {prev_fy_start} to {prev_fy_end}'
+        f'  (TIMESTAMP: use >= {prev_fy_start} AND < {_excl(prev_fy_end)})',
+    ]
+
+    if current_fq is not None:
+        lines.extend([
+            f'- Current fiscal quarter: Q{current_fq} ({current_fq_start} to {current_fq_end})'
+            f'  (TIMESTAMP: use >= {current_fq_start} AND < {_excl(current_fq_end)})',
+            f'- "this quarter" = Q{current_fq}: {current_fq_start} to {current_fq_end}'
+            f'  (TIMESTAMP: use >= {current_fq_start} AND < {_excl(current_fq_end)})',
+        ])
+
+    if prev_fq is not None and prev_fq_start is not None:
+        lines.append(
+            f'- "last quarter" = Q{prev_fq}: {prev_fq_start} to {prev_fq_end}'
+            f'  (TIMESTAMP: use >= {prev_fq_start} AND < {_excl(prev_fq_end)})'
+        )
+
+    return "\n".join(lines)
+
+
 def create_pass2_prompt(
     question: str,
     pass1_output: str,
     metadata: Dict[str, Any],
     dialect_info: Dict = None,
     resolver_text: str = "",
-    rules: str = "[]"
+    rules: str = "[]",
+    fy_context: str = "",
 ) -> str:
     """
     Pass 2: Build complete query plan using Pass 1 columns + metadata.
@@ -278,6 +502,7 @@ def create_pass2_prompt(
     quote_char = dialect_info.get("quote_char", '"') if dialect_info else '"'
     string_quote = dialect_info.get("string_quote", "'") if dialect_info else "'"
     today = date.today().isoformat()
+    date_context = build_date_context()
 
     metadata_text = format_metadata_for_prompt(metadata)
 
@@ -297,6 +522,8 @@ BUSINESS RULES (relevant to identified columns):
 {rules}
 """
 
+    fy_context_section = ("\n" + fy_context) if fy_context else ""
+
     return f"""You are completing a SQL query plan. You already identified the tables 
 and columns needed. Now use the actual stored values to finalize all filters correctly.
 
@@ -304,7 +531,8 @@ DATABASE: {dialect_name}
 COLUMN FORMAT: {quote_char}column_name{quote_char}
 STRING FORMAT: {string_quote}value{string_quote}
 TODAY: {today}
-
+{date_context}
+{fy_context_section}
 ORIGINAL QUESTION: {question}
 
 YOUR PASS 1 OUTPUT (tables + columns already identified):
@@ -324,6 +552,37 @@ CRITICAL FILTER RULES:
   → Exact match is fine (e.g. user said "Active", samples contain "Active")
 - If ⚠️ PARTIAL MATCH LIKELY NEEDED is flagged AND no entity resolution is available
   → You MUST use wildcards, never exact match
+- DATE CONDITIONS: For date filters derived from a fiscal-year business rule:
+  1. READ the FISCAL YEAR CONTEXT block above — it already tells you the exact
+     date boundaries for "last year", "this year", etc. Use those as your ground
+     truth, NOT your own date arithmetic.
+  2. Translate those boundary dates into dynamic MAKE_DATE() expressions.
+     Derive the year offset by comparing the FY context year values to
+     EXTRACT(YEAR FROM CURRENT_DATE) — do NOT guess the offset.
+     Example when TODAY is in April–December (e.g. 2026-04-26):
+       FY context shows: "last year" = 2025-04-01 to 2026-03-31
+       EXTRACT(YEAR FROM CURRENT_DATE) = 2026
+       2025 = 2026 - 1  →  offset -1 for start
+       2026 = 2026 + 0  →  offset  0 for end (exclusive)
+       CORRECT: >= MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::INT - 1, 4, 1)
+                AND < MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::INT, 4, 1)
+     Example when TODAY is in January–March (e.g. 2026-02-15):
+       FY context shows: "last year" = 2024-04-01 to 2025-03-31
+       EXTRACT(YEAR FROM CURRENT_DATE) = 2026
+       2024 = 2026 - 2  →  offset -2 for start
+       2025 = 2026 - 1  →  offset -1 for end
+       CORRECT: >= MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::INT - 2, 4, 1)
+                AND < MAKE_DATE(EXTRACT(YEAR FROM CURRENT_DATE)::INT - 1, 4, 1)
+  3. NEVER write plain string literals ('2025-04-01') — always use MAKE_DATE().
+  4. Only use literal date strings when the user explicitly stated exact calendar
+     dates (e.g. "from Jan 2025 to Mar 2025").
+  This applies to all relative time phrases: "last year", "this year",
+  "last quarter", "current FY", etc.
+- TIMESTAMP BOUNDARY RULE: When filtering a TIMESTAMP (datetime) column by a date range,
+  NEVER use col <= 'YYYY-MM-DD' for the upper bound (this misses records after midnight).
+  Always use col < 'YYYY-MM-DD+1' (exclusive next day) instead.
+  Example: fiscal year end March 31 → use col >= '2026-04-01' AND col < '2027-04-01'
+  The FISCAL YEAR CONTEXT above already shows the correct exclusive bound for each period.
 - If a business rule has "_user_date_override": true, read its "_override_note"
   and adjust the date range to match the user's explicit request — do NOT apply
   the rule's default period
@@ -331,22 +590,99 @@ CRITICAL FILTER RULES:
   might be in "Region" or "Block"), use OR between those columns, not AND.
   Only use AND when different user values map to different columns.
 
+DATE INTERPRETATION:
+Use the DATE CONTEXT facts above as raw reference. Then:
+1. Check if the user mentioned a time period ("last year", "this quarter", "Jan 2025", etc.)
+2. Check if any business rules define a date system (fiscal year, calendar year, custom periods)
+3. Combine both:
+   - If business rules define a date system AND user references a relative period
+     ("last year", "this quarter") → interpret relative to that system
+     CRITICAL DISTINCTION — relative vs explicit dates:
+     Relative phrases like "last year", "this year", "last quarter", "this quarter"
+     are NOT explicit dates. They must be interpreted WITHIN whatever date system applies:
+       If a fiscal year rule is active (e.g., April-March, August-July):
+         → "last year"    = previous fiscal year
+         → "this year"    = current fiscal year
+         → "last quarter" = previous fiscal quarter per that system
+       If NO date-system rule is active:
+         → "last year"    = previous calendar year (Jan 1 – Dec 31)
+         → "this year"    = current calendar year
+         → "last quarter" = previous calendar quarter
+     Only EXPLICIT dates override the business rule's date system:
+       "January to March 2025"         → exact dates, ignore fiscal year rule
+       "in 2024"                       → calendar year 2024, ignore fiscal year rule
+       "calendar year 2025"            → user explicitly requested calendar year
+       "from April 2024 to March 2025" → exact dates as stated
+     "last year" with an active fiscal year rule is NOT an override — it is a relative
+     phrase interpreted within the fiscal year system. Only document it in "overrides"
+     if the user explicitly requests calendar year or specific dates that conflict.
+   - If NO date-system rules exist AND user references a relative period
+     → interpret relative to calendar year using the DATE CONTEXT above
+   - If user gives explicit dates ("Jan to March 2025") → use those dates
+     regardless of any rules
+   - If no time mentioned AND a default date rule has auto_apply for this query type
+     → apply the rule's default period
+   - If no time mentioned AND no applicable date rules exist → no date filter
+4. Document your reasoning in time_interpretation.logic so the auditor can verify.
+
+MULTI-STEP DETECTION:
+If the question asks for TWO or MORE things where the second depends on the first,
+you MUST use query_strategy.type = "multi_step" and define each step separately.
+Examples of multi-step:
+  "Which X did the most Y, and what Z did they have?"
+    → Step 1: find top X by Y, Step 2: find Z for that X
+  "Top region by sales and their best performing month"
+    → Step 1: find top region, Step 2: find best month for that region
+  "Best salesperson and who are their clients"
+    → Step 1: find best salesperson, Step 2: list their clients
+Examples of single-step:
+  "Total sales by region" → single GROUP BY
+  "Who had the most sales?" → single GROUP BY + ORDER + LIMIT
+  "Average order value" → single aggregation
+
+OVERRIDE DOCUMENTATION:
+If the user's question explicitly mentions a time period or condition that conflicts
+with an auto_apply business rule's default behavior, the user's explicit request
+takes priority. Document every such override in the "overrides" array.
+If no conflict exists, leave "overrides" as an empty array [].
+
 OUTPUT (JSON only, NO SQL — intent and plan only):
 {{
   "understanding": "What user wants in plain terms",
+  "time_interpretation": {{
+    "user_said": "exact time phrase from question, or 'none' if no time reference",
+    "business_rule_applied": "name of date-related business rule used, or 'none' if no date rules exist",
+    "resolved_range": "explicit start and end dates, or 'none' if no date filter needed",
+    "logic": "1-2 sentence explanation: how user phrase + rules (or absence of rules) led to this range"
+  }},
+  "query_strategy": {{
+    "type": "single_step or multi_step",
+    "steps": [
+      {{
+        "step": 1,
+        "goal": "what this step computes",
+        "group_by": ["columns for this step"],
+        "aggregation": "aggregation for this step or null",
+        "output": "what this step produces for the next step or as final output"
+      }}
+    ]
+  }},
+  "overrides": [
+    {{
+      "rule_name": "name of the business rule being overridden",
+      "default_behavior": "what the rule normally does",
+      "applied_instead": "what was actually applied",
+      "reason": "why the override was necessary"
+    }}
+  ],
   "tables": ["schema.table"],
   "columns": {{"table": ["col1", "col2"]}},
   "joins": [],
   "filters": [
     {{
-      "column": "status_column",
-      "condition": " = 'Open'",
-      "reason": "show open status"
-    }},
-    {{
-      "column": "category_column",
-      "condition": "<> 'ExactValue'",
-      "reason": "exact match confirmed from samples"
+      "column": "column_name",
+      "condition": "condition as string",
+      "reason": "why this filter"
     }}
   ],
   "aggregations": ["SUM(col)"],
@@ -355,8 +691,17 @@ OUTPUT (JSON only, NO SQL — intent and plan only):
   "notes": "any edge cases or casting needed"
 }}
 
-IMPORTANT: Output is a PLAN — no SQL syntax in filters, write conditions as strings only.
-Output ONLY the JSON object above — no thinking, no reasoning, no explanation before or after it."""
+IMPORTANT:
+- Output is a PLAN — no SQL syntax in filters, write conditions as strings only.
+- OUTPUT FORMAT (MANDATORY — parse failure if not followed):
+  Your response must start with {{ and end with }}.
+  No thinking, no reasoning, no chain-of-thought, no explanation before or after the JSON.
+  Do not include markdown code fences. Do not show your work.
+  Start immediately with the opening brace {{.
+- The time_interpretation, query_strategy, and overrides fields are MANDATORY in every response.
+- If no time reference exists, still include time_interpretation with "none" values.
+- If single step, still include query_strategy with one step.
+- If no overrides, still include overrides as empty array []."""
 
 
 # =============================================================================
@@ -557,16 +902,48 @@ def parse_pass1_output(response: str) -> Dict:
 
 def parse_pass2_output(response: str) -> Dict:
     """
-    Safely parse Pass 2 JSON output.
-    Returns empty dict on failure.
+    Safely parse Pass 2 JSON output. Multi-strategy extraction:
+    1. Strip whitespace, try json.loads
+    2. Strip markdown fences, retry json.loads
+    3. Brace-balanced scan: find first { and matching }
+    4. All fail: log error and return {}
     """
+    import re as _re
+
+    # Strategy 1: direct parse
+    cleaned = response.strip()
     try:
-        cleaned = response.strip()
-        if cleaned.startswith("```"):
-            import re
-            cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
-            cleaned = re.sub(r'\s*```$', '', cleaned)
         return json.loads(cleaned)
-    except Exception as e:
-        print(f"[PASS2 PARSE] Failed: {e}")
-        return {}
+    except Exception:
+        pass
+
+    # Strategy 2: strip markdown fences
+    if cleaned.startswith("```"):
+        cleaned = _re.sub(r'^```(?:json)?\s*', '', cleaned)
+        cleaned = _re.sub(r'\s*```$', '', cleaned)
+        try:
+            return json.loads(cleaned)
+        except Exception:
+            pass
+
+    # Strategy 3: brace-balanced scan for embedded JSON (handles CoT before JSON)
+    start = response.find('{')
+    if start >= 0:
+        depth = 0
+        for i in range(start, len(response)):
+            if response[i] == '{':
+                depth += 1
+            elif response[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        parsed = json.loads(response[start:i + 1])
+                        print(f"[PASS2 PARSE] Extracted JSON via brace-balanced scan (offset {start})")
+                        return parsed
+                    except json.JSONDecodeError:
+                        pass
+                    break
+
+    # Strategy 4: all failed
+    print(f"[PASS2 PARSE] Failed all strategies. Raw start: {response[:200]!r}")
+    return {}

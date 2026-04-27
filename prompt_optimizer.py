@@ -14,6 +14,7 @@ Usage:
 """
 
 import json
+from datetime import date
 from typing import List, Dict, Any, Optional
 from decimal import Decimal
 
@@ -192,6 +193,23 @@ def compress_rules_for_llm(rules: List[Dict]) -> str:
             compressed.append(compact_rule)
 
     return safe_json_dumps(compressed, separators=(',', ':'))
+
+
+# Fields kept only for retrieval/display; Pass 1 needs structural logic, not metadata.
+_PASS1_DROP = frozenset({
+    "keywords", "priority", "mandatory",
+    "desc", "description", "description_type", "subtype",
+})
+
+
+def strip_for_pass1(rules_json: str) -> str:
+    """Remove metadata-only fields from compressed rules before sending to Pass 1."""
+    try:
+        rules = json.loads(rules_json) if rules_json else []
+    except Exception:
+        return rules_json
+    stripped = [{k: v for k, v in rule.items() if k not in _PASS1_DROP} for rule in rules]
+    return safe_json_dumps(stripped, separators=(',', ':'))
 
 
 def decompress_rules_for_display(compressed_json: str) -> List[Dict]:
@@ -581,7 +599,8 @@ def create_opus_review_prompt_optimized(
     rules_applied: List[str] = None,
     error: str = None,
     schema_text: str = "",
-    rules_compressed: str = "[]"
+    rules_compressed: str = "[]",
+    fy_context: str = "",
 ) -> str:
     """
     Strict Opus review prompt.
@@ -604,6 +623,9 @@ def create_opus_review_prompt_optimized(
     Returns:
         Strict review prompt for Opus
     """
+    today = date.today().isoformat()
+    _fy_block = ("\n" + fy_context) if fy_context else ""
+
     if error:
         return f"""Review this failed SQL query.
 
@@ -626,11 +648,14 @@ TASK: Identify the error and suggest a fix.
 
 OUTPUT (JSON):
 {{"verdict": "INCORRECT", "error_type": "syntax|logic|schema|other", "issue": "specific problem", "fix": "suggested correction"}}"""
-    
+
     # SQL succeeded — strict correctness verification
     prompt = f"""You are an independent SQL auditor. Your job is to verify this SQL is ACTUALLY CORRECT,
 not just plausible. Be critical. Wrong column = wrong answer even if the query runs.
 
+## CURRENT DATE
+TODAY: {today}
+{_fy_block}
 ## SCHEMA (ground truth — check every column name and data type)
 {schema_text}
 
@@ -696,6 +721,43 @@ Would a business user looking at these results get the answer, or would they say
      Example: if a rule says "always exclude Rebate" but WHERE clause is missing this, it is INCORRECT
    - Are filter values exactly correct? (case-sensitive string matching matters)
    - Are date ranges correct per any fiscal year / quarter mapping rules?
+   DATE RULE vs USER INTENT:
+   - If a business rule has auto_apply for this query type (check applies_to_queries),
+     verify the SQL applies the rule's date system (e.g., fiscal year April-March).
+     HOWEVER: if the user's question EXPLICITLY requests a different time period
+     (e.g., "last year", "in January 2025", "Q3 2024"), the user's explicit request
+     modifies the default rule — this is NOT a violation.
+   - "last year" with a fiscal year rule = PREVIOUS fiscal year, not current, not calendar year
+   - "this year" with a fiscal year rule = CURRENT fiscal year
+   - "in March 2025" = explicit date, use exactly that regardless of any rule
+   - Judge whether the SQL correctly combines the user's time phrase with the
+     business rule's date system. Getting the system right but the period wrong
+     (e.g., current FY instead of previous FY) is still INCORRECT.
+   - If NO date-related business rule exists for this query type, calendar year
+     interpretation is acceptable for relative phrases like "last year".
+   - Use the TODAY date provided in this prompt to verify date arithmetic.
+   HARDCODED DATES: If the SQL uses hardcoded date literals instead of dynamic
+   expressions (MAKE_DATE, EXTRACT, CURRENT_DATE), verify mathematically whether
+   those literals ARE correct for the user's stated time period using the TODAY
+   date from the CURRENT DATE section at the top of this prompt.
+   Example: if TODAY = {today} and the user asked for "last year" with an
+   April-March fiscal year, then '2025-04-01' as the start date IS correct —
+   mark it PASS. Do NOT mark INCORRECT simply because the SQL uses literals
+   instead of MAKE_DATE(). The business rule's dynamic-syntax example is a
+   best-practice guide, not a strict format requirement.
+   Only flag the date filter INCORRECT if the literal dates represent the WRONG
+   period (e.g. current FY used instead of last FY, or dates are off by a year).
+   ENTITY-RESOLVED FILTERS:
+   - The Pass 2 plan may include ENTITY RESOLUTIONS — results from a live database
+     lookup that determined the exact match strategy for each user-mentioned entity.
+   - If a filter uses ILIKE, LIKE, or a pattern, check whether an entity resolution
+     was performed for that value. If it was, the pattern strategy was chosen by the
+     resolver because an exact match was not found — do NOT flag this as wrong.
+   - Only flag a pattern filter as incorrect if: (a) no entity resolution was done
+     AND samples show the exact value exists verbatim, OR (b) the pattern is so broad
+     it would return unintended rows (e.g., '%a%' for a short common letter).
+   - Entity-resolved conditions come from the live database; they override guessing.
+     If the Pass 2 plan says "use ILIKE '%Acme%'" based on entity resolution, accept it.
 
 3. AGGREGATION VERIFICATION
    - Does the aggregation match what the question asks for?
@@ -732,23 +794,41 @@ def create_refinement_prompt(
     previous_sql: str,
     opus_feedback: Dict,
     schema: str,
-    rules: str
+    rules: str,
+    pass2_plan: str = "",
+    fy_context: str = "",
 ) -> str:
     """
     Create prompt for SQL refinement after Opus rejection.
     Fixes only what Opus flagged, preserves everything else.
     """
+    today = date.today().isoformat()
+    _fy_block = (fy_context + "\n") if fy_context else ""
+
     issues = opus_feedback.get("issues", [])
     reasoning = opus_feedback.get("reasoning", "")
     fix_suggestion = opus_feedback.get("fix", opus_feedback.get("guidance_for_regeneration", ""))
     checks = opus_feedback.get("checks", {})
-    
+
     # Identify which checks failed to give focused fix instructions
     failed_checks = [k for k, v in checks.items() if v == "fail"]
-    
+
     issues_text = "\n".join(f"• {issue}" for issue in issues) if issues else "• Unknown issues"
     failed_checks_text = ", ".join(failed_checks) if failed_checks else "unspecified"
-    
+
+    planner_section = ""
+    if pass2_plan:
+        planner_section = f"""## PLANNER INTENT (reference only — auditor feedback takes priority)
+The query planner made these decisions. Preserve them ONLY if they are
+consistent with the business rules and user question. If the auditor's
+feedback contradicts the planner's intent, follow the auditor.
+
+{pass2_plan}
+
+Use this to understand what the SQL was trying to do, but verify
+independently that the intent was correct before preserving it.
+"""
+
     return f"""Fix a SQL query rejected by the auditor.
 
 ## WHAT FAILED
@@ -762,14 +842,15 @@ Failed checks: {failed_checks_text}
 
 {f"## SUGGESTED FIX{chr(10)}{fix_suggestion}" if fix_suggestion else ""}
 
-## BUSINESS RULES (must be applied correctly)
+{planner_section}## BUSINESS RULES (must be applied correctly)
 {rules}
 
 ## SCHEMA (use exact column names and compatible data types)
 {schema}
 
 ## ORIGINAL QUESTION
-{question}
+TODAY: {today}
+{_fy_block}{question}
 
 ## REJECTED SQL
 ```sql
@@ -783,8 +864,15 @@ Failed checks: {failed_checks_text}
 4. If a type mismatch is possible (e.g. DATE/TEXT), cast safely.
 5. Return a materially corrected query (not a cosmetic rewrite).
 
-## OUTPUT (JSON only)
-{{"analysis": "what you changed and why, referencing specific columns/rules", "sql": "corrected SQL query"}}"""
+## OUTPUT FORMAT (MANDATORY — parse failure if not followed)
+Return ONLY a JSON object. No reasoning, no explanation, no thinking outside the JSON.
+Your response must start with {{ and end with }}. Nothing before, nothing after.
+{{"analysis": "what you changed and why, referencing specific columns/rules", "sql": "the complete corrected SQL query"}}
+CRITICAL:
+- The "sql" value must contain the COMPLETE corrected SQL query as a single string
+- Do not truncate, use placeholders, or split across multiple fields
+- Escape any double quotes inside the SQL with backslash: \"
+- Start your response immediately with the opening brace {{"""
 
 
 # =============================================================================
@@ -832,6 +920,28 @@ def extract_sql_from_response(response: str) -> str:
         candidate = candidate.replace('\\"', '"').replace('\\n', '\n').replace('\\t', '\t')
         if re.search(r'\bFROM\b', candidate, re.IGNORECASE):
             return candidate
+
+    # Strategy: brace-balanced scan for embedded JSON containing "sql" key.
+    # Handles chain-of-thought text before/after the JSON object.
+    import re as _re_bal
+    _bal_match = _re_bal.search(r'\{[^{}]*"sql"\s*:\s*"', response)
+    if _bal_match:
+        _brace_start = _bal_match.start()
+        _depth = 0
+        for _i in range(_brace_start, len(response)):
+            if response[_i] == '{':
+                _depth += 1
+            elif response[_i] == '}':
+                _depth -= 1
+                if _depth == 0:
+                    try:
+                        _candidate = json.loads(response[_brace_start:_i + 1])
+                        if "sql" in _candidate and _candidate["sql"]:
+                            print("[REFINEMENT_PARSE] Extracted SQL via brace-balanced scan")
+                            return _candidate["sql"].strip()
+                    except json.JSONDecodeError:
+                        pass
+                    break
 
     # Try to extract from SQL markdown code block
     sql_match = re.search(r'```sql\s*(.*?)\s*```', response, re.DOTALL | re.IGNORECASE)

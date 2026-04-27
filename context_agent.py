@@ -84,6 +84,10 @@ class ContextBundle:
     stage_times: Dict[str, int] = field(default_factory=dict)
     fallback_used: bool = False
 
+    # Table pruning (populated by fetch_context Step 2.5)
+    pruning_fallback: bool = False       # True → safety triggered; Pass 2 uses full bare_schema
+    rule_extra_tables: List[str] = field(default_factory=list)  # tables added by auto_apply rules
+
 
 # =============================================================================
 # CONTEXT AGENT
@@ -192,13 +196,54 @@ class ContextAgent:
         except Exception:
             source_count = 0
 
-        # ── Step 3: Build focused schema (only identified tables; only relevant cols get descriptions) ──
-        # Pass 1 column keys give us the exact set of tables needed.
-        # When joins are needed, also include tables referenced by kept join rules.
+        # ── Step 2.5: Table pruning — extend table set via auto_apply rule matching ──
+        # Pure code, no LLM. Checks which auto_apply rules match the question
+        # and adds their referenced tables so Pass 2 sees the full required schema.
         stage_start = time.time()
+        rule_extra_tables, pruning_fallback, pruning_log = self._compute_rule_extra_tables(
+            rules_compressed, question   # use unfiltered Stage 2 rules
+        )
+        bundle.rule_extra_tables = list(rule_extra_tables)
+        bundle.pruning_fallback = pruning_fallback
+        for msg in pruning_log:
+            print(f"[TABLE PRUNING] {msg}")
+        if pruning_fallback:
+            print("[TABLE PRUNING] Safety fallback active — Pass 2 will use full bare_schema")
+        elif rule_extra_tables:
+            _id_norm = {t.lower() for t in identified_tables}
+            _id_norm |= {t.split(".")[-1].lower() for t in identified_tables if "." in t}
+            _truly_new = rule_extra_tables - _id_norm
+            if _truly_new:
+                print(f"[TABLE PRUNING] Newly added by rules: {_truly_new}")
+            else:
+                print("[TABLE PRUNING] Rule tables already covered by Pass 1 — no expansion")
+
+        # ── Step 2.6: Enrich rule-referenced columns on newly-added tables ──
+        # Fetch sample values / data types for columns the rule explicitly references
+        # so Pass 2 gets enriched metadata for every table it sees.
+        if rule_extra_tables and not pruning_fallback:
+            _id_norm2 = {t.lower() for t in identified_tables}
+            _id_norm2 |= {t.split(".")[-1].lower() for t in identified_tables if "." in t}
+            if rule_extra_tables - _id_norm2:
+                rule_col_meta = self._enrich_rule_columns(
+                    rules_compressed, rule_extra_tables, identified_tables
+                )
+                for tbl, cols in rule_col_meta.items():
+                    bundle.metadata.setdefault(tbl, {}).update(cols)
+                if rule_col_meta:
+                    print(f"[TABLE PRUNING] Rule-column enrichment: "
+                          f"{sum(len(c) for c in rule_col_meta.values())} columns "
+                          f"across {len(rule_col_meta)} tables")
+        bundle.stage_times["table_pruning"] = int((time.time() - stage_start) * 1000)
+
+        # ── Step 3: Build focused schema (Pass 1 tables + join tables + rule-added tables) ──
+        # When pruning_fallback=True, rule_extra_tables are excluded from focused_schema;
+        # flow_router will substitute bare_schema (full) for Pass 2 in that case.
+        stage_start = time.time()
+        _rule_schema_extras = set() if pruning_fallback else rule_extra_tables
         bundle.focused_schema = self._build_focused_schema(
             columns_by_table, bundle.metadata,
-            extra_join_tables=join_extra_tables if joins_needed else set()
+            extra_join_tables=(join_extra_tables if joins_needed else set()) | _rule_schema_extras
         )
         bundle.stage_times["schema_build"] = int((time.time() - stage_start) * 1000)
 
@@ -378,6 +423,154 @@ class ContextAgent:
         except Exception as e:
             print(f"[CONTEXT AGENT] Rule filtering error (returning unfiltered): {e}")
             return rules_compressed, set(), False
+
+    # ═════════════════════════════════════════════════════════════════════
+    # INTERNAL: Deterministic Table Pruning via auto_apply Rules
+    # ═════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _compute_rule_extra_tables(rules_compressed: str, question: str):
+        """
+        Extend the Pass 1 table set with tables referenced by matching auto_apply rules.
+
+        For each rule where auto_apply=True, check if the question contains any
+        keyword from the rule's applies_to_queries list. If it matches, add the
+        rule's table references to the set.
+
+        Safety: if ANY matching rule has NO table reference, set safety_fallback=True
+        so Pass 2 reverts to full bare_schema rather than risk a missing table.
+
+        Returns: (extra_tables: set, safety_fallback: bool, debug_log: list)
+        """
+        import re as _re
+
+        extra_tables: set = set()
+        safety_fallback = False
+        debug_log: list = []
+
+        try:
+            rules_list = json.loads(rules_compressed or "[]")
+        except Exception:
+            return extra_tables, False, ["Failed to parse rules JSON — skipping pruning"]
+
+        # Build question keyword set for overlap check
+        question_words = set(_re.findall(r'[a-z0-9]+', question.lower()))
+
+        for rule in rules_list:
+            if not rule.get("auto_apply"):
+                continue
+
+            # Check overlap between rule's applies_to_queries and question keywords
+            queries_kw = rule.get("applies_to_queries", [])
+            if isinstance(queries_kw, str):
+                queries_kw = [queries_kw]
+
+            if queries_kw:
+                rule_kw_set = {kw.lower() for kw in queries_kw if kw}
+                if not (question_words & rule_kw_set):
+                    continue   # No keyword overlap — rule doesn't apply to this query
+            # applies_to_queries absent/empty → treat as always matching
+
+            # Extract table references from compressed rule
+            tables_found = []
+            if rule.get("tables"):
+                t = rule["tables"]
+                tables_found = t if isinstance(t, list) else [t]
+            elif rule.get("table"):
+                tables_found = [rule["table"]]
+
+            rule_name = rule.get("name", rule.get("rule_name", "?"))
+            if not tables_found:
+                # Matching rule with no table reference — cannot prune safely
+                safety_fallback = True
+                debug_log.append(
+                    f"SAFETY FALLBACK: rule '{rule_name}' matches but has no table reference"
+                )
+            else:
+                for t in tables_found:
+                    norm = str(t).lower()
+                    bare = norm.split(".")[-1] if "." in norm else norm
+                    extra_tables.add(norm)
+                    extra_tables.add(bare)
+                debug_log.append(f"Rule '{rule_name}' → adds table(s): {tables_found}")
+
+        return extra_tables, safety_fallback, debug_log
+
+    def _enrich_rule_columns(
+        self,
+        rules_compressed: str,
+        rule_extra_tables: set,
+        identified_tables: list,
+    ) -> Dict[str, Any]:
+        """
+        Fetch column metadata for columns that auto_apply rules reference on
+        newly-added (non-Pass-1) tables. Only fetches rule-referenced columns —
+        never all columns of the table.
+
+        Returns metadata dict in the same format as _fetch_column_metadata().
+        """
+        import re as _re
+
+        identified_norm: set = set()
+        for t in identified_tables:
+            identified_norm.add(t.lower())
+            if "." in t:
+                identified_norm.add(t.split(".")[-1].lower())
+
+        cols_to_fetch: Dict[str, set] = {}
+
+        try:
+            rules_list = json.loads(rules_compressed or "[]")
+        except Exception:
+            return {}
+
+        for rule in rules_list:
+            if not rule.get("auto_apply"):
+                continue
+
+            # Find which (new) table this rule references
+            tables_for_rule = []
+            if rule.get("tables"):
+                t = rule["tables"]
+                tables_for_rule = t if isinstance(t, list) else [t]
+            elif rule.get("table"):
+                tables_for_rule = [rule["table"]]
+
+            new_table = None
+            for t in tables_for_rule:
+                norm = str(t).lower()
+                bare = norm.split(".")[-1] if "." in norm else norm
+                # Only enrich tables that are newly added (not from Pass 1)
+                if (norm in rule_extra_tables
+                        and norm not in identified_norm
+                        and bare not in identified_norm):
+                    new_table = t
+                    break
+
+            if not new_table:
+                continue
+
+            # Extract column references from compressed rule fields
+            columns: list = []
+            if rule.get("column"):
+                columns.append(str(rule["column"]))
+            if rule.get("columns"):
+                c = rule["columns"]
+                columns.extend(c if isinstance(c, list) else [c])
+
+            # Fallback: extract quoted identifiers from apply (SQL pattern)
+            if not columns and rule.get("apply"):
+                columns.extend(_re.findall(r'["\[`](\w+)["\]`]', rule["apply"]))
+
+            if columns:
+                cols_to_fetch.setdefault(new_table, set()).update(columns)
+
+        if not cols_to_fetch:
+            return {}
+
+        cols_by_table = {t: list(cols) for t, cols in cols_to_fetch.items()}
+        print(f"[TABLE PRUNING] Enriching rule-referenced columns: {cols_by_table}")
+        return self._fetch_column_metadata(cols_by_table, [])
 
     # ═════════════════════════════════════════════════════════════════════
     # INTERNAL: Rule Dependency Column Injection

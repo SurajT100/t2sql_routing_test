@@ -312,6 +312,10 @@ class FlowConfig:
     # Analyzer Agent (multi-step decomposition for analysis-complexity queries)
     enable_analyzer: bool = True
 
+    # Table pruning (deterministic step between Pass 1 and Pass 2)
+    # When True: skip pruning and send full bare_schema to Pass 2 (debug / regression testing)
+    bypass_table_pruning: bool = False
+
     # Pre-computed classification — when set, process_query skips the second LLM call
     initial_classification: Optional[Dict] = None
 
@@ -473,6 +477,11 @@ class QueryResult:
     columns_retrieved: int = 0
     schema_text: str = ""
     rules_compressed: str = ""
+
+    # Table pruning (populated after context agent runs)
+    focused_schema: str = ""           # pruned schema; used by Pass 2, Opus Review
+    pruning_fallback: bool = False     # True if safety triggered; full bare_schema used instead
+    rule_extra_tables: List[str] = field(default_factory=list)
     
     # Cache
     cache_hit: bool = False
@@ -505,6 +514,18 @@ class QueryResult:
 def _is_claude_provider(provider: str) -> bool:
     """Return True when the provider is a Claude model (supports prompt caching)."""
     return provider.startswith("claude_")
+
+
+def _supports_json_prefill(provider: str) -> bool:
+    """Return True when the provider honours an assistant-turn prefill to force JSON output."""
+    prov = provider.lower()
+    # Kimi K2 supports prefill via messages list even though it has "thinking" in the name
+    if "kimi" in prov:
+        return True
+    # Claude 4.x models and extended-thinking models reject assistant-message prefill (HTTP 400)
+    if "thinking" in prov or prov in ("claude_sonnet_46", "claude_opus_47"):
+        return False
+    return prov.startswith("claude_")
 
 
 def _build_static_system_prompt(
@@ -579,6 +600,7 @@ def process_query(
     from schema_rag import get_relevant_schema, get_relevant_schema_simple, format_schema_for_llm, get_full_schema
     from prompt_optimizer import (
         compress_rules_for_llm,
+        strip_for_pass1,
         create_easy_query_prompt,
         create_medium_query_prompt,
         create_hard_query_prompt,
@@ -849,6 +871,36 @@ def process_query(
                 print(f"[STAGE2] Date override filter error: {e}")
         
         result.rules_compressed = rules_compressed
+
+        # Compute fiscal year context once per query (empty string if no FY rule found).
+        # Injected into Pass 2, Opus, Refinement, and force-regen prompts below.
+        _fy_context = ""
+        try:
+            _rules_for_fy = json.loads(rules_compressed) if rules_compressed and rules_compressed != "[]" else []
+        except Exception:
+            _rules_for_fy = []
+        if _rules_for_fy:
+            from reasoning_prompts import detect_fy_start_month, build_fy_context as _build_fy_context
+            from datetime import date as _date_cls
+            _fy_start = detect_fy_start_month(_rules_for_fy)
+            if _fy_start:
+                _fy_rule_name = ""
+                _fy_tables = None
+                for _r in _rules_for_fy:
+                    if _r.get('auto_apply') and _r.get('type') == 'default':
+                        _fy_rule_name = _r.get('name', '')
+                        _fy_tables = _r.get('applies_to_queries') or None
+                        break
+                _fy_context = _build_fy_context(
+                    today=_date_cls.today(),
+                    fy_start_month=_fy_start,
+                    rule_name=_fy_rule_name,
+                    applicable_tables=_fy_tables,
+                )
+                print(f"[FY_CONTEXT] Detected FY start month={_fy_start}, rule='{_fy_rule_name}'")
+            else:
+                print(f"[FY_CONTEXT] No parseable FY rule found — using calendar year DATE CONTEXT only")
+
         result.stages_completed.append("schema_and_rag")
         result.stage_times["schema_and_rag"] = int((time.time() - stage_start) * 1000)
         
@@ -869,7 +921,9 @@ def process_query(
             create_pass2_prompt,
             create_opus_complex_prompt,
             parse_pass1_output,
-            parse_pass2_output
+            parse_pass2_output,
+            detect_fy_start_month,
+            build_fy_context,
         )
 
         dialect_syntax = get_dialect_syntax_rules(config.dialect_info.get('dialect', 'postgresql'))
@@ -919,7 +973,7 @@ def process_query(
                         f"that may not match exactly (names, categories, codes). "
                         f"Each entry MUST be a dict with keys: table, column, user_value, filter_type."
                     )
-                    _sp1_prefill = "{" if _is_claude_provider(config.reasoning_provider) else None
+                    _sp1_prefill = "{" if _supports_json_prefill(config.reasoning_provider) else None
                     if _is_claude_provider(config.reasoning_provider) and config.enable_prompt_caching:
                         _sp1_response, _sp1_tokens = call_llm(
                             _sp1_user,
@@ -1016,7 +1070,7 @@ def process_query(
             _p1_system = _build_static_system_prompt(
                 dialect_syntax=dialect_syntax,
                 schema=bare_schema,
-                rules=rules_compressed,
+                rules=strip_for_pass1(rules_compressed),
                 extra_instructions=(
                     f"You are a SQL query planner for {dialect_name_upper}. "
                     f"Your task is to identify which tables and columns are needed.\n"
@@ -1033,7 +1087,7 @@ def process_query(
                 f"that may not match exactly (names, categories, codes). "
                 f"Each entry MUST be a dict with keys: table, column, user_value, filter_type."
             )
-            prefill = "{" if _is_claude_provider(config.reasoning_provider) else None
+            prefill = "{" if _supports_json_prefill(config.reasoning_provider) else None
             if _is_claude_provider(config.reasoning_provider) and config.enable_prompt_caching:
                 pass1_response, pass1_tokens = call_llm(
                     _p1_user, config.reasoning_provider,
@@ -1043,7 +1097,7 @@ def process_query(
             else:
                 pass1_prompt = create_pass1_prompt(
                     question=question, schema=bare_schema,
-                    rules=rules_compressed, dialect_info=config.dialect_info,
+                    rules=strip_for_pass1(rules_compressed), dialect_info=config.dialect_info,
                 )
                 pass1_response, pass1_tokens = call_llm(
                     pass1_prompt, config.reasoning_provider, prefill=prefill,
@@ -1052,6 +1106,9 @@ def process_query(
             result.tokens.reasoning_pass1 = pass1_tokens
             _accumulate_cache_tokens(result.tokens.reasoning_pass1, pass1_tokens)
             result.llm_trace.reasoning_pass1_output = pass1_response
+            if not pass1_response or not pass1_response.strip():
+                print(f"[STAGE3] WARNING: Pass 1 returned EMPTY response from "
+                      f"{config.reasoning_provider}. Tokens: {pass1_tokens}.")
             print(f"[STAGE3] Pass 1 complete — {pass1_tokens.get('input',0)+pass1_tokens.get('output',0)} tokens")
 
             # ── CONTEXT AGENT: Focused retrieval for ONLY identified columns ──
@@ -1082,16 +1139,29 @@ def process_query(
             result.llm_trace.resolver_summary = bundle.resolver_text
             result.stages_completed.append("context_agent")
             result.stage_times["context_agent"] = bundle.total_time_ms
+            result.focused_schema = bundle.focused_schema
+            result.pruning_fallback = getattr(bundle, 'pruning_fallback', False)
+            result.rule_extra_tables = getattr(bundle, 'rule_extra_tables', [])
 
             print(f"[STAGE3] Context Agent complete — {bundle.total_time_ms}ms | "
                   f"descs:{bundle.opus_descriptions_fetched} rules:{bundle.rules_retrieved} "
-                  f"entities:{bundle.entities_resolved}")
+                  f"entities:{bundle.entities_resolved} "
+                  f"pruning_fallback={result.pruning_fallback} "
+                  f"rule_tables={len(result.rule_extra_tables)}")
 
             # Pass 2: Full plan with FOCUSED context
+            # Schema: use focused (pruned) schema to save tokens.
+            # Fall back to full bare_schema if pruning safety was triggered or bypassed.
+            _use_full_p2_schema = getattr(bundle, 'pruning_fallback', False) or config.bypass_table_pruning
+            _p2_schema = bare_schema if _use_full_p2_schema else bundle.focused_schema
+            _schema_saved = len(bare_schema) - len(_p2_schema)
+            print(f"[TABLE PRUNING] Pass 2 schema: {len(bare_schema)} → {len(_p2_schema)} chars "
+                  f"(saved {_schema_saved}, fallback={_use_full_p2_schema})")
+
             # Prompt caching: rules + dialect → system; question + metadata → user
             _p2_system = _build_static_system_prompt(
                 dialect_syntax=dialect_syntax,
-                schema=bare_schema,
+                schema=_p2_schema,
                 rules=bundle.rules_compressed,
                 extra_instructions=(
                     f"You are a SQL query planner for {dialect_name_upper}. "
@@ -1106,6 +1176,7 @@ def process_query(
                     dialect_info=config.dialect_info,
                     resolver_text=bundle.resolver_text,
                     rules="",  # already in system_prompt to avoid duplication
+                    fy_context=_fy_context,
                 )
                 pass2_response, pass2_tokens = call_llm(
                     pass2_prompt, config.reasoning_provider,
@@ -1119,6 +1190,7 @@ def process_query(
                     dialect_info=config.dialect_info,
                     resolver_text=bundle.resolver_text,
                     rules="",  # included via _p2_system prepend below
+                    fy_context=_fy_context,
                 )
                 # Non-Claude providers ignore system_prompt param → merge into user message
                 pass2_prompt = f"{_p2_system}\n\n{_p2_user}" if _p2_system else _p2_user
@@ -1135,6 +1207,9 @@ def process_query(
                 result.llm_trace.reasoning_pass2_input = pass2_prompt
             result.llm_trace.reasoning_pass2_output = pass2_response
             result.pass2_plan = pass2_response
+            if not pass2_response or not pass2_response.strip():
+                print(f"[STAGE3] ⚠️ WARNING: Pass 2 returned EMPTY response from {config.reasoning_provider}. "
+                      f"Tokens reported: {pass2_tokens}. SQL Coder will receive blank plan.")
             print(f"[STAGE3] Pass 2 complete — {pass2_tokens.get('input',0)+pass2_tokens.get('output',0)} tokens")
 
             # Keep SQL generation anchored to Pass 1 table/column selection so the
@@ -1190,7 +1265,7 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
             _cp1_system = _build_static_system_prompt(
                 dialect_syntax=dialect_syntax,
                 schema=bare_schema,
-                rules=rules_compressed,
+                rules=strip_for_pass1(rules_compressed),
                 extra_instructions=(
                     f"You are a SQL query planner for {dialect_name_upper}. "
                     f"Identify which tables and columns are needed.\n"
@@ -1207,7 +1282,7 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
                 f"that may not match exactly (names, categories, codes). "
                 f"Each entry MUST be a dict with keys: table, column, user_value, filter_type."
             )
-            prefill = "{" if _is_claude_provider(config.reasoning_provider) else None
+            prefill = "{" if _supports_json_prefill(config.reasoning_provider) else None
             if _is_claude_provider(config.reasoning_provider) and config.enable_prompt_caching:
                 pass1_response, pass1_tokens = call_llm(
                     _cp1_user, config.reasoning_provider,
@@ -1217,7 +1292,7 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
             else:
                 pass1_prompt = create_pass1_prompt(
                     question=question, schema=bare_schema,
-                    rules=rules_compressed, dialect_info=config.dialect_info,
+                    rules=strip_for_pass1(rules_compressed), dialect_info=config.dialect_info,
                 )
                 pass1_response, pass1_tokens = call_llm(
                     pass1_prompt, config.reasoning_provider, prefill=prefill,
@@ -1254,6 +1329,9 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
             result.llm_trace.resolver_summary = bundle.resolver_text
             result.stages_completed.append("context_agent")
             result.stage_times["context_agent"] = bundle.total_time_ms
+            result.focused_schema = bundle.focused_schema
+            result.pruning_fallback = getattr(bundle, 'pruning_fallback', False)
+            result.rule_extra_tables = getattr(bundle, 'rule_extra_tables', [])
 
             # Opus single call: FOCUSED schema + rules + metadata + resolutions → SQL
             _opus_system = _build_static_system_prompt(
@@ -1340,7 +1418,7 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
                 schema=schema_text,
                 rules=rules_compressed,
             ) if (_is_claude_provider(config.reasoning_provider) and config.enable_prompt_caching) else None
-            prefill = "{" if _is_claude_provider(config.reasoning_provider) else None
+            prefill = "{" if _supports_json_prefill(config.reasoning_provider) else None
             reasoning_response, reasoning_tokens = call_llm(
                 reasoning_prompt, config.reasoning_provider,
                 prefill=prefill,
@@ -1614,7 +1692,7 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
                         dialect_info=config.dialect_info,
                         use_opus=False
                     )
-                    prefill = "{" if "claude" in config.reasoning_provider else None
+                    prefill = "{" if _supports_json_prefill(config.reasoning_provider) else None
                     retry_response, retry_tokens = call_llm(
                         retry_prompt, config.reasoning_provider, prefill=prefill
                     )
@@ -1753,16 +1831,61 @@ OUTPUT: Only the SQL query. Start with SELECT or WITH."""
         
         if should_opus:
             stage_start = time.time()
-            
+
+            # Extract time + strategy from Pass 2 plan for refinement context only.
+            # NEVER passed to Opus review — auditor must reason independently.
+            _planner_context = ""
+            if getattr(result, 'pass2_plan', '') and result.pass2_plan:
+                _plan_data = parse_pass2_output(result.pass2_plan)
+                if _plan_data:
+                    _ctx_parts = []
+                    ti = _plan_data.get('time_interpretation') or {}
+                    resolved = (ti.get('resolved_range') or '').strip()
+                    logic = (ti.get('logic') or '').strip()
+                    if resolved and resolved.lower() not in ('none', 'unknown', ''):
+                        _ctx_parts.append(f"Date range intended: {resolved}")
+                    if logic and logic.lower() not in ('none', 'unknown', ''):
+                        _ctx_parts.append(f"Date logic: {logic}")
+                    qs = _plan_data.get('query_strategy') or {}
+                    stype = (qs.get('type') or '').strip()
+                    if stype:
+                        _ctx_parts.append(f"Query strategy: {stype}")
+                    for _step in (qs.get('steps') or []):
+                        _goal = (_step.get('goal') or '').strip()
+                        if _goal:
+                            _ctx_parts.append(f"  Step {_step.get('step', '?')}: {_goal}")
+                    _planner_context = "\n".join(_ctx_parts)
+                if _planner_context:
+                    print(f"[OPUS] Planner context extracted for refinement ({len(_planner_context)} chars)")
+                else:
+                    print(f"[OPUS] No usable planner context extracted (pass2_plan present but fields empty/none)")
+
+            # Schema strategy:
+            # - Opus Review: ALWAYS full schema (must verify table selection independently)
+            # - Refinement: pruned schema (tables already validated by Opus)
+            _refinement_schema = (
+                result.focused_schema
+                if result.focused_schema
+                and not result.pruning_fallback
+                and not config.bypass_table_pruning
+                else schema_text
+            )
+            print(f"[SCHEMA] Opus=full ({len(schema_text)} chars), "
+                  f"Refinement={'pruned' if _refinement_schema != schema_text else 'full'} "
+                  f"({len(_refinement_schema)} chars)")
+
             opus_result = _run_opus_review(
                 question=question,
                 sql=result.sql,
                 results=result.results,
                 schema_text=schema_text,
+                refinement_schema=_refinement_schema,
                 rules_compressed=rules_compressed,
                 config=config,
                 engine=engine,
-                use_opus_refinement=(result.complexity == "hard")
+                use_opus_refinement=(result.complexity == "hard"),
+                pass2_plan=_planner_context,
+                fy_context=_fy_context,
             )
             
             result.llm_trace.opus_input = opus_result.get("trace_opus_input", "")
@@ -2133,7 +2256,10 @@ def _run_opus_review(
     rules_compressed: str,
     config: FlowConfig,
     engine,
-    use_opus_refinement: bool = False
+    use_opus_refinement: bool = False,
+    pass2_plan: str = "",
+    refinement_schema: str = "",
+    fy_context: str = "",
 ) -> Dict[str, Any]:
     """
     Run Opus review with optional retry on INCORRECT verdict.
@@ -2149,6 +2275,8 @@ def _run_opus_review(
       - trace_refinement_input / trace_refinement_output
       - corrected_sql / corrected_results / refinement_tokens (if refined)
     """
+    _eff_ref_schema = refinement_schema or schema_text
+
     from llm_v2 import call_llm
     from db import run_sql
     from prompt_optimizer import (
@@ -2168,7 +2296,7 @@ def _run_opus_review(
     trace_refinement_input = ""
     trace_refinement_output = ""
 
-    use_prefill = _is_claude_provider(config.opus_provider)
+    use_prefill = _supports_json_prefill(config.opus_provider)
     use_cache = _is_claude_provider(config.opus_provider) and config.enable_prompt_caching
 
     # Build cacheable system prompt (schema + rules) for Opus review
@@ -2195,6 +2323,7 @@ def _run_opus_review(
             columns_used=columns_used,
             schema_text="" if use_cache else schema_text,
             rules_compressed="" if use_cache else rules_compressed,
+            fy_context=fy_context,
         )
 
         if use_prefill:
@@ -2212,7 +2341,10 @@ def _run_opus_review(
         if attempt == 1:
             trace_opus_input = opus_prompt
             trace_opus_output = opus_response
-        
+            if not opus_response or not opus_response.strip():
+                print(f"[OPUS REVIEW] WARNING: Reviewer returned EMPTY response from "
+                      f"{config.opus_provider}. Tokens: {opus_tokens}.")
+
         try:
             response_text = opus_response
             if "```json" in response_text:
@@ -2266,11 +2398,13 @@ def _run_opus_review(
         
         if attempt < config.max_retries:
             refine_prompt = create_refinement_prompt(
-                question, current_sql, review, schema_text, rules_compressed
+                question, current_sql, review, _eff_ref_schema, rules_compressed,
+                pass2_plan=pass2_plan,
+                fy_context=fy_context,
             )
             
             refinement_provider = config.opus_provider if use_opus_refinement else config.reasoning_provider
-            prefill = "{" if "claude" in refinement_provider else None
+            prefill = "{" if _supports_json_prefill(refinement_provider) else None
             refine_response, refine_tokens = call_llm(
                 refine_prompt, refinement_provider, prefill=prefill
             )
@@ -2292,8 +2426,14 @@ def _run_opus_review(
 
             # If model repeats same SQL after INCORRECT verdict, force a full regeneration
             if (not new_sql or new_sql.strip() == current_sql.strip()) and verdict == "INCORRECT":
+                from datetime import date as _date
+                _today = _date.today().isoformat()
+                _force_fy_block = ("\n" + fy_context) if fy_context else ""
                 force_prompt = f"""Previous refinement repeated the same incorrect SQL.
 Generate a NEW corrected SQL from scratch that resolves all auditor failures.
+
+TODAY: {_today}
+{_force_fy_block}
 
 QUESTION:
 {question}
@@ -2302,17 +2442,23 @@ AUDITOR FEEDBACK JSON:
 {json.dumps(review, ensure_ascii=False)}
 
 SCHEMA:
-{schema_text}
+{_eff_ref_schema}
 
 BUSINESS RULES:
 {rules_compressed}
+
+{f"PLANNER CONTEXT (reference only — verify independently):{chr(10)}{pass2_plan}{chr(10)}" if pass2_plan else ""}DATE HANDLING: Use dynamic date calculation with CURRENT_DATE and
+EXTRACT/MAKE_DATE functions — never hardcode date literals. If a fiscal
+year business rule applies, implement it with dynamic calculation. If the
+user requested a specific period (e.g., "last year"), adjust the dynamic
+calculation to target that period relative to the business rule's date system.
 
 REJECTED SQL:
 {current_sql}
 
 Return ONLY SQL. No explanation."""
                 force_provider = config.opus_provider if use_opus_refinement else config.reasoning_provider
-                force_prefill = "{" if "claude" in force_provider else None
+                force_prefill = "{" if _supports_json_prefill(force_provider) else None
                 force_response, force_tokens = call_llm(force_prompt, force_provider, prefill=force_prefill)
                 refinement_tokens["input"] += force_tokens.get("input", 0)
                 refinement_tokens["output"] += force_tokens.get("output", 0)
@@ -2321,11 +2467,13 @@ Return ONLY SQL. No explanation."""
                 new_sql = extract_sql_from_response(force_response)
 
             if new_sql and new_sql != current_sql:
+                _prev_sql = current_sql
                 current_sql = new_sql
                 try:
                     current_results = run_sql(engine, current_sql)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[REFINE] Refined SQL failed to execute: {e}")
+                    current_sql = _prev_sql  # revert to keep sql ↔ results in sync
     
     return {
         "verdict": "FAILED_AFTER_RETRIES",
