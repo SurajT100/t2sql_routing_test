@@ -319,6 +319,37 @@ FROM pg_indexes
 WHERE tablename IN ('schema_columns', 'schema_objects');
 
 -- ============================================================================
+-- TABLE: query_examples_v2
+-- Stores verified SQL query examples for few-shot learning (Tier 4 RAG)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS query_examples_v2 (
+    id              SERIAL PRIMARY KEY,
+    question        TEXT NOT NULL,
+    sql_query       TEXT NOT NULL,
+    explanation     TEXT,
+    query_type      TEXT,
+    tables_used     TEXT[],
+    concepts        TEXT[],
+    is_verified     BOOLEAN DEFAULT TRUE,
+    is_active       BOOLEAN DEFAULT TRUE,
+    embedding       vector(384),
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_query_examples_embedding
+ON query_examples_v2
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+
+DROP TRIGGER IF EXISTS update_query_examples_updated_at ON query_examples_v2;
+CREATE TRIGGER update_query_examples_updated_at
+    BEFORE UPDATE ON query_examples_v2
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+-- ============================================================================
 -- NOTES
 -- ============================================================================
 /*
