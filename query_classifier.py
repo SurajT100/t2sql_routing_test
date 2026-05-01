@@ -13,9 +13,13 @@ Usage:
 
     result = classify_query("Show total sales by region")
     # {"complexity": "medium", "reason": "Has aggregation", "tokens": {...}}
+
+    # With rule-aware classification (recommended):
+    rules = fetch_rule_summaries(vector_engine)
+    result = classify_query("Show total sales by region", rule_summaries=rules)
 """
 
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 import json
 import re
 
@@ -87,13 +91,70 @@ Use ANALYSIS only when a single SQL query (even with CTEs) is genuinely insuffic
 Examples:
 - "What would happen to our margin if we removed the top 5 loss-making products?"
 - "Which customers improved their order frequency compared to the same period last year, and what is the revenue impact?"
-- "Show me the top 3 regions by growth rate and then drill into each region's product mix"
+- "Show me the top 3 regions by growth rate and then drill into each region’s product mix"
 - "Simulate the effect of a 15% price increase on our top-selling SKUs"
 
-USER QUESTION: {question}
+{rule_context}USER QUESTION: {question}
 
 Respond with ONLY this JSON (no other text):
 {{"complexity": "easy|medium|hard|analysis", "reason": "brief explanation"}}"""
+
+RULE_CONTEXT_BLOCK = """BUSINESS RULES IN EFFECT:
+These rules will be applied when generating SQL for this question. Use them to \
+assess true complexity — a question that triggers metric definitions, FX conversions, \
+fiscal-year logic, or multi-condition filters is harder than the question text alone suggests.
+
+{summaries}
+
+"""
+
+
+# =============================================================================
+# RULE SUMMARY HELPERS
+# =============================================================================
+
+def fetch_rule_summaries(engine) -> List[Dict[str, Any]]:
+    """
+    Fetch lightweight rule metadata from business_rules_v2.
+    Only reads (rule_type, rule_name, trigger_keywords, is_mandatory) —
+    no rule_data JSON — so the payload stays tiny even with 50+ rules.
+    """
+    try:
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT rule_type, rule_name, trigger_keywords, is_mandatory
+                FROM business_rules_v2
+                WHERE is_active = TRUE
+                ORDER BY is_mandatory DESC, priority ASC
+            """)).fetchall()
+        return [
+            {
+                "rule_type":    row[0] or "other",
+                "rule_name":    row[1] or "",
+                "keywords":     row[2] or [],
+                "is_mandatory": bool(row[3]),
+            }
+            for row in rows
+        ]
+    except Exception as e:
+        print(f"[CLASSIFIER] Could not fetch rule summaries: {e}")
+        return []
+
+
+def format_rule_summaries(rules: List[Dict[str, Any]]) -> str:
+    """
+    Compress rule list into a short text block for the classifier prompt.
+    Format: mandatory? | type | name | keywords
+    """
+    if not rules:
+        return ""
+    lines = []
+    for r in rules:
+        flag = "MANDATORY" if r["is_mandatory"] else "optional "
+        kw   = ", ".join(r["keywords"][:6]) if r["keywords"] else "—"
+        lines.append(f"  [{flag}] {r['rule_type']:12} | {r['rule_name']} | keywords: {kw}")
+    return "\n".join(lines)
 
 
 # =============================================================================
@@ -131,15 +192,20 @@ def classify_query(
     question: str,
     use_llm: bool = True,
     llm_provider: str = "claude_haiku",
+    rule_summaries: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Classify query complexity using a single LLM call (Claude Haiku).
 
     Args:
-        question:     User's natural language question.
-        use_llm:      When True (default), use the LLM. When False, use the
-                      keyword fallback (e.g. when the toggle is off).
-        llm_provider: LLM provider.  Defaults to claude_haiku (cheapest/fastest).
+        question:       User's natural language question.
+        use_llm:        When True (default), use the LLM. When False, use the
+                        keyword fallback (e.g. when the toggle is off).
+        llm_provider:   LLM provider. Defaults to claude_haiku (cheapest/fastest).
+        rule_summaries: Optional list from fetch_rule_summaries(). When provided,
+                        the classifier sees which business rules are in effect so
+                        it can account for hidden complexity (e.g. "total sales"
+                        that triggers FX conversion + fiscal-year date logic).
 
     Returns:
         {
@@ -164,7 +230,14 @@ def classify_query(
             "response": "",
         }
 
-    prompt = CLASSIFIER_PROMPT.format(question=question)
+    # Build optional rule context block
+    rule_context = ""
+    if rule_summaries:
+        summaries_text = format_rule_summaries(rule_summaries)
+        if summaries_text:
+            rule_context = RULE_CONTEXT_BLOCK.format(summaries=summaries_text)
+
+    prompt = CLASSIFIER_PROMPT.format(question=question, rule_context=rule_context)
     tokens: Dict[str, int] = {"input": 0, "output": 0}
     raw_response = ""
 

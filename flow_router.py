@@ -596,7 +596,7 @@ def process_query(
                  → Still fails → Attempt 2: Opus fix (powerful)
                  → Still fails → Return error with explanation
     """
-    from query_classifier import classify_query, get_flow_config
+    from query_classifier import classify_query, get_flow_config, fetch_rule_summaries
     from schema_rag import get_relevant_schema, get_relevant_schema_simple, format_schema_for_llm, get_full_schema
     from prompt_optimizer import (
         compress_rules_for_llm,
@@ -689,11 +689,16 @@ def process_query(
         
         if config.enable_classification:
             # Use pre-computed result from the UI (avoids a second LLM call)
-            classification = config.initial_classification or classify_query(
-                question,
-                use_llm=True,
-                llm_provider=config.classification_provider,
-            )
+            if config.initial_classification:
+                classification = config.initial_classification
+            else:
+                _rule_summaries = fetch_rule_summaries(vector_engine)
+                classification = classify_query(
+                    question,
+                    use_llm=True,
+                    llm_provider=config.classification_provider,
+                    rule_summaries=_rule_summaries,
+                )
             result.complexity = classification["complexity"]
             result.classification_reason = classification["reason"]
             result.tokens.classifier = classification["tokens"]

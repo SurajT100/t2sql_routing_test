@@ -27,7 +27,7 @@ from schema_profiler import (
     update_column_enrichment
 )
 from flow_router import process_query, FlowConfig
-from query_classifier import classify_query, get_flow_config
+from query_classifier import classify_query, get_flow_config, fetch_rule_summaries
 
 # Load environment variables
 load_dotenv()
@@ -2145,7 +2145,7 @@ with tab3:
     else:
         # Import optimization modules
         from flow_router import process_query, FlowConfig, QueryResult
-        from query_classifier import classify_query, get_flow_config
+        from query_classifier import classify_query, get_flow_config, fetch_rule_summaries
         
         # Build schema for reference
         inspector = inspect(st.session_state.engine)
@@ -2345,7 +2345,13 @@ with tab3:
                 # ───────────────────────────────────────────────────────────
                 if enable_classification:
                     with st.spinner("🏷️ Classifying query..."):
-                        classification = classify_query(question, use_llm=True, llm_provider="claude_haiku")
+                        _rule_summaries = fetch_rule_summaries(VECTOR_ENGINE)
+                        classification = classify_query(
+                            question,
+                            use_llm=True,
+                            llm_provider="claude_haiku",
+                            rule_summaries=_rule_summaries,
+                        )
                     config.initial_classification = classification  # reuse — no second LLM call
 
                     complexity = classification["complexity"]
